@@ -55,6 +55,7 @@
 #include "storage/read_stream.h"
 #endif
 #include "executor/spi.h"
+#include "parser/parser.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -3540,6 +3541,17 @@ se_alter_engine_table_set(PG_FUNCTION_ARGS)
 
 		/* empty string clears the orderby */
 		options.orderby = (orderbyStr[0] != '\0') ? orderbyStr : NULL;
+
+		/* validate SQL syntax immediately so callers fail fast instead
+		 * of discovering the error only after minutes of merge work */
+		if (options.orderby != NULL)
+		{
+			StringInfoData chkbuf;
+			initStringInfo(&chkbuf);
+			appendStringInfo(&chkbuf, "SELECT 1 ORDER BY %s", options.orderby);
+			raw_parser(chkbuf.data, RAW_PARSE_DEFAULT);
+			pfree(chkbuf.data);
+		}
 
 		ereport(DEBUG1, (errmsg("updating orderby to %s",
 								options.orderby ? options.orderby : "(none)")));
