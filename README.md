@@ -481,6 +481,3 @@ The `engine` schema and both AMs are created automatically on `CREATE EXTENSION`
 
 ---
 
-## Benchmarks
-
-See [BENCHMARKS.md](BENCHMARKS.md) for detailed results comparing `colcompress`, `rowcompress`, and heap across analytical and mixed OLTP/OLAP workloads.
