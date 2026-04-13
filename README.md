@@ -40,6 +40,9 @@ Both AMs coexist alongside standard heap tables in the same database. All catalo
 - [Management Functions](#management-functions)
 - [Catalog Views](#catalog-views)
 - [Installation](#installation)
+  - [Dependencies](#dependencies)
+  - [Build from source](#build-from-source)
+  - [Docker](#docker)
 - [PostgreSQL Version Compatibility](#postgresql-version-compatibility)
 - [Benchmarks](#benchmarks)
 
@@ -376,13 +379,70 @@ All views grant `SELECT` to `PUBLIC`.
 
 ## Installation
 
-### Build from source
+### Dependencies
 
-Requires PostgreSQL server headers and `pg_config` in `PATH`.
+The following libraries and tools must be installed before building:
+
+| Dependency | Purpose | Optional |
+|---|---|---|
+| C compiler (`gcc` or `clang`) | Build toolchain | No |
+| `make` | Build system | No |
+| PostgreSQL server headers | Extension API | No |
+| `liblz4` + headers | lz4 compression support | Yes (`--without-lz4`) |
+| `libzstd` + headers | zstd compression (default algorithm) | Yes (`--without-zstd`) |
+| `libcurl` + headers | Anonymous statistics scaffolding | Yes (`--without-libcurl`) |
+| `autoconf` | Regenerating `./configure` after source changes | Dev only |
+
+> **Note:** `pglz` is built into PostgreSQL itself — no separate package required.
+
+**Debian / Ubuntu:**
 
 ```bash
-cd columnar
+sudo apt-get install -y \
+  gcc make autoconf \
+  postgresql-server-dev-18 \
+  liblz4-dev \
+  libzstd-dev \
+  libcurl4-openssl-dev
+```
+
+Replace `18` with your PostgreSQL major version (`16`, `17`, `18`, …).
+
+**RHEL / Fedora / Rocky Linux:**
+
+```bash
+sudo dnf install -y \
+  gcc make autoconf \
+  postgresql18-server-devel \
+  lz4-devel \
+  libzstd-devel \
+  libcurl-devel
+```
+
+**macOS (Homebrew):**
+
+```bash
+brew install lz4 zstd curl
+```
+
+PostgreSQL from `brew install postgresql@18` already includes server headers in the keg.
+
+---
+
+### Build from source
+
+Requires `pg_config` in `PATH` (provided by `postgresql-server-dev-XX` or the PostgreSQL keg).
+
+```bash
+./configure
 make -j$(nproc) install
+```
+
+To build without optional dependencies:
+
+```bash
+./configure --without-libcurl --without-lz4   # zstd only
+./configure --without-libcurl --without-zstd  # lz4 only
 ```
 
 Add to `postgresql.conf`:
