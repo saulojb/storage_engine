@@ -1,0 +1,4 @@
+comment = 'Storage Engine extension — colcompress (column store) and rowcompress (row-based compressed store)'
+default_version = '1.0'
+module_pathname = '$libdir/storage_engine'
+relocatable = false

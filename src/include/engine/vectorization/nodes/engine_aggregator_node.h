@@ -1,0 +1,29 @@
+/*-------------------------------------------------------------------------
+ *
+ * engine_aggregator_node.h
+ *	Custom scan method for aggregation
+ * 
+ * IDENTIFICATION
+ *	src/backend/columnar/vectorization/nodes/engine_aggregator_node.c
+ *
+ *-------------------------------------------------------------------------
+ */
+
+
+#ifndef ENGINE_AGGEREGATOR_NODE_H
+#define ENGINE_AGGEREGATOR_NODE_H
+
+#include "postgres.h"
+
+#include "nodes/execnodes.h"
+
+typedef struct VectorAggState
+{
+	CustomScanState css;
+	AggState *aggstate;
+} VectorAggState;
+
+extern CustomScan *engine_create_aggregator_node(void);
+extern void engine_register_aggregator_node(void);
+
+#endif
