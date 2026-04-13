@@ -5290,7 +5290,7 @@ static void EndVectorAgg(CustomScanState *node);
 static void ExplainAggNode(CustomScanState *node, List *ancestors, ExplainState *es);
 
 static CustomScanMethods VectorAggNodeMethods = {
-	"VectorAggNode",		/* CustomName */
+	"StorageEngineVectorAgg",		/* CustomName */
 	CreateVectorAggState,	/* CreateCustomScanState */
 };
 

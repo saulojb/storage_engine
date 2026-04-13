@@ -695,7 +695,7 @@ static void ColumnarIndexScan_InitializeWorkerCustomScan(CustomScanState *node,
 														 shm_toc *toc,
 														 void *coordinate);
 static CustomScanMethods ColumnarIndexCustomScanMethods = {
-	"ColumnarIndexScan",			/* CustomName */
+	"StorageEngineIndexScan",			/* CustomName */
 	CreateColumnarIndexScanState,	/* CreateCustomScanState */
 };
 

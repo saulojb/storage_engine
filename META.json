@@ -4,7 +4,7 @@
    "description": "storage_engine provides two high-performance Table Access Methods: colcompress (columnar, vectorized, MergeTree-style sort key, chunk-level min/max pruning, parallel DSM scan) and rowcompress (batch-compressed rows, parallel work-stealing scan). Both AMs use zstd by default and coexist safely with heap tables. All catalog objects live in the engine schema; C symbols use the se_ prefix.",
    "version": "1.0.0",
    "maintainer": [
-      "Saulo José Benvenutti <saulo@example.com>"
+      "Saulo José Benvenutti <saulojb@gmail.com>"
    ],
    "license": "agpl",
    "provides": {
