@@ -261,7 +261,7 @@ CREATE OR REPLACE FUNCTION engine.alter_colcompress_table_set(
     index_scan            bool DEFAULT NULL)
     RETURNS void
     LANGUAGE C
-AS 'MODULE_PATHNAME', 'se_alter_columnar_table_set';
+AS 'MODULE_PATHNAME', 'se_alter_engine_table_set';
 
 COMMENT ON FUNCTION engine.alter_colcompress_table_set(
     regclass, int, int, name, int, text, bool)
@@ -280,7 +280,7 @@ CREATE OR REPLACE FUNCTION engine.alter_colcompress_table_reset(
     index_scan            bool DEFAULT false)
     RETURNS void
     LANGUAGE C
-AS 'MODULE_PATHNAME', 'se_alter_columnar_table_reset';
+AS 'MODULE_PATHNAME', 'se_alter_engine_table_reset';
 
 COMMENT ON FUNCTION engine.alter_colcompress_table_reset(
     regclass, bool, bool, bool, bool, bool, bool)
