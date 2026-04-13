@@ -1,11 +1,19 @@
 # storage_engine
 
-A PostgreSQL extension providing two high-performance Table Access Methods designed for analytical and HTAP workloads.
+Copyright (c) 2026 Saulo José Benvenutti — [AGPL-3.0 License](LICENSE)
 
-- **`colcompress`** — column-oriented compressed storage with vectorized execution and parallel scan
-- **`rowcompress`** — row-oriented batch-compressed storage with parallel scan
+A PostgreSQL extension providing two high-performance Table Access Methods designed for analytical and HTAP workloads — with **significant storage savings and no meaningful query performance penalty** compared to standard heap tables.
+
+- **`colcompress`** — column-oriented compressed storage with vectorized execution and parallel scan. Typical real-world compression ratios of **3–10× smaller** than heap for analytical datasets, while aggregate and range-scan queries often run *faster* due to reduced I/O and vectorized evaluation.
+- **`rowcompress`** — row-oriented batch-compressed storage with parallel scan. Achieves **2–6× smaller** footprint than heap for append-heavy workloads (audit logs, event streams, time-series), with read throughput comparable to heap thanks to parallel work-stealing batch decompression.
+
+Both AMs use `zstd` compression by default (configurable per table to `lz4`, `pglz`, or `none`). Storage savings translate directly to lower I/O, smaller backups, and reduced memory pressure from the buffer cache — benefits that compound as data volumes grow.
 
 Both AMs coexist alongside standard heap tables in the same database. All catalog objects are isolated in the `engine` schema, making the extension safe to install alongside `citus_columnar` or any other columnar extension (all exported C symbols carry the `se_` prefix to avoid linker conflicts).
+
+### Lineage
+
+`storage_engine` is a restructured fork of [Hydra Columnar](https://github.com/hydradatabase/hydra), which is itself a fork of [Citus Columnar](https://github.com/citusdata/citus) (the columnar AM originally developed by Citus Data / Microsoft). The columnar storage model (`colcompress`) was further inspired by [ClickHouse's MergeTree engine](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree), particularly its per-table sort key and min/max chunk-level pruning semantics.
 
 ---
 
