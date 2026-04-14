@@ -632,9 +632,9 @@ SaveEmptyRowMask(uint64 storageId, uint64 stripeId,
 		int64 rowCount = lfirst_int(lc);
 
 		uint16 rowMaskIterations = 
-			(rowCount % ENGINE_ROW_MASK_CHUNK_SIZE) ? 
-				(rowCount / ENGINE_ROW_MASK_CHUNK_SIZE + 1) :
-				(rowCount / ENGINE_ROW_MASK_CHUNK_SIZE);
+			(rowCount % COLUMNAR_ROW_MASK_CHUNK_SIZE) ? 
+				(rowCount / COLUMNAR_ROW_MASK_CHUNK_SIZE + 1) :
+				(rowCount / COLUMNAR_ROW_MASK_CHUNK_SIZE);
 
 		for(uint16 n = 0; n < rowMaskIterations; n++)
 		{
@@ -643,8 +643,8 @@ SaveEmptyRowMask(uint64 storageId, uint64 stripeId,
 			/* Last iteration */
 			if (n == (rowMaskIterations - 1))
 			{
-				uint16 lastIterationRowSize = rowCount % ENGINE_ROW_MASK_CHUNK_SIZE ? 
-						rowCount % ENGINE_ROW_MASK_CHUNK_SIZE : ENGINE_ROW_MASK_CHUNK_SIZE;
+				uint16 lastIterationRowSize = rowCount % COLUMNAR_ROW_MASK_CHUNK_SIZE ? 
+						rowCount % COLUMNAR_ROW_MASK_CHUNK_SIZE : COLUMNAR_ROW_MASK_CHUNK_SIZE;
 				chunkIterationEndRowNumber += lastIterationRowSize;
 				maskSize = (lastIterationRowSize) % 8 ? 
 								lastIterationRowSize / 8 + 1 :
@@ -652,8 +652,8 @@ SaveEmptyRowMask(uint64 storageId, uint64 stripeId,
 			}
 			else
 			{
-				chunkIterationEndRowNumber += ENGINE_ROW_MASK_CHUNK_SIZE;
-				maskSize = ENGINE_ROW_MASK_CHUNK_SIZE / 8;
+				chunkIterationEndRowNumber += COLUMNAR_ROW_MASK_CHUNK_SIZE;
+				maskSize = COLUMNAR_ROW_MASK_CHUNK_SIZE / 8;
 			}
 
 			bytea *initialLookupRecord = (bytea *) palloc0(maskSize + VARHDRSZ);
@@ -696,7 +696,7 @@ SaveEmptyRowMask(uint64 storageId, uint64 stripeId,
 
 			PG_END_TRY();
 
-			chunkIterationStartRowNumber += ENGINE_ROW_MASK_CHUNK_SIZE;
+			chunkIterationStartRowNumber += COLUMNAR_ROW_MASK_CHUNK_SIZE;
 		}
 
 		chunkIterationStartRowNumber = chunkIterationEndRowNumber + 1;
@@ -855,7 +855,7 @@ ReadChunkRowMask(RelFileLocator relfilelocator, Snapshot snapshot,
 	MemoryContext oldContext = MemoryContextSwitchTo(cxt);
 
 	uint16 chunkMaskSize = 
-		(rowCount % ENGINE_ROW_MASK_CHUNK_SIZE) ?
+		(rowCount % COLUMNAR_ROW_MASK_CHUNK_SIZE) ?
 			(rowCount / 8 + 1) :
 			(rowCount / 8);
 
@@ -1684,7 +1684,7 @@ GetHighestUsedAddressAndId(uint64 storageId,
 	*highestUsedId = 0;
 
 	/* file starts with metapage */
-	*highestUsedAddress = ENGINE_BYTES_PER_PAGE;
+	*highestUsedAddress = COLUMNAR_BYTES_PER_PAGE;
 
 	foreach(stripeMetadataCell, stripeMetadataList)
 	{
@@ -2655,7 +2655,7 @@ ColumnarStorageUpdateIfNeeded(Relation rel, bool isUpgrade)
 
 /*
  * GetHighestUsedRowNumber returns the highest used rowNumber for given
- * storageId. Returns ENGINE_INVALID_ROW_NUMBER if storage with
+ * storageId. Returns COLUMNAR_INVALID_ROW_NUMBER if storage with
  * storageId has no stripes.
  * Note that normally we would use ColumnarStorageGetReservedRowNumber
  * to decide that. However, this function is designed to be used when
@@ -2664,7 +2664,7 @@ ColumnarStorageUpdateIfNeeded(Relation rel, bool isUpgrade)
 static uint64
 GetHighestUsedRowNumber(uint64 storageId)
 {
-	uint64 highestRowNumber = ENGINE_INVALID_ROW_NUMBER;
+	uint64 highestRowNumber = COLUMNAR_INVALID_ROW_NUMBER;
 
 	List *stripeMetadataList = ReadDataFileStripeList(storageId,
 													  GetTransactionSnapshot(),

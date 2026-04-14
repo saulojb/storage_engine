@@ -34,7 +34,7 @@ DROP TABLE test_alter_table;
 -- This is reflected by the VACUUM VERBOSE output right after a rewrite showing
 -- that all chunks are compressed with the configured compression algorithm
 CREATE TABLE test(i int) USING columnar;
-SELECT columnar.alter_columnar_table_set('test', compression => 'lz4');
+SELECT columnar.alter_engine_table_set('test', compression => 'lz4');
 INSERT INTO test VALUES(1);
 VACUUM VERBOSE test;
 

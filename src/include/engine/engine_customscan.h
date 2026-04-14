@@ -10,8 +10,8 @@
  *-------------------------------------------------------------------------
  */
 
-#ifndef ENGINE_CUSTOMSCAN_H
-#define ENGINE_CUSTOMSCAN_H
+#ifndef COLUMNAR_CUSTOMSCAN_H
+#define COLUMNAR_CUSTOMSCAN_H
 
 #include "nodes/extensible.h"
 
@@ -22,4 +22,4 @@ extern void engine_customscan_init(void);
 extern const CustomScanMethods * engine_customscan_methods(void);
 extern Bitmapset * ColumnarAttrNeeded(ScanState *ss, List *customList);
 
-#endif /* ENGINE_CUSTOMSCAN_H */
+#endif /* COLUMNAR_CUSTOMSCAN_H */

@@ -9,8 +9,8 @@
  *-------------------------------------------------------------------------
  */
 
-#ifndef ENGINE_COMPRESSION_H
-#define ENGINE_COMPRESSION_H
+#ifndef COLUMNAR_COMPRESSION_H
+#define COLUMNAR_COMPRESSION_H
 
 /* Enumaration for columnar table's compression method */
 typedef enum
@@ -31,4 +31,4 @@ extern bool CompressBuffer(StringInfo inputBuffer,
 extern StringInfo DecompressBuffer(StringInfo buffer, CompressionType compressionType,
 								   uint64 decompressedSize);
 
-#endif /* ENGINE_COMPRESSION_H */
+#endif /* COLUMNAR_COMPRESSION_H */

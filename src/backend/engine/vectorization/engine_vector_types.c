@@ -28,7 +28,7 @@ BuildVectorColumn(int16 columnDimension, int16 columnTypeLen,
 	vectorColumn = palloc0(sizeof(VectorColumn));
 
 	vectorColumn->dimension = 0;
-	vectorColumn->value = palloc0(columnTypeLen * ENGINE_VECTOR_COLUMN_SIZE);
+	vectorColumn->value = palloc0(columnTypeLen * COLUMNAR_VECTOR_COLUMN_SIZE);
 	vectorColumn->columnTypeLen = columnTypeLen;
 	vectorColumn->columnIsVal = columnIsVal;
 	vectorColumn->rowNumber = rowNumber;
@@ -56,7 +56,7 @@ CreateVectorTupleTableSlot(TupleDesc tupleDesc)
 	vectorTTS = (VectorTupleTableSlot*) slot;
 	
 	/* All tuples should be skipped in initialization */
-	memset(vectorTTS->keep, false, ENGINE_VECTOR_COLUMN_SIZE);
+	memset(vectorTTS->keep, false, COLUMNAR_VECTOR_COLUMN_SIZE);
 
 	for (i = 0; i < slotTupleDesc->natts; i++)
 	{		
@@ -74,7 +74,7 @@ CreateVectorTupleTableSlot(TupleDesc tupleDesc)
 		*/
 		bool vectorColumnIsVal = vectorColumnTypeLen <= sizeof(Datum);
 
-		vectorColumn = BuildVectorColumn(ENGINE_VECTOR_COLUMN_SIZE,
+		vectorColumn = BuildVectorColumn(COLUMNAR_VECTOR_COLUMN_SIZE,
 										 vectorColumnTypeLen,
 										 vectorColumnIsVal,
 										 vectorTTS->rowNumber);
@@ -162,10 +162,10 @@ CleanupVectorSlot(VectorTupleTableSlot *vectorSlot)
 	for (i = 0; i < tupDesc->natts; i++)
 	{
 		VectorColumn *column = (VectorColumn *) vectorSlot->tts.tts_values[i];
-		memset(column->isnull, true, ENGINE_VECTOR_COLUMN_SIZE);
+		memset(column->isnull, true, COLUMNAR_VECTOR_COLUMN_SIZE);
 		column->dimension = 0;
 	}
 	
-	memset(vectorSlot->keep, true, ENGINE_VECTOR_COLUMN_SIZE);
+	memset(vectorSlot->keep, true, COLUMNAR_VECTOR_COLUMN_SIZE);
 	vectorSlot->dimension = 0;
 }

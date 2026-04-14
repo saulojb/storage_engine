@@ -2,8 +2,8 @@
 -- Testing insert on columnar tables.
 --
 
-CREATE SCHEMA columnar_insert;
-SET search_path TO columnar_insert;
+CREATE SCHEMA engine_insert;
+SET search_path TO engine_insert;
 
 CREATE TABLE test_insert_command (a int) USING columnar;
 
@@ -27,9 +27,9 @@ select count(*) from test_insert_command;
 
 select
   version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('test_insert_command');
+  from engine_test_helpers.engine_storage_info('test_insert_command');
 
-SELECT * FROM columnar_test_helpers.chunk_group_consistency;
+SELECT * FROM engine_test_helpers.chunk_group_consistency;
 
 drop table test_insert_command_data;
 drop table test_insert_command;
@@ -46,13 +46,13 @@ CREATE TABLE test_long_text_hash AS
 SELECT int_val, md5(text_val) AS hash
 FROM test_long_text;
 
-CREATE TABLE test_columnar_long_text(int_val int, text_val text)
+CREATE TABLE test_engine_long_text(int_val int, text_val text)
 USING columnar;
 
 -- store long text in columnar table
-INSERT INTO test_columnar_long_text SELECT * FROM test_long_text;
+INSERT INTO test_engine_long_text SELECT * FROM test_long_text;
 
-SELECT * FROM columnar_test_helpers.chunk_group_consistency;
+SELECT * FROM engine_test_helpers.chunk_group_consistency;
 
 -- drop source table to remove original text from toast
 DROP TABLE test_long_text;
@@ -60,20 +60,20 @@ DROP TABLE test_long_text;
 -- check if text data is still available in columnar table
 -- by comparing previously stored hash.
 SELECT a.int_val
-FROM  test_long_text_hash a, test_columnar_long_text c
+FROM  test_long_text_hash a, test_engine_long_text c
 WHERE a.int_val = c.int_val AND a.hash = md5(c.text_val);
 
 DROP TABLE test_long_text_hash;
-DROP TABLE test_columnar_long_text;
+DROP TABLE test_engine_long_text;
 
 CREATE TABLE test_logical_replication(i int) USING columnar;
 -- should succeed
 INSERT INTO test_logical_replication VALUES (1);
-CREATE PUBLICATION test_columnar_publication
+CREATE PUBLICATION test_engine_publication
   FOR TABLE test_logical_replication;
 -- should fail; columnar does not support logical replication
 INSERT INTO test_logical_replication VALUES (2);
-DROP PUBLICATION test_columnar_publication;
+DROP PUBLICATION test_engine_publication;
 -- should succeed
 INSERT INTO test_logical_replication VALUES (3);
 DROP TABLE test_logical_replication;
@@ -108,9 +108,9 @@ FROM test_toast_columnar;
 
 select
   version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('test_toast_columnar');
+  from engine_test_helpers.engine_storage_info('test_toast_columnar');
 
-SELECT * FROM columnar_test_helpers.chunk_group_consistency;
+SELECT * FROM engine_test_helpers.chunk_group_consistency;
 
 DROP TABLE test_toast_row;
 DROP TABLE test_toast_columnar;
@@ -119,7 +119,7 @@ DROP TABLE test_toast_columnar;
 -- We support writing into zero column tables, but not reading from them.
 -- We test that metadata makes sense so we can fix the read path in future.
 CREATE TABLE zero_col() USING columnar;
-SELECT columnar.alter_columnar_table_set('zero_col', chunk_group_row_limit => 1000);
+SELECT columnar.alter_engine_table_set('zero_col', chunk_group_row_limit => 1000);
 
 INSERT INTO zero_col DEFAULT VALUES;
 INSERT INTO zero_col DEFAULT VALUES;
@@ -141,23 +141,23 @@ INSERT INTO zero_col SELECT * FROM zero_col_heap;
 
 select
   version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('zero_col');
+  from engine_test_helpers.engine_storage_info('zero_col');
 
 SELECT relname, stripe_num, chunk_group_count, row_count FROM columnar.stripe a, pg_class b
-WHERE columnar_test_helpers.columnar_relation_storageid(b.oid)=a.storage_id AND relname = 'zero_col'
+WHERE engine_test_helpers.engine_relation_storageid(b.oid)=a.storage_id AND relname = 'zero_col'
 ORDER BY 1,2,3,4;
 
 SELECT relname, stripe_num, value_count FROM columnar.chunk a, pg_class b
-WHERE columnar_test_helpers.columnar_relation_storageid(b.oid)=a.storage_id AND relname = 'zero_col'
+WHERE engine_test_helpers.engine_relation_storageid(b.oid)=a.storage_id AND relname = 'zero_col'
 ORDER BY 1,2,3;
 
 SELECT relname, stripe_num, chunk_group_num, row_count FROM columnar.chunk_group a, pg_class b
-WHERE columnar_test_helpers.columnar_relation_storageid(b.oid)=a.storage_id AND relname = 'zero_col'
+WHERE engine_test_helpers.engine_relation_storageid(b.oid)=a.storage_id AND relname = 'zero_col'
 ORDER BY 1,2,3,4;
 
 CREATE TABLE selfinsert(x int) USING columnar;
 
-SELECT columnar.alter_columnar_table_set('selfinsert', stripe_row_limit => 1000);
+SELECT columnar.alter_engine_table_set('selfinsert', stripe_row_limit => 1000);
 
 BEGIN;
   INSERT INTO selfinsert SELECT generate_series(1,1010);
@@ -199,19 +199,19 @@ BEGIN;
   SELECT a FROM flush_create_index WHERE a=5;
 ROLLBACK;
 
-CREATE OR REPLACE FUNCTION test_columnar_storage_write_new_page(relation regclass) RETURNS void
-STRICT LANGUAGE c AS 'columnar', 'test_columnar_storage_write_new_page';
+CREATE OR REPLACE FUNCTION test_engine_storage_write_new_page(relation regclass) RETURNS void
+STRICT LANGUAGE c AS 'columnar', 'test_engine_storage_write_new_page';
 
 CREATE TABLE aborted_write (a int, b int) USING columnar;
 
-SELECT test_columnar_storage_write_new_page('aborted_write');
+SELECT test_engine_storage_write_new_page('aborted_write');
 
 SET client_min_messages TO DEBUG4;
 INSERT INTO aborted_write VALUES (5);
 
 RESET search_path;
 SET client_min_messages TO WARNING;
-DROP SCHEMA columnar_insert CASCADE;
+DROP SCHEMA engine_insert CASCADE;
 
 --- HYD-760
 

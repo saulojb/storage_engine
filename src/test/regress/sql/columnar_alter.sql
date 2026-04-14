@@ -2,8 +2,8 @@
 -- Testing ALTER TABLE on columnar tables.
 --
 
-CREATE SCHEMA columnar_alter;
-SET search_path tO columnar_alter, public;
+CREATE SCHEMA engine_alter;
+SET search_path tO engine_alter, public;
 
 CREATE TABLE test_alter_table (a int, b int, c int) USING columnar;
 
@@ -19,7 +19,7 @@ ALTER TABLE test_alter_table DROP COLUMN a;
 
 select
   version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('test_alter_table');
+  from engine_test_helpers.engine_storage_info('test_alter_table');
 
 -- test analyze
 ANALYZE test_alter_table;
@@ -42,7 +42,7 @@ SELECT * FROM test_alter_table;
 
 select
   version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('test_alter_table');
+  from engine_test_helpers.engine_storage_info('test_alter_table');
 
 
 -- add a fixed-length column with default value
@@ -53,7 +53,7 @@ SELECT * from test_alter_table;
 
 select
   version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('test_alter_table');
+  from engine_test_helpers.engine_storage_info('test_alter_table');
 
 
 -- add a variable-length column with default value
@@ -160,7 +160,7 @@ create table local(y int);
 insert into local values (1), (2);
 alter table local drop column y;
 
-CREATE TABLE zero_col_columnar (like local) USING COLUMNAR;
+CREATE TABLE zero_col_columnar (like local) USING ENGINE;
 ALTER TABLE local RENAME TO local_xxxxx;
 INSERT INTO zero_col_columnar SELECT * FROM local_xxxxx;
 COMMIT;
@@ -271,4 +271,4 @@ DROP USER user1;
 DROP USER user2;
 
 SET client_min_messages TO WARNING;
-DROP SCHEMA columnar_alter CASCADE;
+DROP SCHEMA engine_alter CASCADE;

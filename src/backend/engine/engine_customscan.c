@@ -2526,7 +2526,7 @@ CustomExecScan(ColumnarScanState *columnarScanState,
 										columnarScanState->vectorization.constructedVectorizedQualList,
 										AND_EXPR, econtext);
 
-				memcpy(vectorSlot->keep, resultQual, ENGINE_VECTOR_COLUMN_SIZE);
+				memcpy(vectorSlot->keep, resultQual, COLUMNAR_VECTOR_COLUMN_SIZE);
 			}
 			/*
 			 * No qual, no vectorized qual, no projection but we need to return vector
@@ -2679,7 +2679,7 @@ ColumnarScanNext(ColumnarScanState *columnarScanState)
 		foreach_int(attrIndex, columnarScanState->vectorization.attrNeededList)
 		{
 			VectorColumn *column = (VectorColumn *) vectorSlot->tts.tts_values[attrIndex];
-			memset(column->isnull, true, ENGINE_VECTOR_COLUMN_SIZE);
+			memset(column->isnull, true, COLUMNAR_VECTOR_COLUMN_SIZE);
 			column->dimension = 0;
 		}
 		vectorSlot->dimension = 0;

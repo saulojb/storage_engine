@@ -9,8 +9,8 @@
  *-------------------------------------------------------------------------
  */
 
-#ifndef ENGINE_STORAGE_H
-#define ENGINE_STORAGE_H
+#ifndef COLUMNAR_STORAGE_H
+#define COLUMNAR_STORAGE_H
 
 #include "postgres.h"
 
@@ -20,10 +20,10 @@
 #include "engine/engine_tableam.h"
 
 
-#define ENGINE_INVALID_ROW_NUMBER ((uint64) 0)
-#define ENGINE_FIRST_ROW_NUMBER ((uint64) 1)
-#define ENGINE_MAX_ROW_NUMBER ((uint64) \
-								 (ENGINE_FIRST_ROW_NUMBER + \
+#define COLUMNAR_INVALID_ROW_NUMBER ((uint64) 0)
+#define COLUMNAR_FIRST_ROW_NUMBER ((uint64) 1)
+#define COLUMNAR_MAX_ROW_NUMBER ((uint64) \
+								 (COLUMNAR_FIRST_ROW_NUMBER + \
 								  VALID_ITEMPOINTER_OFFSETS * \
 								  VALID_BLOCKNUMBERS))
 
@@ -61,4 +61,4 @@ extern void ColumnarStorageWrite(Relation rel, uint64 logicalOffset,
 								 char *data, uint32 amount);
 extern bool ColumnarStorageTruncate(Relation rel, uint64 newDataReservation);
 
-#endif /* ENGINE_STORAGE_H */
+#endif /* COLUMNAR_STORAGE_H */

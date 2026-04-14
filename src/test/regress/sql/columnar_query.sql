@@ -2,8 +2,8 @@
 -- Test querying columnar tables.
 --
 
-CREATE SCHEMA columnar_join;
-SET search_path to columnar_join, public;
+CREATE SCHEMA engine_join;
+SET search_path to engine_join, public;
 
 -- Settings to make the result deterministic
 SET datestyle = "ISO, YMD";
@@ -90,7 +90,7 @@ UNION
 (table result_regular EXCEPT table result_columnar);
 
 SET client_min_messages TO WARNING;
-DROP SCHEMA columnar_join CASCADE;
+DROP SCHEMA engine_join CASCADE;
 
 --
 -- https://github.com/citusdata/citus/issues/5258
@@ -119,7 +119,7 @@ select * from
 group by f1,f2,fs;
 drop table t1;
 
-CREATE TABLE tbl1(c0 int4range) USING COLUMNAR;
+CREATE TABLE tbl1(c0 int4range) USING ENGINE;
 CREATE TABLE tbl2(c0 int4range);
 
 INSERT INTO tbl1(c0) VALUES('[0,1]'::int4range);
@@ -168,7 +168,7 @@ DROP TABLE t;
 
 CREATE TABLE t(a INT) USING columnar;
 
-SELECT columnar.alter_columnar_table_set('t', chunk_group_row_limit => '11000');
+SELECT columnar.alter_engine_table_set('t', chunk_group_row_limit => '11000');
 
 INSERT INTO t SELECT a FROM generate_series(0,50000) AS a;
 
@@ -183,7 +183,7 @@ DROP TABLE t;
 
 CREATE TABLE t(a INT, b TEXT) USING columnar;
 
-SELECT columnar.alter_columnar_table_set('t', chunk_group_row_limit => '11000');
+SELECT columnar.alter_engine_table_set('t', chunk_group_row_limit => '11000');
 
 INSERT INTO t SELECT a, md5(b::text) FROM generate_series(0,50000) AS t1(a)
 JOIN LATERAL generate_series(1, 10) AS t2(b) ON (true);

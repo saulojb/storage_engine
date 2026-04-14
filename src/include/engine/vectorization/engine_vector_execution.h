@@ -9,8 +9,8 @@
  *-------------------------------------------------------------------------
  */
 
-#ifndef ENGINE_VECTOR_EXECUTION_H
-#define ENGINE_VECTOR_EXECUTION_H
+#ifndef COLUMNAR_VECTOR_EXECUTION_H
+#define COLUMNAR_VECTOR_EXECUTION_H
 
 #include "executor/tuptable.h"
 #include "nodes/pg_list.h"

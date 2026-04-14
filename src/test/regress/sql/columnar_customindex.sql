@@ -7,7 +7,7 @@
 -- Test also shows that we are not using CustomIndexScan with heap tables and only on columnar tables.
 --
 
-SET columnar.enable_columnar_index_scan TO TRUE;
+SET columnar.enable_engine_index_scan TO TRUE;
 
 CREATE TABLE t(a INT PRIMARY KEY, b INT, c TEXT) USING columnar;
 CREATE INDEX t_idx ON t USING btree(b);

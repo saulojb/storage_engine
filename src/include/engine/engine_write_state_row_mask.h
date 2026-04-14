@@ -9,8 +9,8 @@
  *-------------------------------------------------------------------------
  */
 
-#ifndef ENGINE_WRITE_STATE_ROW_MASK_H
-#define ENGINE_WRITE_STATE_ROW_MASK_H
+#ifndef COLUMNAR_WRITE_STATE_ROW_MASK_H
+#define COLUMNAR_WRITE_STATE_ROW_MASK_H
 
 struct RowMaskWriteStateEntry
 {

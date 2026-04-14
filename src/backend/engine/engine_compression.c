@@ -46,10 +46,10 @@ typedef struct ColumnarCompressHeader
  * Utilities for manipulation of header information for compressed data
  */
 
-#define ENGINE_COMPRESS_HDRSZ ((int32) sizeof(ColumnarCompressHeader))
-#define ENGINE_COMPRESS_RAWSIZE(ptr) (((ColumnarCompressHeader *) (ptr))->rawsize)
-#define ENGINE_COMPRESS_RAWDATA(ptr) (((char *) (ptr)) + ENGINE_COMPRESS_HDRSZ)
-#define ENGINE_COMPRESS_SET_RAWSIZE(ptr, \
+#define COLUMNAR_COMPRESS_HDRSZ ((int32) sizeof(ColumnarCompressHeader))
+#define COLUMNAR_COMPRESS_RAWSIZE(ptr) (((ColumnarCompressHeader *) (ptr))->rawsize)
+#define COLUMNAR_COMPRESS_RAWDATA(ptr) (((char *) (ptr)) + COLUMNAR_COMPRESS_HDRSZ)
+#define COLUMNAR_COMPRESS_SET_RAWSIZE(ptr, \
 									  len) (((ColumnarCompressHeader *) (ptr))->rawsize = \
 												(len))
 
@@ -124,7 +124,7 @@ CompressBuffer(StringInfo inputBuffer,
 		case COMPRESSION_PG_LZ:
 		{
 			uint64 maximumLength = PGLZ_MAX_OUTPUT(inputBuffer->len) +
-								   ENGINE_COMPRESS_HDRSZ;
+								   COLUMNAR_COMPRESS_HDRSZ;
 			bool compressionResult = false;
 
 			resetStringInfo(outputBuffer);
@@ -132,14 +132,14 @@ CompressBuffer(StringInfo inputBuffer,
 
 			int32 compressedByteCount = pglz_compress((const char *) inputBuffer->data,
 													  inputBuffer->len,
-													  ENGINE_COMPRESS_RAWDATA(
+													  COLUMNAR_COMPRESS_RAWDATA(
 														  outputBuffer->data),
 													  PGLZ_strategy_always);
 			if (compressedByteCount >= 0)
 			{
-				ENGINE_COMPRESS_SET_RAWSIZE(outputBuffer->data, inputBuffer->len);
+				COLUMNAR_COMPRESS_SET_RAWSIZE(outputBuffer->data, inputBuffer->len);
 				SET_VARSIZE_COMPRESSED(outputBuffer->data,
-									   compressedByteCount + ENGINE_COMPRESS_HDRSZ);
+									   compressedByteCount + COLUMNAR_COMPRESS_HDRSZ);
 				compressionResult = true;
 			}
 
@@ -231,10 +231,10 @@ DecompressBuffer(StringInfo buffer,
 
 		case COMPRESSION_PG_LZ:
 		{
-			uint32 compressedDataSize = VARSIZE(buffer->data) - ENGINE_COMPRESS_HDRSZ;
-			uint32 decompressedDataSize = ENGINE_COMPRESS_RAWSIZE(buffer->data);
+			uint32 compressedDataSize = VARSIZE(buffer->data) - COLUMNAR_COMPRESS_HDRSZ;
+			uint32 decompressedDataSize = COLUMNAR_COMPRESS_RAWSIZE(buffer->data);
 
-			if (compressedDataSize + ENGINE_COMPRESS_HDRSZ != buffer->len)
+			if (compressedDataSize + COLUMNAR_COMPRESS_HDRSZ != buffer->len)
 			{
 				ereport(ERROR, (errmsg("cannot decompress the buffer"),
 								errdetail("Expected %u bytes, but received %u bytes",
@@ -243,7 +243,7 @@ DecompressBuffer(StringInfo buffer,
 
 			char *decompressedData = palloc0(decompressedDataSize);
 
-			int32 decompressedByteCount = pglz_decompress(ENGINE_COMPRESS_RAWDATA(
+			int32 decompressedByteCount = pglz_decompress(COLUMNAR_COMPRESS_RAWDATA(
 															  buffer->data),
 														  compressedDataSize,
 														  decompressedData,

@@ -1,5 +1,5 @@
-#ifndef ENGINE_TABLEAM_H
-#define ENGINE_TABLEAM_H
+#ifndef COLUMNAR_TABLEAM_H
+#define COLUMNAR_TABLEAM_H
 #include "citus_version.h"
 
 #include "postgres.h"
@@ -66,4 +66,4 @@ extern bool ColumnarSupportsIndexAM(char *indexAMName);
 extern bool IsColumnarTableAmTable(Oid relationId);
 
 
-#endif /* ENGINE_TABLEAM_H */
+#endif /* COLUMNAR_TABLEAM_H */

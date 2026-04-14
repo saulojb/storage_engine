@@ -9,8 +9,8 @@
  *-------------------------------------------------------------------------
  */
 
-#ifndef ENGINE_VECTOR_TYPES_H
-#define ENGINE_VECTOR_TYPES_H
+#ifndef COLUMNAR_VECTOR_TYPES_H
+#define COLUMNAR_VECTOR_TYPES_H
 
 #include "postgres.h"
 #include "fmgr.h"
@@ -20,7 +20,7 @@
 #include "nodes/primnodes.h"
 
 /* DEFAULT_CHUNK_ROW_COUNT */
-#define ENGINE_VECTOR_COLUMN_SIZE 10000
+#define COLUMNAR_VECTOR_COLUMN_SIZE 10000
 
 typedef struct VectorTupleTableSlot
 {
@@ -29,9 +29,9 @@ typedef struct VectorTupleTableSlot
 	/* How many tuples does this slot contain */ 
 	uint32 dimension;
 	/* Keep array to represent filtered tuples */
-	bool keep[ENGINE_VECTOR_COLUMN_SIZE];
+	bool keep[COLUMNAR_VECTOR_COLUMN_SIZE];
 	/* Row Number */
-	uint64 rowNumber[ENGINE_VECTOR_COLUMN_SIZE];
+	uint64 rowNumber[COLUMNAR_VECTOR_COLUMN_SIZE];
 } VectorTupleTableSlot;
 
 extern TupleTableSlot * CreateVectorTupleTableSlot(TupleDesc tupleDesc);
@@ -42,7 +42,7 @@ typedef struct VectorColumn
 	uint16	columnTypeLen;
 	bool 	columnIsVal;
 	Datum	*value;
-	bool	isnull[ENGINE_VECTOR_COLUMN_SIZE];
+	bool	isnull[COLUMNAR_VECTOR_COLUMN_SIZE];
 	uint64	*rowNumber;
 } VectorColumn;
 

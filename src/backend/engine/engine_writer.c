@@ -227,7 +227,7 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Datum *columnValues, bool *colu
 	 * written to StripeBuffers during ColumnarFlushPendingWrites() at the
 	 * end of the statement (or when the stripe fills up).
 	 *
-	 * We return ENGINE_FIRST_ROW_NUMBER as a placeholder — callers that
+	 * We return COLUMNAR_FIRST_ROW_NUMBER as a placeholder — callers that
 	 * require precise TIDs (e.g. RETURNING) are not compatible with sort
 	 * ordering, but columnar tables have no secondary indexes so this is
 	 * acceptable in practice.
@@ -280,7 +280,7 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Datum *columnValues, bool *colu
 				(int) writeState->options.stripeRowCount)
 			ColumnarFlushPendingWrites(writeState);
 
-		return ENGINE_FIRST_ROW_NUMBER; /* placeholder */
+		return COLUMNAR_FIRST_ROW_NUMBER; /* placeholder */
 	}
 
 	return ColumnarWriteRowInternal(writeState, columnValues, columnNulls);

@@ -9,8 +9,8 @@
  *-------------------------------------------------------------------------
  */
 
-#ifndef ENGINE_COMPAT_H
-#define ENGINE_COMPAT_H
+#ifndef COLUMNAR_COMPAT_H
+#define COLUMNAR_COMPAT_H
 
 #include "pg_version_constants.h"
 
@@ -55,4 +55,4 @@
 	FreeExprContext((planstate)->ps_ExprContext, true)
 #endif
 
-#endif /* ENGINE_COMPAT_H */
+#endif /* COLUMNAR_COMPAT_H */

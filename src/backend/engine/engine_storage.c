@@ -96,10 +96,10 @@ typedef struct PhysicalAddr
 } PhysicalAddr;
 
 
-#define ENGINE_METAPAGE_BLOCKNO 0
-#define ENGINE_EMPTY_BLOCKNO 1
-#define ENGINE_INVALID_STRIPE_ID 0
-#define ENGINE_FIRST_STRIPE_ID 1
+#define COLUMNAR_METAPAGE_BLOCKNO 0
+#define COLUMNAR_EMPTY_BLOCKNO 1
+#define COLUMNAR_INVALID_STRIPE_ID 0
+#define COLUMNAR_FIRST_STRIPE_ID 1
 
 
 #define OLD_METAPAGE_VERSION_HINT "Use \"VACUUM\" to upgrade the columnar table format " \
@@ -118,8 +118,8 @@ LogicalToPhysical(uint64 logicalOffset)
 {
 	PhysicalAddr addr;
 
-	addr.blockno = logicalOffset / ENGINE_BYTES_PER_PAGE;
-	addr.offset = SizeOfPageHeaderData + (logicalOffset % ENGINE_BYTES_PER_PAGE);
+	addr.blockno = logicalOffset / COLUMNAR_BYTES_PER_PAGE;
+	addr.offset = SizeOfPageHeaderData + (logicalOffset % COLUMNAR_BYTES_PER_PAGE);
 
 	return addr;
 }
@@ -131,7 +131,7 @@ LogicalToPhysical(uint64 logicalOffset)
 static inline uint64
 PhysicalToLogical(PhysicalAddr addr)
 {
-	return ENGINE_BYTES_PER_PAGE * addr.blockno + addr.offset - SizeOfPageHeaderData;
+	return COLUMNAR_BYTES_PER_PAGE * addr.blockno + addr.offset - SizeOfPageHeaderData;
 }
 
 
@@ -182,10 +182,10 @@ ColumnarStorageInit(SMgrRelation srel, uint64 storageId)
 
 	ColumnarMetapage metapage = { 0 };
 	metapage.storageId = storageId;
-	metapage.versionMajor = ENGINE_VERSION_MAJOR;
-	metapage.versionMinor = ENGINE_VERSION_MINOR;
-	metapage.reservedStripeId = ENGINE_FIRST_STRIPE_ID;
-	metapage.reservedRowNumber = ENGINE_FIRST_ROW_NUMBER;
+	metapage.versionMajor = COLUMNAR_VERSION_MAJOR;
+	metapage.versionMinor = COLUMNAR_VERSION_MINOR;
+	metapage.reservedStripeId = COLUMNAR_FIRST_STRIPE_ID;
+	metapage.reservedRowNumber = COLUMNAR_FIRST_ROW_NUMBER;
 	metapage.reservedOffset = ColumnarFirstLogicalOffset;
 	metapage.unloggedReset = false;
 	memcpy_s(page + phdr->pd_lower, phdr->pd_upper - phdr->pd_lower,
@@ -193,28 +193,28 @@ ColumnarStorageInit(SMgrRelation srel, uint64 storageId)
 	phdr->pd_lower += sizeof(ColumnarMetapage);
 #if PG_VERSION_NUM >= PG_VERSION_16
 	log_newpage(&srel->smgr_rlocator.locator, MAIN_FORKNUM,
-				ENGINE_METAPAGE_BLOCKNO, page, true);
+				COLUMNAR_METAPAGE_BLOCKNO, page, true);
 #else
 	log_newpage(&srel->smgr_rnode.node, MAIN_FORKNUM,
-				ENGINE_METAPAGE_BLOCKNO, page, true);
+				COLUMNAR_METAPAGE_BLOCKNO, page, true);
 #endif
 
-	PageSetChecksumInplace(page, ENGINE_METAPAGE_BLOCKNO);
-	smgrextend(srel, MAIN_FORKNUM, ENGINE_METAPAGE_BLOCKNO, page, true);
+	PageSetChecksumInplace(page, COLUMNAR_METAPAGE_BLOCKNO);
+	smgrextend(srel, MAIN_FORKNUM, COLUMNAR_METAPAGE_BLOCKNO, page, true);
 
 	/* write empty page */
 	PageInit(page, BLCKSZ, 0);
 
 #if PG_VERSION_NUM >= PG_VERSION_16
 	log_newpage(&srel->smgr_rlocator.locator, MAIN_FORKNUM,
-				ENGINE_EMPTY_BLOCKNO, page, true);
+				COLUMNAR_EMPTY_BLOCKNO, page, true);
 #else
 	log_newpage(&srel->smgr_rnode.node, MAIN_FORKNUM,
-				ENGINE_EMPTY_BLOCKNO, page, true);
+				COLUMNAR_EMPTY_BLOCKNO, page, true);
 #endif
 
-	PageSetChecksumInplace(page, ENGINE_EMPTY_BLOCKNO);
-	smgrextend(srel, MAIN_FORKNUM, ENGINE_EMPTY_BLOCKNO, page, true);
+	PageSetChecksumInplace(page, COLUMNAR_EMPTY_BLOCKNO);
+	smgrextend(srel, MAIN_FORKNUM, COLUMNAR_EMPTY_BLOCKNO, page, true);
 
 	/*
 	 * An immediate sync is required even if we xlog'd the page, because the
@@ -258,8 +258,8 @@ ColumnarStorageUpdateCurrent(Relation rel, bool upgrade, uint64 reservedStripeId
 		elog(ERROR, "found older columnar metapage while downgrading");
 	}
 
-	metapage.versionMajor = ENGINE_VERSION_MAJOR;
-	metapage.versionMinor = ENGINE_VERSION_MINOR;
+	metapage.versionMajor = COLUMNAR_VERSION_MAJOR;
+	metapage.versionMinor = COLUMNAR_VERSION_MINOR;
 
 	/* storageId remains the same */
 	metapage.reservedStripeId = reservedStripeId;
@@ -628,7 +628,7 @@ ColumnarOverwriteMetapage(Relation relation, ColumnarMetapage columnarMetapage)
 {
 	/* clear metapage because we are overwriting */
 	bool clear = true;
-	WriteToBlock(relation, ENGINE_METAPAGE_BLOCKNO, SizeOfPageHeaderData,
+	WriteToBlock(relation, COLUMNAR_METAPAGE_BLOCKNO, SizeOfPageHeaderData,
 				 (char *) &columnarMetapage, sizeof(ColumnarMetapage), clear);
 }
 
@@ -671,7 +671,7 @@ ColumnarMetapageRead(Relation rel, bool force)
 	 */
 	bool forceReadBlock = true;
 	ColumnarMetapage metapage;
-	ReadFromBlock(rel, ENGINE_METAPAGE_BLOCKNO, SizeOfPageHeaderData,
+	ReadFromBlock(rel, COLUMNAR_METAPAGE_BLOCKNO, SizeOfPageHeaderData,
 				  (char *) &metapage, sizeof(ColumnarMetapage), forceReadBlock);
 
 	if (!force)
@@ -800,8 +800,8 @@ AlignReservation(uint64 prevReservation)
 static bool
 ColumnarMetapageIsCurrent(ColumnarMetapage *metapage)
 {
-	return (metapage->versionMajor == ENGINE_VERSION_MAJOR &&
-			metapage->versionMinor == ENGINE_VERSION_MINOR);
+	return (metapage->versionMajor == COLUMNAR_VERSION_MAJOR &&
+			metapage->versionMinor == COLUMNAR_VERSION_MINOR);
 }
 
 
@@ -811,9 +811,9 @@ ColumnarMetapageIsCurrent(ColumnarMetapage *metapage)
 static bool
 ColumnarMetapageIsOlder(ColumnarMetapage *metapage)
 {
-	return (metapage->versionMajor < ENGINE_VERSION_MAJOR ||
-			(metapage->versionMajor == ENGINE_VERSION_MAJOR &&
-			 (int) metapage->versionMinor < (int) ENGINE_VERSION_MINOR));
+	return (metapage->versionMajor < COLUMNAR_VERSION_MAJOR ||
+			(metapage->versionMajor == COLUMNAR_VERSION_MAJOR &&
+			 (int) metapage->versionMinor < (int) COLUMNAR_VERSION_MINOR));
 }
 
 
@@ -823,9 +823,9 @@ ColumnarMetapageIsOlder(ColumnarMetapage *metapage)
 static bool
 ColumnarMetapageIsNewer(ColumnarMetapage *metapage)
 {
-	return (metapage->versionMajor > ENGINE_VERSION_MAJOR ||
-			(metapage->versionMajor == ENGINE_VERSION_MAJOR &&
-			 metapage->versionMinor > ENGINE_VERSION_MINOR));
+	return (metapage->versionMajor > COLUMNAR_VERSION_MAJOR ||
+			(metapage->versionMajor == COLUMNAR_VERSION_MAJOR &&
+			 metapage->versionMinor > COLUMNAR_VERSION_MINOR));
 }
 
 
@@ -844,7 +844,7 @@ ColumnarMetapageCheckVersion(Relation rel, ColumnarMetapage *metapage)
 							RelationGetRelationName(rel)),
 						errdetail(
 							"Engine format version %d.%d is required, \"%s\" has version %d.%d.",
-							ENGINE_VERSION_MAJOR, ENGINE_VERSION_MINOR,
+							COLUMNAR_VERSION_MAJOR, COLUMNAR_VERSION_MINOR,
 							RelationGetRelationName(rel),
 							metapage->versionMajor, metapage->versionMinor),
 						errhint(OLD_METAPAGE_VERSION_HINT)));

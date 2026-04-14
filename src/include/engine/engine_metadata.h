@@ -9,8 +9,8 @@
  *-------------------------------------------------------------------------
  */
 
-#ifndef ENGINE_METADATA_H
-#define ENGINE_METADATA_H
+#ifndef COLUMNAR_METADATA_H
+#define COLUMNAR_METADATA_H
 
 #include "access/sdir.h"
 
@@ -60,4 +60,4 @@ extern void ColumnarStorageUpdateIfNeeded(Relation rel, bool isUpgrade);
 extern StripeMetadata * RewriteStripeMetadataRowWithNewValues(Relation rel, uint64 stripeId,
               uint64 sizeBytes, uint64 fileOffset, uint64 rowCount, uint64 chunkCount);
 
-#endif /* ENGINE_METADATA_H */
+#endif /* COLUMNAR_METADATA_H */

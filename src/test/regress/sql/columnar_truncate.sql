@@ -7,110 +7,110 @@ SHOW server_version \gset
 SELECT substring(:'server_version', '\d+')::int > 10 AS version_above_ten;
 
 -- CREATE a columnar table, fill with some data --
-CREATE TABLE columnar_truncate_test (a int, b int) USING columnar;
-CREATE TABLE columnar_truncate_test_second (a int, b int) USING columnar;
+CREATE TABLE engine_truncate_test (a int, b int) USING columnar;
+CREATE TABLE engine_truncate_test_second (a int, b int) USING columnar;
 -- COMPRESSED
-CREATE TABLE columnar_truncate_test_compressed (a int, b int) USING columnar;
-CREATE TABLE columnar_truncate_test_regular (a int, b int);
+CREATE TABLE engine_truncate_test_compressed (a int, b int) USING columnar;
+CREATE TABLE engine_truncate_test_regular (a int, b int);
 
-SELECT count(distinct storage_id) AS columnar_data_files_before_truncate FROM columnar.stripe \gset
+SELECT count(distinct storage_id) AS engine_data_files_before_truncate FROM columnar.stripe \gset
 
-INSERT INTO columnar_truncate_test select a, a from generate_series(1, 10) a;
+INSERT INTO engine_truncate_test select a, a from generate_series(1, 10) a;
 
 set columnar.compression = 'pglz';
-INSERT INTO columnar_truncate_test_compressed select a, a from generate_series(1, 10) a;
-INSERT INTO columnar_truncate_test_compressed select a, a from generate_series(1, 10) a;
+INSERT INTO engine_truncate_test_compressed select a, a from generate_series(1, 10) a;
+INSERT INTO engine_truncate_test_compressed select a, a from generate_series(1, 10) a;
 set columnar.compression to default;
 
 -- query rows
-SELECT * FROM columnar_truncate_test;
+SELECT * FROM engine_truncate_test;
 
-SELECT * FROM columnar_test_helpers.chunk_group_consistency;
-
-select
-  version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('columnar_truncate_test');
-
-TRUNCATE TABLE columnar_truncate_test;
+SELECT * FROM engine_test_helpers.chunk_group_consistency;
 
 select
   version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('columnar_truncate_test');
+  from engine_test_helpers.engine_storage_info('engine_truncate_test');
 
-SELECT * FROM columnar_test_helpers.chunk_group_consistency;
+TRUNCATE TABLE engine_truncate_test;
 
-SELECT * FROM columnar_truncate_test;
+select
+  version_major, version_minor, reserved_stripe_id, reserved_row_number
+  from engine_test_helpers.engine_storage_info('engine_truncate_test');
 
-SELECT COUNT(*) from columnar_truncate_test;
+SELECT * FROM engine_test_helpers.chunk_group_consistency;
 
-SELECT count(*) FROM columnar_truncate_test_compressed;
-TRUNCATE TABLE columnar_truncate_test_compressed;
-SELECT count(*) FROM columnar_truncate_test_compressed;
+SELECT * FROM engine_truncate_test;
 
-SELECT pg_relation_size('columnar_truncate_test_compressed');
+SELECT COUNT(*) from engine_truncate_test;
 
-INSERT INTO columnar_truncate_test select a, a from generate_series(1, 10) a;
-INSERT INTO columnar_truncate_test_regular select a, a from generate_series(10, 20) a;
-INSERT INTO columnar_truncate_test_second select a, a from generate_series(20, 30) a;
+SELECT count(*) FROM engine_truncate_test_compressed;
+TRUNCATE TABLE engine_truncate_test_compressed;
+SELECT count(*) FROM engine_truncate_test_compressed;
 
-SELECT * from columnar_truncate_test;
+SELECT pg_relation_size('engine_truncate_test_compressed');
 
-SELECT * from columnar_truncate_test_second;
+INSERT INTO engine_truncate_test select a, a from generate_series(1, 10) a;
+INSERT INTO engine_truncate_test_regular select a, a from generate_series(10, 20) a;
+INSERT INTO engine_truncate_test_second select a, a from generate_series(20, 30) a;
 
-SELECT * from columnar_truncate_test_regular;
+SELECT * from engine_truncate_test;
 
-SELECT * FROM columnar_test_helpers.chunk_group_consistency;
+SELECT * from engine_truncate_test_second;
+
+SELECT * from engine_truncate_test_regular;
+
+SELECT * FROM engine_test_helpers.chunk_group_consistency;
 
 -- make sure multi truncate works
 -- notice that the same table might be repeated
-TRUNCATE TABLE columnar_truncate_test,
-			   columnar_truncate_test_regular,
-			   columnar_truncate_test_second,
-   			   columnar_truncate_test;
+TRUNCATE TABLE engine_truncate_test,
+			   engine_truncate_test_regular,
+			   engine_truncate_test_second,
+   			   engine_truncate_test;
 
-SELECT * FROM columnar_test_helpers.chunk_group_consistency;
+SELECT * FROM engine_test_helpers.chunk_group_consistency;
 
-SELECT * from columnar_truncate_test;
-SELECT * from columnar_truncate_test_second;
-SELECT * from columnar_truncate_test_regular;
+SELECT * from engine_truncate_test;
+SELECT * from engine_truncate_test_second;
+SELECT * from engine_truncate_test_regular;
 
 -- test if truncate on empty table works
-TRUNCATE TABLE columnar_truncate_test;
-SELECT * from columnar_truncate_test;
+TRUNCATE TABLE engine_truncate_test;
+SELECT * from engine_truncate_test;
 
 -- make sure TRUNCATE deletes metadata for old relfilenode
-SELECT :columnar_data_files_before_truncate - count(distinct storage_id) FROM columnar.stripe;
+SELECT :engine_data_files_before_truncate - count(distinct storage_id) FROM columnar.stripe;
 
 -- test if truncation in the same transaction that created the table works properly
 BEGIN;
-CREATE TABLE columnar_same_transaction_truncate(a int) USING columnar;
-INSERT INTO columnar_same_transaction_truncate SELECT * FROM generate_series(1, 100);
-TRUNCATE columnar_same_transaction_truncate;
-INSERT INTO columnar_same_transaction_truncate SELECT * FROM generate_series(20, 23);
+CREATE TABLE engine_same_transaction_truncate(a int) USING columnar;
+INSERT INTO engine_same_transaction_truncate SELECT * FROM generate_series(1, 100);
+TRUNCATE engine_same_transaction_truncate;
+INSERT INTO engine_same_transaction_truncate SELECT * FROM generate_series(20, 23);
 COMMIT;
 
 -- should output "1" for the newly created relation
-SELECT count(distinct storage_id) - :columnar_data_files_before_truncate FROM columnar.stripe;
-SELECT * FROM columnar_same_transaction_truncate;
+SELECT count(distinct storage_id) - :engine_data_files_before_truncate FROM columnar.stripe;
+SELECT * FROM engine_same_transaction_truncate;
 
-DROP TABLE columnar_same_transaction_truncate;
+DROP TABLE engine_same_transaction_truncate;
 
 -- test if a cached truncate from a pl/pgsql function works
-CREATE FUNCTION columnar_truncate_test_regular_func() RETURNS void AS $$
+CREATE FUNCTION engine_truncate_test_regular_func() RETURNS void AS $$
 BEGIN
-	INSERT INTO columnar_truncate_test_regular select a, a from generate_series(1, 10) a;
-	TRUNCATE TABLE columnar_truncate_test_regular;
+	INSERT INTO engine_truncate_test_regular select a, a from generate_series(1, 10) a;
+	TRUNCATE TABLE engine_truncate_test_regular;
 END;$$
 LANGUAGE plpgsql;
 
-SELECT columnar_truncate_test_regular_func();
+SELECT engine_truncate_test_regular_func();
 -- the cached plans are used stating from the second call
-SELECT columnar_truncate_test_regular_func();
-DROP FUNCTION columnar_truncate_test_regular_func();
+SELECT engine_truncate_test_regular_func();
+DROP FUNCTION engine_truncate_test_regular_func();
 
-DROP TABLE columnar_truncate_test, columnar_truncate_test_second;
-DROP TABLE columnar_truncate_test_regular;
-DROP TABLE columnar_truncate_test_compressed;
+DROP TABLE engine_truncate_test, engine_truncate_test_second;
+DROP TABLE engine_truncate_test_regular;
+DROP TABLE engine_truncate_test_compressed;
 
 -- test truncate with schema
 CREATE SCHEMA truncate_schema;
@@ -153,7 +153,7 @@ TRUNCATE TABLE truncate_schema.truncate_tbl;
 SELECT count(*) FROM truncate_schema.truncate_tbl;
 \c - :current_user
 
-SELECT * FROM columnar_test_helpers.chunk_group_consistency;
+SELECT * FROM engine_test_helpers.chunk_group_consistency;
 
 -- cleanup
 DROP SCHEMA truncate_schema CASCADE;

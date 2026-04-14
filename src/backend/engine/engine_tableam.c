@@ -111,6 +111,15 @@ typedef struct ColumnarScanDescData
 	bool returnVectorizedTuple;
 
 	/*
+	 * ANALYZE chunk-group sampling.
+	 * cs_analyze_initialized: true after the stride was computed.
+	 * cs_analyze_cg_stride: 0 = read all CGs; N > 1 = read 1 CG then skip N-1.
+	 */
+	bool cs_analyze_initialized;
+	int  cs_analyze_cg_stride;
+	bool cs_analyze_block_done; /* true after next_block returned true once */
+
+	/*
 	 * Bitmap scan state — used by engine_scan_bitmap_next_block /
 	 * engine_scan_bitmap_next_tuple to iterate over a TIDBitmap.
 	 */
@@ -419,6 +428,8 @@ engine_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot 
 									 scan->scanContext, scan->cs_base.rs_snapshot,
 									 randomAccess,
 									 scan->parallelColumnarScan);
+		/* Propagate ANALYZE sampling stride (0 = normal scan) */
+		ColumnarSetAnalyzeCGStride(scan->cs_readState, scan->cs_analyze_cg_stride);
 	}
 
 	ExecClearTuple(slot);
@@ -500,18 +511,18 @@ tid_to_row_number(ItemPointerData tid)
 static void
 ErrorIfInvalidRowNumber(uint64 rowNumber)
 {
-	if (rowNumber == ENGINE_INVALID_ROW_NUMBER)
+	if (rowNumber == COLUMNAR_INVALID_ROW_NUMBER)
 	{
 		/* not expected but be on the safe side */
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("unexpected row number for columnar table")));
 	}
-	else if (rowNumber > ENGINE_MAX_ROW_NUMBER)
+	else if (rowNumber > COLUMNAR_MAX_ROW_NUMBER)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("columnar tables can't have row numbers "
 							   "greater than " UINT64_FORMAT,
-							   (uint64) ENGINE_MAX_ROW_NUMBER),
+							   (uint64) COLUMNAR_MAX_ROW_NUMBER),
 						errhint("Consider using VACUUM FULL for your table")));
 	}
 }
@@ -2183,11 +2194,14 @@ static bool
 engine_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
 {
 	/*
-	 * Our access method is not pages based, i.e. tuples are not confined
-	 * to pages boundaries. So not much to do here. We return true anyway
-	 * so acquire_sample_rows() in analyze.c would call our
-	 * engine_scan_analyze_next_tuple() callback.
+	 * Columnar tables have no heap pages. Treat the entire table as a single
+	 * logical block: return true exactly once, then false to terminate
+	 * acquire_sample_rows outer loop after next_tuple exhausts all rows.
 	 */
+	ColumnarScanDesc cscan = (ColumnarScanDesc) scan;
+	if (cscan->cs_analyze_block_done)
+		return false;
+	cscan->cs_analyze_block_done = true;
 	return true;
 }
 #else
@@ -2195,12 +2209,10 @@ static bool
 engine_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 								 BufferAccessStrategy bstrategy)
 {
-	/*
-	 * Our access method is not pages based, i.e. tuples are not confined
-	 * to pages boundaries. So not much to do here. We return true anyway
-	 * so acquire_sample_rows() in analyze.c would call our
-	 * engine_scan_analyze_next_tuple() callback.
-	 */
+	ColumnarScanDesc cscan = (ColumnarScanDesc) scan;
+	if (cscan->cs_analyze_block_done)
+		return false;
+	cscan->cs_analyze_block_done = true;
 	return true;
 }
 #endif
@@ -2211,21 +2223,39 @@ engine_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 								 double *liverows, double *deadrows,
 								 TupleTableSlot *slot)
 {
+	ColumnarScanDesc cscan = (ColumnarScanDesc) scan;
+
 	/* Capture the cache state and disable it for a vacuum. */
 	bool old_cache_mode = engine_enable_page_cache;
 	engine_enable_page_cache = false;
 
 	/*
-	 * Currently we don't do anything smart to reduce number of rows returned
-	 * for ANALYZE. The TableAM API's ANALYZE functions are designed for page
-	 * based access methods where it chooses random pages, and then reads
-	 * tuples from those pages.
+	 * Compute the chunk-group sampling stride once, before the first slot read
+	 * (cs_readState is still NULL at this point so no stripe has been opened).
 	 *
-	 * We could do something like that here by choosing sample stripes or chunks,
-	 * but getting that correct might need quite some work. Since engine_fdw's
-	 * ANALYZE scanned all rows, as a starter we do the same here and scan all
-	 * rows.
+	 * We target ~30,000 rows (300 × default_statistics_target=100).  A stride
+	 * of N means: decompress 1 chunk group, then skip the next N-1 chunk
+	 * groups without decompressing them.  This gives uniform coverage across
+	 * the whole table while greatly reducing CPU time for large tables.
+	 *
+	 * For small tables (totalRows <= targrows) we leave cs_analyze_cg_stride=0
+	 * which means "read all chunk groups" (no sampling).
 	 */
+	if (!cscan->cs_analyze_initialized)
+	{
+		cscan->cs_analyze_initialized = true;
+
+		uint64 totalRows = ColumnarTableRowCount(scan->rs_rd);
+		const int targrows = 30000; /* 300 * default default_statistics_target */
+
+		if (totalRows > (uint64) targrows)
+		{
+			int stride = (int) ceil((double) totalRows / (double) targrows);
+			cscan->cs_analyze_cg_stride = Max(2, stride);
+		}
+		/* else: cs_analyze_cg_stride stays 0 — read everything */
+	}
+
 	if (engine_getnextslot(scan, ForwardScanDirection, slot))
 	{
 		(*liverows)++;
@@ -3002,7 +3032,7 @@ engine_tableam_init()
 {
 	ColumnarTableSetOptions_hook_type **ColumnarTableSetOptions_hook_ptr =
 		(ColumnarTableSetOptions_hook_type **) find_rendezvous_variable(
-			ENGINE_SETOPTIONS_HOOK_SYM);
+			COLUMNAR_SETOPTIONS_HOOK_SYM);
 	*ColumnarTableSetOptions_hook_ptr = &ColumnarTableSetOptions_hook;
 
 	RegisterXactCallback(ColumnarXactCallback, NULL);
@@ -3568,8 +3598,6 @@ se_alter_engine_table_set(PG_FUNCTION_ARGS)
 			pfree(chkbuf.data);
 		}
 
-		ereport(DEBUG1, (errmsg("updating orderby to %s",
-								options.orderby ? options.orderby : "(none)")));
 	}
 
 	/* index_scan => not null: enable/disable per-table index scan */

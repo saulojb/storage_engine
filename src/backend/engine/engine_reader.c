@@ -106,6 +106,13 @@ struct ColumnarReadState
 
 	/* Parallel exeuction */
 	ParallelColumnarScan parallelColumnarScan;
+
+	/*
+	 * ANALYZE chunk-group sampling: read 1 CG, skip (stride-1) CGs.
+	 * 0 = disabled (normal full scan).
+	 * Propagated to StripeReadState->analyze_cg_stride by each BeginStripeRead call.
+	 */
+	int analyze_cg_stride;
 };
 
 /* static function declarations */
@@ -128,7 +135,8 @@ static StripeReadState * BeginStripeRead(StripeMetadata *stripeMetadata, Relatio
 										 TupleDesc tupleDesc, List *projectedColumnList,
 										 List *whereClauseList, List *whereClauseVars,
 										 MemoryContext stripeReadContext,
-										 Snapshot snapshot);
+										 Snapshot snapshot,
+										 int analyze_cg_stride);
 static void AdvanceStripeRead(ColumnarReadState *readState);
 static bool SnapshotMightSeeUnflushedStripes(Snapshot snapshot);
 static bool ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnValues,
@@ -152,7 +160,8 @@ static StripeBuffers * LoadFilteredStripeBuffers(Relation relation,
 												 List *whereClauseList,
 												 List *whereClauseVars,
 												 int64 *chunkGroupsFiltered,
-												 Snapshot snapshot);
+												 Snapshot snapshot,
+												 int analyze_cg_stride);
 static ColumnBuffers * LoadColumnBuffers(Relation relation,
 										 ColumnChunkSkipNode *chunkSkipNodeArray,
 										 uint32 chunkCount, uint64 stripeOffset,
@@ -350,7 +359,8 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *columnValues, bool *col
 														 readState->whereClauseList,
 														 readState->whereClauseVars,
 														 readState->stripeReadContext,
-														 readState->snapshot);
+														 readState->snapshot,
+														 readState->analyze_cg_stride);
 		}
 
 		if (!ReadStripeNextRow(readState->stripeReadState, columnValues, columnNulls,
@@ -445,7 +455,8 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 													 whereClauseList,
 													 whereClauseVars,
 													 stripeReadContext,
-													 snapshot);
+													 snapshot,
+													 0 /* no ANALYZE sampling */);
 
 		readState->currentStripeMetadata = stripeMetadata;
 	}
@@ -499,7 +510,8 @@ ColumnarSetStripeReadState(ColumnarReadState *readState,
 													 whereClauseList,
 													 whereClauseVars,
 													 stripeReadContext,
-													 snapshot);
+													 snapshot,
+													 0 /* no ANALYZE sampling */);
 
 		readState->currentStripeMetadata = stripeMetadata;
 	}
@@ -763,7 +775,8 @@ ColumnarResetRead(ColumnarReadState *readState)
 static StripeReadState *
 BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDesc,
 				List *projectedColumnList, List *whereClauseList, List *whereClauseVars,
-				MemoryContext stripeReadContext, Snapshot snapshot)
+				MemoryContext stripeReadContext, Snapshot snapshot,
+				int analyze_cg_stride)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(stripeReadContext);
 
@@ -784,7 +797,8 @@ BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDes
 															   whereClauseVars,
 															   &stripeReadState->
 															   chunkGroupsFiltered,
-															   snapshot);
+															   snapshot,
+															   analyze_cg_stride);
 
 	stripeReadState->rowCount = stripeReadState->stripeBuffers->rowCount;
 
@@ -807,7 +821,7 @@ AdvanceStripeRead(ColumnarReadState *readState)
 	if (readState->parallelColumnarScan == 0)
 	{
 		/* if not read any stripes yet, start from the first one .. */
-		uint64 lastReadRowNumber = ENGINE_INVALID_ROW_NUMBER;
+		uint64 lastReadRowNumber = COLUMNAR_INVALID_ROW_NUMBER;
 		if (StripeReadInProgress(readState))
 		{
 			/* .. otherwise, continue with the next stripe */
@@ -1144,6 +1158,19 @@ ColumnarReadChunkGroupsFiltered(ColumnarReadState *state)
 
 
 /*
+ * ColumnarSetAnalyzeCGStride sets the chunk-group sampling stride used during
+ * ANALYZE.  A stride of N means: decompress 1 chunk group then skip the next
+ * N-1 chunk groups without decompressing.  stride=0 disables sampling (read
+ * all chunk groups).  Must be called before the first row is read.
+ */
+void
+ColumnarSetAnalyzeCGStride(ColumnarReadState *state, int stride)
+{
+	state->analyze_cg_stride = stride;
+}
+
+
+/*
  * CreateEmptyChunkDataArray creates data buffers to keep deserialized exist and
  * value arrays for requested columns in columnMask.
  */
@@ -1290,7 +1317,8 @@ static StripeBuffers *
 LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 						  TupleDesc tupleDescriptor, List *projectedColumnList,
 						  List *whereClauseList, List *whereClauseVars,
-						  int64 *chunkGroupsFiltered, Snapshot snapshot)
+						  int64 *chunkGroupsFiltered, Snapshot snapshot,
+						  int analyze_cg_stride)
 {
 	uint32 columnIndex = 0;
 	uint32 columnCount = tupleDescriptor->natts;
@@ -1312,6 +1340,17 @@ LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 #endif
 	bool *selectedChunkMask = SelectedChunkMask(stripeSkipList, whereClauseList,
 												whereClauseVars, chunkGroupsFiltered);
+
+	/*
+	 * ANALYZE chunk-group sampling: exclude CGs not matching the stride so that
+	 * LoadColumnBuffers never reads their compressed data from disk.
+	 */
+	if (analyze_cg_stride > 1)
+	{
+		for (uint32 cgIdx = 0; cgIdx < stripeSkipList->chunkCount; cgIdx++)
+			if (cgIdx % analyze_cg_stride != 0)
+				selectedChunkMask[cgIdx] = false;
+	}
 
 	StripeSkipList *selectedChunkSkipList =
 		SelectedChunkSkipList(stripeSkipList, projectedColumnMask,
@@ -2066,7 +2105,8 @@ ColumnarReadNextVector(ColumnarReadState *readState,  Datum *columnValues,
 														 readState->whereClauseList,
 														 readState->whereClauseVars,
 														 readState->stripeReadContext,
-														 readState->snapshot);
+														 readState->snapshot,
+														 readState->analyze_cg_stride);
 		}
 
 		if (!ReadStripeNextVector(readState->stripeReadState, columnValues, columnNulls, 
@@ -2221,7 +2261,7 @@ ReadChunkGroupNextVector(ChunkGroupReadState *chunkGroupReadState, Datum *column
 		if (chunkGroupReadState->currentRow >= chunkGroupReadState->rowCount)
 			return false;
 		
-		if (*chunkReadRows >= ENGINE_VECTOR_COLUMN_SIZE)
+		if (*chunkReadRows >= COLUMNAR_VECTOR_COLUMN_SIZE)
 			break;
 
 		if (chunkGroupReadState->rowMask != NULL)

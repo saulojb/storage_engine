@@ -1,11 +1,11 @@
-CREATE SCHEMA columnar_test_helpers;
-SET search_path TO columnar_test_helpers;
+CREATE SCHEMA engine_test_helpers;
+SET search_path TO engine_test_helpers;
 
-CREATE FUNCTION columnar_relation_storageid(relid oid) RETURNS bigint
+CREATE FUNCTION engine_relation_storageid(relid oid) RETURNS bigint
     LANGUAGE C STABLE STRICT
-    AS 'columnar', $$columnar_relation_storageid$$;
+    AS 'columnar', $$engine_relation_storageid$$;
 
-CREATE OR REPLACE FUNCTION columnar_storage_info(
+CREATE OR REPLACE FUNCTION engine_storage_info(
     rel regclass,
     version_major OUT int4,
     version_minor OUT int4,
@@ -14,7 +14,7 @@ CREATE OR REPLACE FUNCTION columnar_storage_info(
     reserved_row_number OUT int8,
     reserved_offset OUT int8)
   STRICT
-  LANGUAGE c AS 'columnar', $$columnar_storage_info$$;
+  LANGUAGE c AS 'columnar', $$engine_storage_info$$;
 
 CREATE FUNCTION compression_type_supported(type text) RETURNS boolean
 AS $$
@@ -55,7 +55,7 @@ WITH a as (
 SELECT (SELECT count(*) = 0 FROM d) AND
        (SELECT count(*) = 0 FROM g) as consistent;
 
-CREATE FUNCTION columnar_metadata_has_storage_id(input_storage_id bigint) RETURNS boolean
+CREATE FUNCTION engine_metadata_has_storage_id(input_storage_id bigint) RETURNS boolean
 AS $$
 DECLARE
    union_storage_id_count integer;
@@ -76,17 +76,17 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION columnar_store_memory_stats(
+CREATE OR REPLACE FUNCTION engine_store_memory_stats(
                   OUT TopMemoryContext BIGINT,
 		          OUT TopTransactionContext BIGINT,
 		          OUT WriteStateContext BIGINT)
     RETURNS RECORD
     LANGUAGE C STRICT VOLATILE
-    AS 'columnar', $$columnar_store_memory_stats$$;
+    AS 'columnar', $$engine_store_memory_stats$$;
 
 CREATE FUNCTION top_memory_context_usage()
 	RETURNS BIGINT AS $$
-		SELECT TopMemoryContext FROM columnar_test_helpers.columnar_store_memory_stats();
+		SELECT TopMemoryContext FROM engine_test_helpers.engine_store_memory_stats();
 	$$ LANGUAGE SQL VOLATILE;
 
 CREATE OR REPLACE FUNCTION uses_index_scan(command text)

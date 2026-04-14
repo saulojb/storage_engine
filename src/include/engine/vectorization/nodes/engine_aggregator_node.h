@@ -10,8 +10,8 @@
  */
 
 
-#ifndef ENGINE_AGGEREGATOR_NODE_H
-#define ENGINE_AGGEREGATOR_NODE_H
+#ifndef COLUMNAR_AGGEREGATOR_NODE_H
+#define COLUMNAR_AGGEREGATOR_NODE_H
 
 #include "postgres.h"
 

@@ -6,7 +6,7 @@ CREATE TABLE t(a int, b int) USING columnar;
 
 CREATE VIEW t_stripes AS
 SELECT * FROM columnar.stripe a, pg_class b
-WHERE a.storage_id = columnar_test_helpers.columnar_relation_storageid(b.oid) AND b.relname = 't';
+WHERE a.storage_id = engine_test_helpers.engine_relation_storageid(b.oid) AND b.relname = 't';
 
 BEGIN;
 INSERT INTO t SELECT i, i+1 FROM generate_series(1, 10) i;
@@ -15,7 +15,7 @@ SELECT count(*) FROM t;
 
 select
   version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('t');
+  from engine_test_helpers.engine_storage_info('t');
 
 -- check stripe metadata also have been rolled-back
 SELECT count(*) FROM t_stripes;
@@ -35,7 +35,7 @@ INSERT INTO t SELECT i, i+1 FROM generate_series(1, 10) i;
 
 select
   version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('t');
+  from engine_test_helpers.engine_storage_info('t');
 
 SELECT count(*) FROM t;
 ROLLBACK TO SAVEPOINT s1;
@@ -47,7 +47,7 @@ COMMIT;
 
 select
   version_major, version_minor, reserved_stripe_id, reserved_row_number
-  from columnar_test_helpers.columnar_storage_info('t');
+  from engine_test_helpers.engine_storage_info('t');
 
 SELECT count(*) FROM t;
 

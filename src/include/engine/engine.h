@@ -10,8 +10,8 @@
  *-------------------------------------------------------------------------
  */
 
-#ifndef ENGINE_H
-#define ENGINE_H
+#ifndef COLUMNAR_H
+#define COLUMNAR_H
 
 #include "pg_version_compat.h"
 
@@ -39,9 +39,9 @@ typedef struct RelFileNode RelFileLocator;
 #include "engine/engine_metadata.h"
 #include "engine/engine_write_state_row_mask.h"
 
-#define ENGINE_MODULE_NAME "citus_columnar"
+#define COLUMNAR_MODULE_NAME "citus_columnar"
 
-#define ENGINE_SETOPTIONS_HOOK_SYM "ColumnarTableSetOptions_hook"
+#define COLUMNAR_SETOPTIONS_HOOK_SYM "ColumnarTableSetOptions_hook"
 
 /* Defines for valid option names */
 #define OPTION_NAME_COMPRESSION_TYPE "compression"
@@ -57,17 +57,17 @@ typedef struct RelFileNode RelFileLocator;
 #define COMPRESSION_LEVEL_MAX 19
 
 /* Engine file signature */
-#define ENGINE_VERSION_MAJOR 2
-#define ENGINE_VERSION_MINOR 0
+#define COLUMNAR_VERSION_MAJOR 2
+#define COLUMNAR_VERSION_MINOR 0
 
 /* miscellaneous defines */
-#define ENGINE_TUPLE_COST_MULTIPLIER 10
-#define ENGINE_POSTSCRIPT_SIZE_LENGTH 1
-#define ENGINE_POSTSCRIPT_SIZE_MAX 256
-#define ENGINE_BYTES_PER_PAGE (BLCKSZ - SizeOfPageHeaderData)
+#define COLUMNAR_TUPLE_COST_MULTIPLIER 10
+#define COLUMNAR_POSTSCRIPT_SIZE_LENGTH 1
+#define COLUMNAR_POSTSCRIPT_SIZE_MAX 256
+#define COLUMNAR_BYTES_PER_PAGE (BLCKSZ - SizeOfPageHeaderData)
 
 /* Engine row mask byte array size */
-#define ENGINE_ROW_MASK_CHUNK_SIZE 10000
+#define COLUMNAR_ROW_MASK_CHUNK_SIZE 10000
 
 /*
  * ColumnarOptions holds the option values to be used when reading or writing
@@ -327,6 +327,7 @@ extern bool ColumnarReadNextVector(ColumnarReadState *readState, Datum *columnVa
 								   bool *columnNulls, uint64 *rowNumber,
 								   int *newVectorSize);
 extern int64 ColumnarReadChunkGroupsFiltered(ColumnarReadState *state);
+extern void ColumnarSetAnalyzeCGStride(ColumnarReadState *state, int stride);
 extern void ColumnarRescan(ColumnarReadState *readState, List *scanQual);
 
 /* functions only applicable for random access */
@@ -477,4 +478,4 @@ extern ColumnarCacheStatistics *ColumnarGetCacheStatistics(void);
 extern MemoryContext ColumnarCacheMemoryContext(void);
 
 
-#endif /* ENGINE_H */
+#endif /* COLUMNAR_H */

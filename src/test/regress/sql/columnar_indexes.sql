@@ -2,8 +2,8 @@
 -- Testing indexes on on columnar tables.
 --
 
-CREATE SCHEMA columnar_indexes;
-SET search_path tO columnar_indexes, public;
+CREATE SCHEMA engine_indexes;
+SET search_path tO engine_indexes, public;
 
 --
 -- create index with the concurrent option. We should
@@ -27,63 +27,63 @@ set columnar.enable_custom_scan to 'off';
 set enable_seqscan to off;
 set seq_page_cost TO 10000000;
 
-CREATE table columnar_table (a INT, b int) USING columnar;
+CREATE table engine_table (a INT, b int) USING columnar;
 
-INSERT INTO columnar_table (a) VALUES (1), (1);
-CREATE UNIQUE INDEX CONCURRENTLY ON columnar_table (a);
+INSERT INTO engine_table (a) VALUES (1), (1);
+CREATE UNIQUE INDEX CONCURRENTLY ON engine_table (a);
 
 -- CONCURRENTLY should leave an invalid index behind
-SELECT COUNT(*)=1 FROM pg_index WHERE indrelid = 'columnar_table'::regclass AND indisvalid = 'false';
+SELECT COUNT(*)=1 FROM pg_index WHERE indrelid = 'engine_table'::regclass AND indisvalid = 'false';
 
-INSERT INTO columnar_table (a) VALUES (1), (1);
+INSERT INTO engine_table (a) VALUES (1), (1);
 
-REINDEX TABLE columnar_table;
+REINDEX TABLE engine_table;
 -- index is still invalid since REINDEX error'ed out
-SELECT COUNT(*)=1 FROM pg_index WHERE indrelid = 'columnar_table'::regclass AND indisvalid = 'false';
+SELECT COUNT(*)=1 FROM pg_index WHERE indrelid = 'engine_table'::regclass AND indisvalid = 'false';
 
-TRUNCATE columnar_table;
-REINDEX TABLE columnar_table;
+TRUNCATE engine_table;
+REINDEX TABLE engine_table;
 
 -- now it should be valid
-SELECT COUNT(*)=0 FROM pg_index WHERE indrelid = 'columnar_table'::regclass AND indisvalid = 'false';
+SELECT COUNT(*)=0 FROM pg_index WHERE indrelid = 'engine_table'::regclass AND indisvalid = 'false';
 
-DROP INDEX columnar_table_a_idx;
+DROP INDEX engine_table_a_idx;
 
-INSERT INTO columnar_table (a, b) SELECT i,i*2 FROM generate_series(0, 16000) i;
+INSERT INTO engine_table (a, b) SELECT i,i*2 FROM generate_series(0, 16000) i;
 
 -- unique --
 BEGIN;
-  INSERT INTO columnar_table VALUES (100000000);
+  INSERT INTO engine_table VALUES (100000000);
   SAVEPOINT s1;
   -- errors out due to unflushed data in upper transaction
-  CREATE UNIQUE INDEX ON columnar_table (a);
+  CREATE UNIQUE INDEX ON engine_table (a);
 ROLLBACK;
 
-CREATE UNIQUE INDEX CONCURRENTLY ON columnar_table (a);
+CREATE UNIQUE INDEX CONCURRENTLY ON engine_table (a);
 
 BEGIN;
-  INSERT INTO columnar_table VALUES (16050);
+  INSERT INTO engine_table VALUES (16050);
   SAVEPOINT s1;
   -- index scan errors out due to unflushed data in upper transaction
-  SELECT a FROM columnar_table WHERE a = 16050;
+  SELECT a FROM engine_table WHERE a = 16050;
 ROLLBACK;
 
-EXPLAIN (COSTS OFF) SELECT * FROM columnar_table WHERE a=6456;
-EXPLAIN (COSTS OFF) SELECT a FROM columnar_table WHERE a=6456;
-SELECT (SELECT a FROM columnar_table WHERE a=6456 limit 1)=6456;
-SELECT (SELECT b FROM columnar_table WHERE a=6456 limit 1)=6456*2;
+EXPLAIN (COSTS OFF) SELECT * FROM engine_table WHERE a=6456;
+EXPLAIN (COSTS OFF) SELECT a FROM engine_table WHERE a=6456;
+SELECT (SELECT a FROM engine_table WHERE a=6456 limit 1)=6456;
+SELECT (SELECT b FROM engine_table WHERE a=6456 limit 1)=6456*2;
 
 -- even if a=16050 doesn't exist, we try to insert it twice so this should error out
-INSERT INTO columnar_table VALUES (16050), (16050);
+INSERT INTO engine_table VALUES (16050), (16050);
 
 -- should work
-INSERT INTO columnar_table VALUES (16050);
+INSERT INTO engine_table VALUES (16050);
 
 -- check edge cases around stripe boundaries, error out
-INSERT INTO columnar_table VALUES (16050);
-INSERT INTO columnar_table VALUES (15999);
+INSERT INTO engine_table VALUES (16050);
+INSERT INTO engine_table VALUES (15999);
 
-DROP INDEX columnar_table_a_idx;
+DROP INDEX engine_table_a_idx;
 
 CREATE TABLE partial_unique_idx_test (a INT, b INT) USING columnar;
 CREATE UNIQUE INDEX ON partial_unique_idx_test (a)
@@ -101,101 +101,101 @@ INSERT INTO partial_unique_idx_test VALUES (4, 600);
 INSERT INTO partial_unique_idx_test VALUES (4, 700);
 
 -- btree --
-CREATE INDEX CONCURRENTLY ON columnar_table (a);
-SELECT (SELECT SUM(b) FROM columnar_table WHERE a>700 and a<965)=439560;
+CREATE INDEX CONCURRENTLY ON engine_table (a);
+SELECT (SELECT SUM(b) FROM engine_table WHERE a>700 and a<965)=439560;
 
-CREATE INDEX ON columnar_table (b)
+CREATE INDEX ON engine_table (b)
 WHERE (b > 30000 AND b < 33000);
 
 -- partial index should be way smaller than the non-partial index
-SELECT pg_total_relation_size('columnar_table_b_idx') * 5 <
-       pg_total_relation_size('columnar_table_a_idx');
+SELECT pg_total_relation_size('engine_table_b_idx') * 5 <
+       pg_total_relation_size('engine_table_a_idx');
 
 -- can't use index scan due to partial index boundaries
-EXPLAIN (COSTS OFF) SELECT b FROM columnar_table WHERE b = 30000;
+EXPLAIN (COSTS OFF) SELECT b FROM engine_table WHERE b = 30000;
 -- can use index scan
-EXPLAIN (COSTS OFF) SELECT b FROM columnar_table WHERE b = 30001;
+EXPLAIN (COSTS OFF) SELECT b FROM engine_table WHERE b = 30001;
 
 -- some more rows
-INSERT INTO columnar_table (a, b) SELECT i,i*2 FROM generate_series(16000, 17000) i;
+INSERT INTO engine_table (a, b) SELECT i,i*2 FROM generate_series(16000, 17000) i;
 
-DROP INDEX CONCURRENTLY columnar_table_a_idx;
-TRUNCATE columnar_table;
+DROP INDEX CONCURRENTLY engine_table_a_idx;
+TRUNCATE engine_table;
 
 -- pkey --
-INSERT INTO columnar_table (a, b) SELECT i,i*2 FROM generate_series(16000, 16499) i;
-ALTER TABLE columnar_table ADD PRIMARY KEY (a);
-INSERT INTO columnar_table (a, b) SELECT i,i*2 FROM generate_series(16500, 17000) i;
+INSERT INTO engine_table (a, b) SELECT i,i*2 FROM generate_series(16000, 16499) i;
+ALTER TABLE engine_table ADD PRIMARY KEY (a);
+INSERT INTO engine_table (a, b) SELECT i,i*2 FROM generate_series(16500, 17000) i;
 
 BEGIN;
-  INSERT INTO columnar_table (a) SELECT 1;
+  INSERT INTO engine_table (a) SELECT 1;
 ROLLBACK;
 
 -- should work
-INSERT INTO columnar_table (a) SELECT 1;
+INSERT INTO engine_table (a) SELECT 1;
 
 -- error out
-INSERT INTO columnar_table VALUES (16100), (16101);
-INSERT INTO columnar_table VALUES (16999);
+INSERT INTO engine_table VALUES (16100), (16101);
+INSERT INTO engine_table VALUES (16999);
 
 BEGIN;
-  REINDEX INDEX columnar_table_pkey;
+  REINDEX INDEX engine_table_pkey;
   -- should error even after reindex
-  INSERT INTO columnar_table VALUES (16999);
+  INSERT INTO engine_table VALUES (16999);
 ROLLBACK;
 
-VACUUM FULL columnar_table;
+VACUUM FULL engine_table;
 
 -- show that we don't support clustering columnar tables using indexes
-CLUSTER columnar_table USING columnar_table_pkey;
+CLUSTER engine_table USING engine_table_pkey;
 
-ALTER TABLE columnar_table CLUSTER ON columnar_table_pkey;
-CLUSTER columnar_table;
+ALTER TABLE engine_table CLUSTER ON engine_table_pkey;
+CLUSTER engine_table;
 
 -- should error even after vacuum
-INSERT INTO columnar_table VALUES (16999);
+INSERT INTO engine_table VALUES (16999);
 
-TRUNCATE columnar_table;
-INSERT INTO columnar_table (a, b) SELECT i,i*2 FROM generate_series(1, 160000) i;
-SELECT (SELECT b FROM columnar_table WHERE a = 150000)=300000;
+TRUNCATE engine_table;
+INSERT INTO engine_table (a, b) SELECT i,i*2 FROM generate_series(1, 160000) i;
+SELECT (SELECT b FROM engine_table WHERE a = 150000)=300000;
 
 -- Since our index is highly correlated with the relation itself, we should
 -- de-serialize each chunk group only once. For this reason, if this test
 -- file hangs on below queries, then you should think that we are not properly
 -- caching the last-read chunk group during index reads.
-SELECT SUM(a)=312487500 FROM columnar_table WHERE a < 25000;
-SELECT SUM(a)=167000 FROM columnar_table WHERE a = 16000 OR a = 151000;
-SELECT SUM(a)=48000 FROM columnar_table WHERE a = 16000 OR a = 32000;
+SELECT SUM(a)=312487500 FROM engine_table WHERE a < 25000;
+SELECT SUM(a)=167000 FROM engine_table WHERE a = 16000 OR a = 151000;
+SELECT SUM(a)=48000 FROM engine_table WHERE a = 16000 OR a = 32000;
 
-TRUNCATE columnar_table;
-ALTER TABLE columnar_table DROP CONSTRAINT columnar_table_pkey;
+TRUNCATE engine_table;
+ALTER TABLE engine_table DROP CONSTRAINT engine_table_pkey;
 
 -- hash --
-INSERT INTO columnar_table (a, b) SELECT i*2,i FROM generate_series(1, 8000) i;
-CREATE INDEX hash_idx ON columnar_table USING HASH (b);
+INSERT INTO engine_table (a, b) SELECT i*2,i FROM generate_series(1, 8000) i;
+CREATE INDEX hash_idx ON engine_table USING HASH (b);
 
 BEGIN;
-  CREATE INDEX hash_idx_fill_factor ON columnar_table USING HASH (b) WITH (fillfactor=10);
+  CREATE INDEX hash_idx_fill_factor ON engine_table USING HASH (b) WITH (fillfactor=10);
   -- same hash index with lower fillfactor should be way bigger
   SELECT pg_total_relation_size ('hash_idx_fill_factor') >
          pg_total_relation_size ('hash_idx') * 5;
 ROLLBACK;
 
 BEGIN;
-  INSERT INTO columnar_table (a, b) SELECT i*3,i FROM generate_series(1, 8000) i;
+  INSERT INTO engine_table (a, b) SELECT i*3,i FROM generate_series(1, 8000) i;
 ROLLBACK;
 
-INSERT INTO columnar_table (a, b) SELECT i*4,i FROM generate_series(1, 8000) i;
+INSERT INTO engine_table (a, b) SELECT i*4,i FROM generate_series(1, 8000) i;
 
-SELECT SUM(a)=42000 FROM columnar_table WHERE b = 7000;
+SELECT SUM(a)=42000 FROM engine_table WHERE b = 7000;
 
 BEGIN;
-  REINDEX TABLE columnar_table;
-  SELECT SUM(a)=42000 FROM columnar_table WHERE b = 7000;
+  REINDEX TABLE engine_table;
+  SELECT SUM(a)=42000 FROM engine_table WHERE b = 7000;
 ROLLBACK;
 
-VACUUM FULL columnar_table;
-SELECT SUM(a)=42000 FROM columnar_table WHERE b = 7000;
+VACUUM FULL engine_table;
+SELECT SUM(a)=42000 FROM engine_table WHERE b = 7000;
 
 -- exclusion contraints --
 CREATE TABLE exclusion_test (c1 INT,c2 INT, c3 INT, c4 BOX,
@@ -436,7 +436,7 @@ rollback;
 insert into uniq select generate_series(1,100);
 
 SELECT COUNT(*)=1 FROM columnar.stripe cs
-WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+WHERE cs.storage_id = engine_test_helpers.engine_relation_storageid('engine_indexes.uniq'::regclass);
 
 TRUNCATE uniq;
 
@@ -448,7 +448,7 @@ rollback;
 insert into uniq select generate_series(1,100);
 
 SELECT COUNT(*)=1 FROM columnar.stripe cs
-WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+WHERE cs.storage_id = engine_test_helpers.engine_relation_storageid('engine_indexes.uniq'::regclass);
 
 TRUNCATE uniq;
 
@@ -460,7 +460,7 @@ rollback;
 insert into uniq select generate_series(1,100);
 
 SELECT COUNT(*)=1 FROM columnar.stripe cs
-WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+WHERE cs.storage_id = engine_test_helpers.engine_relation_storageid('engine_indexes.uniq'::regclass);
 
 TRUNCATE uniq;
 
@@ -472,7 +472,7 @@ rollback;
 insert into uniq select generate_series(1,100);
 
 SELECT COUNT(*)=1 FROM columnar.stripe cs
-WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+WHERE cs.storage_id = engine_test_helpers.engine_relation_storageid('engine_indexes.uniq'::regclass);
 
 TRUNCATE uniq;
 
@@ -488,12 +488,12 @@ begin;
 
   -- didn't flush anything yet, but should see the in progress stripe-write
   SELECT stripe_num, first_row_number, row_count FROM columnar.stripe cs
-  WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+  WHERE cs.storage_id = engine_test_helpers.engine_relation_storageid('engine_indexes.uniq'::regclass);
 commit;
 
 -- should have completed the stripe reservation
 SELECT stripe_num, first_row_number, row_count FROM columnar.stripe cs
-WHERE cs.storage_id = columnar_test_helpers.columnar_relation_storageid('columnar_indexes.uniq'::regclass);
+WHERE cs.storage_id = engine_test_helpers.engine_relation_storageid('engine_indexes.uniq'::regclass);
 
 TRUNCATE uniq;
 
@@ -513,7 +513,7 @@ rollback;
 --   a) simple deletion
 --   b) bottom-up deletion (>= pg14)
 --
--- Since columnar_index_fetch_tuple never sets all_dead to true, columnarAM
+-- Since engine_index_fetch_tuple never sets all_dead to true, columnarAM
 -- doesn't expect to receive simple deletion as we don't mark any index
 -- entries as dead.
 -- Otherwise, columnarAM would throw an error for all of below six test cases.
@@ -523,7 +523,7 @@ rollback;
 -- at some point when pg >= 14.
 -- For this reason, all following six test cases would certainly trigger
 -- bottom-up deletion. Show that we gracefully ignore such requests.
-CREATE TABLE index_tuple_delete (a int UNIQUE) USING COLUMNAR;
+CREATE TABLE index_tuple_delete (a int UNIQUE) USING ENGINE;
 ALTER TABLE index_tuple_delete SET (autovacuum_enabled = false);
 
 BEGIN;
@@ -618,7 +618,7 @@ INSERT INTO circles_and_stuff (c, label) VALUES (circle(point(6.2, 123.1), 100),
 
 BEGIN;
   SET LOCAL columnar.enable_custom_scan TO 'OFF';
-  SELECT columnar_test_helpers.uses_index_scan (
+  SELECT engine_test_helpers.uses_index_scan (
   $$
   SELECT * FROM circles_and_stuff WHERE c && CIRCLE(POINT(1.2, 123.1), 10);
   $$
@@ -628,7 +628,7 @@ ROLLBACK;
 BEGIN;
   SET LOCAL columnar.enable_custom_scan TO 'ON';
   SET LOCAL enable_indexscan TO 'OFF';
-  SELECT columnar_test_helpers.uses_custom_scan (
+  SELECT engine_test_helpers.uses_custom_scan (
     $$
     SELECT * FROM circles_and_stuff WHERE c && CIRCLE(POINT(1.2, 123.1), 10);
     $$
@@ -656,4 +656,4 @@ SHOW columnar.enable_column_cache;
 DROP TABLE test_cache;
 
 SET client_min_messages TO WARNING;
-DROP SCHEMA columnar_indexes CASCADE;
+DROP SCHEMA engine_indexes CASCADE;

@@ -69,7 +69,7 @@ set columnar.enable_vectorization to default;
 set columnar.stripe_row_limit to default;
 set columnar.chunk_group_row_limit to default;
 
-CREATE TABLE simple_chunk_filtering(i int) USING COLUMNAR;
+CREATE TABLE simple_chunk_filtering(i int) USING ENGINE;
 INSERT INTO simple_chunk_filtering SELECT generate_series(0,234567);
 EXPLAIN (analyze on, costs off, timing off, summary off)
   SELECT * FROM simple_chunk_filtering WHERE i > 123456;
@@ -120,25 +120,25 @@ BEGIN;
   SELECT * FROM multi_column_chunk_filtering;
 ROLLBACK;
 
-CREATE TABLE another_columnar_table(x int, y int) USING columnar;
-INSERT INTO another_columnar_table SELECT generate_series(0,5);
+CREATE TABLE another_engine_table(x int, y int) USING columnar;
+INSERT INTO another_engine_table SELECT generate_series(0,5);
 
 EXPLAIN (analyze on, costs off, timing off, summary off)
-  SELECT a, y FROM multi_column_chunk_filtering, another_columnar_table WHERE x > 1;
+  SELECT a, y FROM multi_column_chunk_filtering, another_engine_table WHERE x > 1;
 
 EXPLAIN (costs off, timing off, summary off)
-  SELECT y, * FROM another_columnar_table;
+  SELECT y, * FROM another_engine_table;
 
 EXPLAIN (costs off, timing off, summary off)
-  SELECT *, x FROM another_columnar_table;
+  SELECT *, x FROM another_engine_table;
 
 EXPLAIN (costs off, timing off, summary off)
-  SELECT y, another_columnar_table FROM another_columnar_table;
+  SELECT y, another_engine_table FROM another_engine_table;
 
 EXPLAIN (costs off, timing off, summary off)
-  SELECT another_columnar_table, x FROM another_columnar_table;
+  SELECT another_engine_table, x FROM another_engine_table;
 
-DROP TABLE multi_column_chunk_filtering, another_columnar_table;
+DROP TABLE multi_column_chunk_filtering, another_engine_table;
 
 --
 -- https://github.com/citusdata/citus/issues/4780
@@ -308,9 +308,9 @@ set columnar.planner_debug_level to default;
 --
 -- https://github.com/citusdata/citus/issues/4488
 --
-create table columnar_prepared_stmt (x int, y int) using columnar;
-insert into columnar_prepared_stmt select s, s from generate_series(1,5000000) s;
-prepare foo (int) as select x from columnar_prepared_stmt where x = $1;
+create table engine_prepared_stmt (x int, y int) using columnar;
+insert into engine_prepared_stmt select s, s from generate_series(1,5000000) s;
+prepare foo (int) as select x from engine_prepared_stmt where x = $1;
 execute foo(3);
 execute foo(3);
 execute foo(3);
@@ -327,7 +327,7 @@ select filtered_row_count('execute foo(3)');
 set columnar.enable_vectorization to default;
 set columnar.enable_parallel_execution to default;
 
-drop table columnar_prepared_stmt;
+drop table engine_prepared_stmt;
 
 --
 -- https://github.com/citusdata/citus/issues/5258

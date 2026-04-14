@@ -1,19 +1,11 @@
 # storage_engine
 
-Copyright (c) 2026 Saulo José Benvenutti — [AGPL-3.0 License](LICENSE)
+A PostgreSQL extension providing two high-performance Table Access Methods designed for analytical and HTAP workloads.
 
-A PostgreSQL extension providing two high-performance Table Access Methods designed for analytical and HTAP workloads — with **significant storage savings and no meaningful query performance penalty** compared to standard heap tables.
-
-- **`colcompress`** — column-oriented compressed storage with vectorized execution and parallel scan. Typical real-world compression ratios of **3–10× smaller** than heap for analytical datasets, while aggregate and range-scan queries often run *faster* due to reduced I/O and vectorized evaluation.
-- **`rowcompress`** — row-oriented batch-compressed storage with parallel scan. Achieves **2–6× smaller** footprint than heap for append-heavy workloads (audit logs, event streams, time-series), with read throughput comparable to heap thanks to parallel work-stealing batch decompression.
-
-Both AMs use `zstd` compression by default (configurable per table to `lz4`, `pglz`, or `none`). Storage savings translate directly to lower I/O, smaller backups, and reduced memory pressure from the buffer cache — benefits that compound as data volumes grow.
+- **`colcompress`** — column-oriented compressed storage with vectorized execution and parallel scan
+- **`rowcompress`** — row-oriented batch-compressed storage with parallel scan
 
 Both AMs coexist alongside standard heap tables in the same database. All catalog objects are isolated in the `engine` schema, making the extension safe to install alongside `citus_columnar` or any other columnar extension (all exported C symbols carry the `se_` prefix to avoid linker conflicts).
-
-### Lineage
-
-`storage_engine` is a restructured fork of [Hydra Columnar](https://github.com/hydradatabase/hydra), which is itself a fork of [Citus Columnar](https://github.com/citusdata/citus) (the columnar AM originally developed by Citus Data / Microsoft). The columnar storage model (`colcompress`) was further inspired by [ClickHouse's MergeTree engine](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree), particularly its per-table sort key and min/max chunk-level pruning semantics.
 
 ---
 
@@ -40,9 +32,6 @@ Both AMs coexist alongside standard heap tables in the same database. All catalo
 - [Management Functions](#management-functions)
 - [Catalog Views](#catalog-views)
 - [Installation](#installation)
-  - [Dependencies](#dependencies)
-  - [Build from source](#build-from-source)
-  - [Docker](#docker)
 - [PostgreSQL Version Compatibility](#postgresql-version-compatibility)
 - [Benchmarks](#benchmarks)
 
@@ -379,70 +368,13 @@ All views grant `SELECT` to `PUBLIC`.
 
 ## Installation
 
-### Dependencies
-
-The following libraries and tools must be installed before building:
-
-| Dependency | Purpose | Optional |
-|---|---|---|
-| C compiler (`gcc` or `clang`) | Build toolchain | No |
-| `make` | Build system | No |
-| PostgreSQL server headers | Extension API | No |
-| `liblz4` + headers | lz4 compression support | Yes (`--without-lz4`) |
-| `libzstd` + headers | zstd compression (default algorithm) | Yes (`--without-zstd`) |
-| `libcurl` + headers | Anonymous statistics scaffolding | Yes (`--without-libcurl`) |
-| `autoconf` | Regenerating `./configure` after source changes | Dev only |
-
-> **Note:** `pglz` is built into PostgreSQL itself — no separate package required.
-
-**Debian / Ubuntu:**
-
-```bash
-sudo apt-get install -y \
-  gcc make autoconf \
-  postgresql-server-dev-18 \
-  liblz4-dev \
-  libzstd-dev \
-  libcurl4-openssl-dev
-```
-
-Replace `18` with your PostgreSQL major version (`16`, `17`, `18`, …).
-
-**RHEL / Fedora / Rocky Linux:**
-
-```bash
-sudo dnf install -y \
-  gcc make autoconf \
-  postgresql18-server-devel \
-  lz4-devel \
-  libzstd-devel \
-  libcurl-devel
-```
-
-**macOS (Homebrew):**
-
-```bash
-brew install lz4 zstd curl
-```
-
-PostgreSQL from `brew install postgresql@18` already includes server headers in the keg.
-
----
-
 ### Build from source
 
-Requires `pg_config` in `PATH` (provided by `postgresql-server-dev-XX` or the PostgreSQL keg).
+Requires PostgreSQL server headers and `pg_config` in `PATH`.
 
 ```bash
-./configure
+cd columnar
 make -j$(nproc) install
-```
-
-To build without optional dependencies:
-
-```bash
-./configure --without-libcurl --without-lz4   # zstd only
-./configure --without-libcurl --without-zstd  # lz4 only
 ```
 
 Add to `postgresql.conf`:
@@ -481,3 +413,6 @@ The `engine` schema and both AMs are created automatically on `CREATE EXTENSION`
 
 ---
 
+## Benchmarks
+
+See [BENCHMARKS.md](BENCHMARKS.md) for detailed results comparing `colcompress`, `rowcompress`, and heap across analytical and mixed OLTP/OLAP workloads.

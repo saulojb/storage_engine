@@ -1,5 +1,5 @@
 --
--- columnar_fallback_scan.sql
+-- engine_fallback_scan.sql
 --
 -- Test columnar.enable_custom_scan = false, which will use an
 -- ordinary sequential scan. It won't benefit from projection pushdown
@@ -10,7 +10,7 @@ set columnar.enable_custom_scan = false;
 
 create table fallback_scan(i int) using columnar;
 -- large enough to test parallel_workers > 1
-select columnar.alter_columnar_table_set('fallback_scan', compression => 'none');
+select columnar.alter_engine_table_set('fallback_scan', compression => 'none');
 insert into fallback_scan select generate_series(1,150000);
 vacuum analyze fallback_scan;
 

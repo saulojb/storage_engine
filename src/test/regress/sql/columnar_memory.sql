@@ -2,8 +2,8 @@
 -- Testing memory usage of columnar tables.
 --
 
-CREATE SCHEMA columnar_memory;
-SET search_path TO 'columnar_memory';
+CREATE SCHEMA engine_memory;
+SET search_path TO 'engine_memory';
 
 SET columnar.stripe_row_limit TO 50000;
 SET columnar.compression TO 'pglz';
@@ -12,7 +12,7 @@ CREATE TABLE t (a int, tag text, memusage bigint) USING columnar;
 -- measure memory before doing writes
 SELECT TopMemoryContext as top_pre,
 	   WriteStateContext write_pre
-FROM columnar_test_helpers.columnar_store_memory_stats() \gset
+FROM engine_test_helpers.engine_store_memory_stats() \gset
 
 BEGIN;
 SET LOCAL client_min_messages TO DEBUG1;
@@ -21,12 +21,12 @@ SET LOCAL client_min_messages TO DEBUG1;
 INSERT INTO t
  SELECT i, 'first batch',
         -- sample memusage instead of recording everyr row for speed
-        CASE WHEN i % 100 = 0 THEN columnar_test_helpers.top_memory_context_usage() ELSE 0 END
+        CASE WHEN i % 100 = 0 THEN engine_test_helpers.top_memory_context_usage() ELSE 0 END
  FROM generate_series(1, 49999) i;
 SELECT TopMemoryContext as top0,
        TopTransactionContext xact0,
 	   WriteStateContext write0
-FROM columnar_test_helpers.columnar_store_memory_stats() \gset
+FROM engine_test_helpers.engine_store_memory_stats() \gset
 
 -- flush 1st stripe, and measure memory just before flushing 2nd stripe
 INSERT INTO t
@@ -35,7 +35,7 @@ INSERT INTO t
 SELECT TopMemoryContext as top1,
        TopTransactionContext xact1,
 	   WriteStateContext write1
-FROM columnar_test_helpers.columnar_store_memory_stats() \gset
+FROM engine_test_helpers.engine_store_memory_stats() \gset
 
 -- flush 2nd stripe, and measure memory just before flushing 3rd stripe
 INSERT INTO t
@@ -44,13 +44,13 @@ INSERT INTO t
 SELECT TopMemoryContext as top2,
        TopTransactionContext xact2,
 	   WriteStateContext write2
-FROM columnar_test_helpers.columnar_store_memory_stats() \gset
+FROM engine_test_helpers.engine_store_memory_stats() \gset
 
 -- insert a large batch
 INSERT INTO t
  SELECT i, 'large batch',
         -- sample memusage instead of recording everyr row for speed
-        CASE WHEN i % 100 = 0 THEN columnar_test_helpers.top_memory_context_usage() ELSE 0 END
+        CASE WHEN i % 100 = 0 THEN engine_test_helpers.top_memory_context_usage() ELSE 0 END
  FROM generate_series(1, 100000) i;
 
 COMMIT;
@@ -58,7 +58,7 @@ COMMIT;
 -- measure memory after doing writes
 SELECT TopMemoryContext as top_post,
 	   WriteStateContext write_post
-FROM columnar_test_helpers.columnar_store_memory_stats() \gset
+FROM engine_test_helpers.engine_store_memory_stats() \gset
 
 \x
 SELECT (1.0 * :top2/:top1 BETWEEN 0.99 AND 1.01) AS top_growth_ok,
@@ -73,10 +73,10 @@ INSERT INTO t
  SELECT i, 'last batch', 0 /* no need to record memusage per row */
  FROM generate_series(1, 50000) i;
 
-SELECT 1.0 * TopMemoryContext / :top_post FROM columnar_test_helpers.columnar_store_memory_stats();
+SELECT 1.0 * TopMemoryContext / :top_post FROM engine_test_helpers.engine_store_memory_stats();
 
 SELECT 1.0 * TopMemoryContext / :top_post BETWEEN 0.98 AND 1.02 AS top_growth_ok
-FROM columnar_test_helpers.columnar_store_memory_stats();
+FROM engine_test_helpers.engine_store_memory_stats();
 
 -- before this change, max mem usage while executing inserts was 28MB and
 -- with this change it's less than 8MB.
@@ -89,4 +89,4 @@ SELECT
 SELECT count(*) FROM t;
 
 SET client_min_messages TO WARNING;
-DROP SCHEMA columnar_memory CASCADE;
+DROP SCHEMA engine_memory CASCADE;

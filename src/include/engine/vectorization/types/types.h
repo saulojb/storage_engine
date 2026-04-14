@@ -9,8 +9,8 @@
  *-------------------------------------------------------------------------
  */
 
-#ifndef ENGINE_TYPES_H
-#define ENGINE_TYPES_H
+#ifndef COLUMNAR_TYPES_H
+#define COLUMNAR_TYPES_H
 
 #include "postgres.h"
 

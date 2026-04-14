@@ -10,8 +10,8 @@
  */
 
 
-#ifndef ENGINE_INDEXSCAN_H
-#define ENGINE_INDEXSCAN_H
+#ifndef COLUMNAR_INDEXSCAN_H
+#define COLUMNAR_INDEXSCAN_H
 
 #include "postgres.h"
 
