@@ -1154,48 +1154,15 @@ engine_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		uint64 writtenRowNumber = ColumnarWriteRow(writeState, values,
 												   tupleSlot->tts_isnull);
 
-		/* Set TID before index processing so B-tree entries get the correct physical location */
+		/*
+		 * Set tts_tid so the caller (COPY's CopyMultiInsertBufferFlush, or
+		 * any other table_multi_insert caller) can build correct index entries.
+		 * Index insertion is the caller's responsibility -- we must NOT call
+		 * ExecInsertIndexTuples here, because the caller will also call it
+		 * after table_multi_insert returns, which would insert each entry twice
+		 * and corrupt B-tree indexes.
+		 */
 		tupleSlot->tts_tid = row_number_to_tid(writtenRowNumber);
-
-		EState *estate = create_estate_for_relation(relation);
-
-#if PG_VERSION_NUM >= PG_VERSION_14
-		ResultRelInfo *resultRelInfo = makeNode(ResultRelInfo);
-		InitResultRelInfo(resultRelInfo, relation, 1, NULL, 0);
-#else
-		ResultRelInfo *resultRelInfo = estate->es_result_relation_info;
-#endif
-
-		ExecOpenIndices(resultRelInfo, false);
-
-		if (relation->rd_att->constr)
-			ExecConstraints(resultRelInfo, tupleSlot, estate);
-
-#if PG_VERSION_NUM >= PG_VERSION_16
-		List *recheckIndexes = ExecInsertIndexTuples(resultRelInfo, tupleSlot,
-														 estate, false, false,
-														 NULL, NIL, false);
-#elif PG_VERSION_NUM >= PG_VERSION_14
-		List *recheckIndexes = ExecInsertIndexTuples(resultRelInfo, tupleSlot,
-														 estate, false, false,
-														 NULL, NIL);
-#else
-		List *recheckIndexes = ExecInsertIndexTuples(tupleSlot, estate,
-														 false, NULL, NIL);
-#endif
-		list_free(recheckIndexes);
-
-		ExecCloseIndices(resultRelInfo);
-
-		AfterTriggerEndQuery(estate);
-#if PG_VERSION_NUM >= PG_VERSION_14
-		ExecCloseResultRelations(estate);
-		ExecCloseRangeTableRelations(estate);
-#else
-		ExecCleanUpTriggerState(estate);
-#endif
-		ExecResetTupleTable(estate->es_tupleTable, false);
-		FreeExecutorState(estate);
 
 		MemoryContextReset(ColumnarWritePerTupleContext(writeState));
 	}
