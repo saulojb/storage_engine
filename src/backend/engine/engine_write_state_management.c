@@ -195,6 +195,22 @@ engine_init_write_state(Relation relation, TupleDesc tupdesc,
 	 */
 	ReadColumnarOptions(tupSlotRelationId, &columnarOptions);
 
+	/*
+	 * Disable sort-on-write when the relation has indexes.
+	 *
+	 * When sort-on-write is active, ColumnarWriteRow() buffers rows and
+	 * returns COLUMNAR_FIRST_ROW_NUMBER as a placeholder for every inserted
+	 * row.  The caller (ExecInsert/ExecInsertIndexTuples or COPY's
+	 * CopyMultiInsertBufferFlush) then builds index entries using that
+	 * placeholder TID, causing every B-tree entry to point to the same
+	 * physical location and corrupting all indexes.
+	 *
+	 * When the table has no indexes this is harmless, so we only suppress
+	 * the sort for relations that actually have at least one index.
+	 */
+	if (relation->rd_rel->relhasindex)
+		columnarOptions.orderby = NULL;
+
 	SubXidWriteState *stackEntry = palloc0(sizeof(SubXidWriteState));
 #if PG_VERSION_NUM >= PG_VERSION_16
 	stackEntry->writeState = ColumnarBeginWrite(relation->rd_locator,
