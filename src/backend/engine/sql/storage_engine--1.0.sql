@@ -365,6 +365,17 @@ COMMENT ON VIEW engine.colcompress_options
 GRANT SELECT ON engine.colcompress_options TO PUBLIC;
 
 --
+-- engine.colcompress_relation_storageid — returns the internal storage_id for a colcompress relation
+--
+CREATE OR REPLACE FUNCTION engine.colcompress_relation_storageid(relation regclass)
+    RETURNS bigint
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', 'se_engine_relation_storageid';
+
+COMMENT ON FUNCTION engine.colcompress_relation_storageid(regclass)
+    IS 'returns the internal storage_id for a colcompress relation';
+
+--
 -- engine.colcompress_stripes — stripe-level metadata for colcompress tables
 --
 CREATE OR REPLACE VIEW engine.colcompress_stripes AS
@@ -379,14 +390,9 @@ CREATE OR REPLACE VIEW engine.colcompress_stripes AS
         s.row_count,
         s.chunk_group_row_count,
         s.first_row_number
-    FROM engine.stripe s
-    JOIN pg_class c ON c.relfilenode = (
-        SELECT relfilenode FROM pg_class WHERE oid = (
-            SELECT regclass FROM engine.col_options co
-            WHERE (SELECT relfilenode FROM pg_class WHERE oid = co.regclass) = s.storage_id
-            LIMIT 1
-        ) LIMIT 1
-    )
+    FROM engine.col_options co
+    JOIN pg_class c ON c.oid = co.regclass::oid
+    JOIN engine.stripe s ON s.storage_id = engine.colcompress_relation_storageid(co.regclass)
     ORDER BY s.storage_id, s.stripe_num;
 
 COMMENT ON VIEW engine.colcompress_stripes
