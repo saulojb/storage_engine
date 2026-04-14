@@ -33,6 +33,7 @@ Both AMs coexist alongside standard heap tables in the same database. All catalo
 - [Catalog Views](#catalog-views)
 - [Installation](#installation)
 - [PostgreSQL Version Compatibility](#postgresql-version-compatibility)
+- [Known Limitations](#known-limitations)
 - [Benchmarks](#benchmarks)
 
 ---
@@ -347,6 +348,7 @@ SELECT * FROM engine.rowcompress_batches LIMIT 10;
 | `engine.alter_colcompress_table_set(regclass, ...)` | Set one or more options on a colcompress table |
 | `engine.alter_colcompress_table_reset(regclass, ...)` | Reset colcompress options to system defaults |
 | `engine.colcompress_merge(regclass)` | Rewrite and globally sort a colcompress table by its `orderby` key |
+| `engine.colcompress_repack(regclass)` | Alias for `colcompress_merge`; drop-in replacement for `pg_repack` on colcompress tables |
 | `engine.alter_rowcompress_table_set(regclass, ...)` | Set one or more options on a rowcompress table |
 | `engine.alter_rowcompress_table_reset(regclass, ...)` | Reset rowcompress options to system defaults |
 | `engine.rowcompress_repack(regclass)` | Rewrite all batches of a rowcompress table with current options |
@@ -397,6 +399,74 @@ psql postgres://postgres:password@127.0.0.1:5432
 ```
 
 The `engine` schema and both AMs are created automatically on `CREATE EXTENSION`.
+
+---
+
+## Known Limitations
+
+### No AFTER ROW triggers (and no pg_repack)
+
+`colcompress` and `rowcompress` tables do not support **AFTER ROW triggers** or **foreign keys**. This is a fundamental architectural constraint: columnar storage does not maintain heap tuples in a form that row-level trigger machinery can inspect.
+
+This means **`pg_repack` cannot be used** — it relies internally on an AFTER ROW trigger to capture concurrent changes during its online copy phase:
+
+```
+ERROR: Foreign keys and AFTER ROW triggers are not supported for columnar tables
+DETAIL: Tools such as pg_repack use AFTER ROW triggers internally and cannot be used with colcompress or rowcompress tables.
+HINT: Use engine.colcompress_repack(table) as a drop-in replacement for pg_repack on colcompress tables.
+```
+
+Use `engine.colcompress_repack()` instead:
+
+```sql
+-- Drop-in replacement for: pg_repack -t mytable
+SELECT engine.colcompress_repack('adm.documents'::regclass);
+
+-- Repack all colcompress tables in the database:
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN
+    SELECT n.nspname, c.relname
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_am a ON c.relam = a.oid
+    WHERE a.amname = 'colcompress' AND c.relkind = 'r'
+    ORDER BY pg_total_relation_size(c.oid) DESC
+  LOOP
+    RAISE NOTICE 'Repacking %.%...', r.nspname, r.relname;
+    PERFORM engine.colcompress_repack(
+      (quote_ident(r.nspname) || '.' || quote_ident(r.relname))::regclass);
+  END LOOP;
+END;
+$$;
+```
+
+> **Limitation vs. pg_repack:** `colcompress_repack` acquires `AccessExclusiveLock` for the duration of the operation (reads and writes are blocked). There is no online/concurrent mode. Schedule during a maintenance window for large tables.
+
+### AFTER STATEMENT triggers are supported
+
+Only row-level (`FOR EACH ROW`) AFTER triggers are blocked. Statement-level (`FOR EACH STATEMENT`) AFTER triggers work fine.
+
+### sort-on-write is disabled when indexes exist
+
+When a `colcompress` table has both an `orderby` option and one or more B-tree indexes, the sort-on-write path is automatically disabled during writes. This avoids a TID placeholder problem that would corrupt index entries. The table's stripes are still read in their natural write order; run `engine.colcompress_merge()` (or `colcompress_repack()`) to produce globally sorted stripes after loading data.
+
+### No CLUSTER support
+
+`CLUSTER` (index-ordered physical rewrite) is not implemented for columnar tables. Use `engine.colcompress_merge()` with an `orderby` option to achieve equivalent physical ordering.
+
+### No VACUUM FULL / table rewrite
+
+`VACUUM FULL` triggers a table rewrite that is not implemented for colcompress or rowcompress tables. Use `engine.colcompress_repack()` / `engine.rowcompress_repack()` instead, which perform the same compaction without the PostgreSQL rewrite machinery.
+
+### No unlogged tables
+
+`CREATE UNLOGGED TABLE ... USING colcompress` is not supported (`ERRCODE_FEATURE_NOT_SUPPORTED`). Use the default `LOGGED` persistence.
+
+### No speculative insertion (INSERT … ON CONFLICT on non-unique predicates)
+
+Speculative insertion (`INSERT … ON CONFLICT`) requires a unique index on the conflict target. Conflict detection on arbitrary predicates or without an index is not supported.
 
 ---
 

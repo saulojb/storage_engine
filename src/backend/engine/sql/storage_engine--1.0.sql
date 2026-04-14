@@ -456,4 +456,30 @@ AS 'MODULE_PATHNAME', 'colcompress_merge';
 COMMENT ON FUNCTION engine.colcompress_merge(regclass)
 IS 'rewrite all stripes of a colcompress table globally sorted by its orderby key; no-op on tables without orderby';
 
+-- ============================================================
+-- engine.colcompress_repack — pg_repack-compatible alias
+-- ============================================================
+--
+-- pg_repack cannot be used with colcompress tables because it relies on
+-- AFTER ROW triggers, which columnar storage does not support. Use this
+-- function instead: it performs the same logical operation (compact, reorder,
+-- rebuild indexes) by delegating to engine.colcompress_merge().
+--
+-- Limitation: requires AccessExclusiveLock (blocks concurrent reads and
+-- writes during the repack). Unlike pg_repack there is no online/concurrent mode.
+--
+CREATE OR REPLACE FUNCTION engine.colcompress_repack(
+    table_name  regclass)
+    RETURNS void
+    LANGUAGE sql
+    CALLED ON NULL INPUT
+AS $$
+    SELECT engine.colcompress_merge(table_name);
+$$;
+
+COMMENT ON FUNCTION engine.colcompress_repack(regclass)
+IS 'pg_repack-compatible alias for colcompress tables: compacts stripes, re-applies global orderby sort, and rebuilds indexes. Requires AccessExclusiveLock; no online/concurrent mode.';
+
+GRANT EXECUTE ON FUNCTION engine.colcompress_repack(regclass) TO PUBLIC;
+
 GRANT SELECT ON engine.rowcompress_batches TO PUBLIC;
