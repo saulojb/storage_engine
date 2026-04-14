@@ -1143,6 +1143,9 @@ engine_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		uint64 writtenRowNumber = ColumnarWriteRow(writeState, values,
 												   tupleSlot->tts_isnull);
 
+		/* Set TID before index processing so B-tree entries get the correct physical location */
+		tupleSlot->tts_tid = row_number_to_tid(writtenRowNumber);
+
 		EState *estate = create_estate_for_relation(relation);
 
 #if PG_VERSION_NUM >= PG_VERSION_14
@@ -1157,6 +1160,20 @@ engine_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		if (relation->rd_att->constr)
 			ExecConstraints(resultRelInfo, tupleSlot, estate);
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+		List *recheckIndexes = ExecInsertIndexTuples(resultRelInfo, tupleSlot,
+														 estate, false, false,
+														 NULL, NIL, false);
+#elif PG_VERSION_NUM >= PG_VERSION_14
+		List *recheckIndexes = ExecInsertIndexTuples(resultRelInfo, tupleSlot,
+														 estate, false, false,
+														 NULL, NIL);
+#else
+		List *recheckIndexes = ExecInsertIndexTuples(tupleSlot, estate,
+														 false, NULL, NIL);
+#endif
+		list_free(recheckIndexes);
+
 		ExecCloseIndices(resultRelInfo);
 
 		AfterTriggerEndQuery(estate);
@@ -1168,8 +1185,6 @@ engine_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 #endif
 		ExecResetTupleTable(estate->es_tupleTable, false);
 		FreeExecutorState(estate);
-
-		tupleSlot->tts_tid = row_number_to_tid(writtenRowNumber);
 
 		MemoryContextReset(ColumnarWritePerTupleContext(writeState));
 	}
