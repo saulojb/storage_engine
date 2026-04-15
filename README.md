@@ -395,8 +395,8 @@ All views grant `SELECT` to `PUBLIC`.
 Requires PostgreSQL server headers and `pg_config` in `PATH`.
 
 ```bash
-cd columnar
-make -j$(nproc) install
+cd dist/
+sudo make -j$(nproc) install
 ```
 
 Add to `postgresql.conf`:
@@ -404,6 +404,16 @@ Add to `postgresql.conf`:
 ```
 shared_preload_libraries = 'storage_engine'
 ```
+
+#### Loading with citus
+
+If `citus` or `pg_cron` is also in `shared_preload_libraries`, the load order matters:
+
+```
+shared_preload_libraries = 'pg_cron,citus,storage_engine'
+```
+
+`citus` **must appear before** `storage_engine`. PostgreSQL registers planner hooks in load order; citus expects to be the outermost hook in the chain. Reversing the order causes PostgreSQL to refuse to start.
 
 Restart PostgreSQL and load the extension:
 
@@ -472,6 +482,26 @@ Only row-level (`FOR EACH ROW`) AFTER triggers are blocked. Statement-level (`FO
 
 When a `colcompress` table has both an `orderby` option and one or more B-tree indexes, the sort-on-write path is automatically disabled during writes. This avoids a TID placeholder problem that would corrupt index entries. The table's stripes are still read in their natural write order; run `engine.colcompress_merge()` (or `colcompress_repack()`) to produce globally sorted stripes after loading data.
 
+### B-tree indexes on colcompress disable stripe pruning
+
+When a B-tree index exists on a `colcompress` column, the PostgreSQL planner may choose `IndexScan` even for queries that would benefit from a full sequential scan with stripe pruning. `IndexScan` opens the table with `randomAccess=true`, which bypasses the stripe pruning code path — causing date-range and similar ordered queries to read all stripes instead of only the relevant one.
+
+**For analytical tables: do not create B-tree indexes on columns covered by the `orderby` key.** Use GIN indexes for JSONB and array columns, and rely on stripe pruning for range predicates on the sort key. If point-lookup access is occasionally needed on an analytical colcompress table, set `index_scan = false` explicitly and use `engine.colcompress_merge()` to keep the data globally sorted.
+
+Examples of problematic and safe index patterns:
+
+```sql
+-- BAD: B-tree index on the ordery column defeats stripe pruning on range queries
+CREATE INDEX ON events_col (event_date);  -- do NOT do this
+
+-- GOOD: GIN indexes for JSONB / array columns are fine
+CREATE INDEX ON events_col USING gin (metadata jsonb_path_ops);
+CREATE INDEX ON events_col USING gin (tags);
+
+-- Ensure the planner does not choose IndexScan
+SELECT engine.alter_colcompress_table_set('events_col'::regclass, index_scan => false);
+```
+
 ### No CLUSTER support
 
 `CLUSTER` (index-ordered physical rewrite) is not implemented for columnar tables. Use `engine.colcompress_merge()` with an `orderby` option to achieve equivalent physical ordering.
@@ -487,6 +517,74 @@ When a `colcompress` table has both an `orderby` option and one or more B-tree i
 ### No speculative insertion (INSERT … ON CONFLICT on non-unique predicates)
 
 Speculative insertion (`INSERT … ON CONFLICT`) requires a unique index on the conflict target. Conflict detection on arbitrary predicates or without an index is not supported.
+
+---
+
+## Benchmarks
+
+Benchmark suite: 1 000 000 rows, PostgreSQL 18.3, AMD Ryzen 7 5800H (8-core), 40 GB RAM, `shared_buffers=10GB`. `colcompress` configured with `lz4` compression and `orderby = 'event_date ASC'` (globally sorted via `colcompress_merge`).
+
+Two scenarios are measured:
+
+| Scenario | Settings |
+|---|---|
+| **Serial** (storage baseline) | `JIT=off`, `max_parallel_workers_per_gather=0` |
+| **Parallel** (real-world simulation) | `JIT=on`, `max_parallel_workers_per_gather=16` |
+
+### Serial results — median of 3 runs
+
+| Query | heap | colcompress | rowcompress | citus_columnar |
+|---|---|---|---|---|
+| Q1 `count(*)` | 38.6ms | 43.7ms | 305ms | 36.9ms |
+| Q2 `SUM/AVG` numeric+double | 182.3ms | 118.3ms | 356ms | 121.4ms |
+| Q3 `GROUP BY` country (10 vals) | 214.4ms | 162.3ms | 382ms | 141.4ms |
+| Q4 `GROUP BY` event_type + p95 | 538.2ms | 452.5ms | 680ms | 469.9ms |
+| **Q5 date range 1 month** | 21.1ms | **23.5ms** | 60.0ms | 21.1ms |
+| Q6 JSONB `@>` GIN | 121.7ms | 371.4ms | 322ms | 236.9ms |
+| Q7 JSONB key + GROUP BY | 386.2ms | 309.0ms | 537ms | 354.4ms |
+| Q8 array `@>` GIN | 61.3ms | 329.2ms | 272ms | 143.8ms |
+| Q9 LIKE text scan | 147.0ms | 88.3ms | 333ms | 90.3ms |
+| Q10 heavy multi-agg | 1908ms | 1902ms | 2067ms | 1914ms |
+
+Q5 on `colcompress` achieves heap-equivalent performance (23.5ms vs 21.1ms heap) because stripe pruning skips 6 of 7 stripes — data is physically sorted by `event_date` via the `orderby` option. lz4 decompression adds negligible overhead over zstd for this stripe-pruned workload while reducing merge time.
+
+### Parallel results — median of 3 runs (JIT on, 16 workers)
+
+| Query | heap | colcompress | rowcompress | citus_columnar |
+|---|---|---|---|---|
+| Q1 `count(*)` | 17.8ms | 16.3ms | 144ms | 37.0ms |
+| Q2 `SUM/AVG` numeric+double | 50.1ms | 30.9ms | 142ms | 121.7ms |
+| Q3 `GROUP BY` country (10 vals) | 57.6ms | 171ms | 151ms | 138ms |
+| Q4 `GROUP BY` event_type + p95 | 539ms | 329ms | 686ms | 473ms |
+| Q5 date range 1 month | 21.2ms | 242ms | 69.5ms | 21.0ms |
+| Q6 JSONB `@>` GIN | 84.5ms | 42.8ms | 465ms | 235ms |
+| Q7 JSONB key + GROUP BY | 391ms | 87.7ms | 692ms | 349ms |
+| Q8 array `@>` GIN | 61.7ms | 33.3ms | 275ms | 147ms |
+| Q9 LIKE text scan | 48.7ms | 26.8ms | 140ms | 91.0ms |
+| Q10 heavy multi-agg | 1951ms | **691ms** | 2085ms | 1958ms |
+
+Note: Q5 shows higher latency for `colcompress` in parallel mode. Each parallel worker scans its assigned block range independently without a global stripe-pruning pass, so all stripes are read. Stripe pruning is effective only in the single-process sequential scan path.
+
+### Reproducing the results
+
+The full benchmark kit is in `tests/bench/`:
+
+```bash
+createdb bench_am
+psql -d bench_am -f tests/bench/setup.sql
+
+# Serial run
+bash tests/bench/run.sh 3
+python3 tests/bench/chart.py
+
+# Parallel run
+bash tests/bench/run_parallel.sh 3
+python3 tests/bench/chart_parallel.py
+```
+
+See [tests/README.md](tests/README.md) for full environment description and step-by-step instructions.
+
+> Benchmark results above correspond to version 1.0.4 with `lz4` compression and globally sorted stripes.
 
 ---
 

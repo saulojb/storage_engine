@@ -769,6 +769,17 @@ ColumnarIndexScanAdditionalCost(PlannerInfo *root, RelOptInfo *rel,
 
 	Cost scanCost = perStripeCost * estimatedStripeReadCount;
 
+	/*
+	 * Random access to columnar data requires decompressing an entire chunk
+	 * for each row fetched.  Even when correlation is perfect the index path
+	 * does NOT benefit from stripe pruning, so we add a per-row penalty that
+	 * reflects this chunk-decompression overhead.  This keeps the planner
+	 * from preferring an index scan over the custom columnar scan (which
+	 * CAN prune stripes) for OLAP range queries when index_scan=false.
+	 */
+	Cost randomAccessPenalty = estimatedRows * cpu_tuple_cost * 100.0;
+	scanCost = Max(scanCost, randomAccessPenalty);
+
 	ereport(DEBUG4, (errmsg("re-costing index scan for columnar table: "
 							"selectivity = %.10f, complement abs "
 							"correlation = %.10f, per stripe cost = %.10f, "

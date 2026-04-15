@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 1.0.5
+
+* fix: **EXPLAIN + citus SIGSEGV** — `IsCreateTableAs(NULL)` called `strlen(NULL)` when
+  citus passed `query_string=NULL` internally; added NULL guard. Added `IsExplainQuery`
+  guard to skip `PlanTreeMutator` for EXPLAIN statements. Fixed `T_CustomScan` else
+  branch to recurse into `custom_plans` instead of `elog(ERROR)`.
+* fix: **stripe pruning bypassed by btree indexes** — when a btree index existed on a
+  colcompress table, the planner chose `IndexScan` with `randomAccess=true`, which
+  disabled stripe pruning entirely. Fixed by strengthening
+  `ColumnarIndexScanAdditionalCost` with a per-row random-access penalty
+  (`estimatedRows * cpu_tuple_cost * 100.0`), steering the planner back to seq scan.
+* perf: **`ColumnarIndexScanAdditionalCost` per-row penalty** — discourages index scans
+  on large colcompress tables where full-stripe pruning is more efficient.
+* docs: **benchmark kit** — added `tests/bench/` with setup SQL, serial/parallel run
+  scripts, chart generators, and result PNGs; added `BENCHMARKS.md` with full analysis.
+* docs: **README** — citus load order note, btree/stripe-pruning Known Limitation,
+  Benchmarks section, corrected install path.
+
+## 1.0.4
+
+* chore: bump version to 1.0.4 (PGXN meta).
+* docs: benchmark results — heap vs colcompress vs rowcompress vs citus_columnar.
+
 ## 1.0.3
 
 * perf: **stripe-level min/max pruning for colcompress scans** — before reading

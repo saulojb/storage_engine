@@ -53,9 +53,7 @@ static Oid engine_tableam_oid = InvalidOid;
 static PlannedStmt * ColumnarPlannerHook(Query *parse,  const char *query_string,
 										 int cursorOptions, ParamListInfo boundParams);
 static bool IsCreateTableAs(const char *query);
-
-#if PG_VERSION_NUM >= PG_VERSION_14
-static Plan * PlanTreeMutator(Plan *node, void *context);
+static bool IsExplainQuery(const char *query);
 
 typedef struct PlanTreeMutatorContext
 {
@@ -173,6 +171,7 @@ ExpressionMutator(Node *node, void *context)
 	return expression_tree_mutator(node, ExpressionMutator, (void *) context);
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_14
 
 static Plan *
 PlanTreeMutator(Plan *node, void *context)
@@ -204,7 +203,17 @@ PlanTreeMutator(Plan *node, void *context)
 			}
 			else
 			{
-					elog(ERROR, "Custom Scan type is not ColcompressScan.");
+				/*
+				 * This is another extension's CustomScan node (e.g. citus router
+				 * or local execution plan).  Leave it alone but recurse into its
+				 * custom_plans so we can find and mutate any nested storage_engine
+				 * CustomScan nodes.
+				 */
+				ListCell *lc;
+				foreach(lc, customScan->custom_plans)
+				{
+					lfirst(lc) = PlanTreeMutator((Plan *) lfirst(lc), context);
+				}
 			}
 
 			break;
@@ -342,6 +351,17 @@ ColumnarPlannerHook(Query *parse,
 	}
 
 #if PG_VERSION_NUM >= PG_VERSION_14
+	/*
+	 * Skip plan tree mutation for EXPLAIN queries.  When citus is loaded
+	 * alongside storage_engine, citus calls ExecutorStart internally during
+	 * EXPLAIN processing.  Mutating the plan tree in that context causes a
+	 * segfault because citus does not expect the plan to be modified after
+	 * its own planner hook has run.  Plain EXPLAIN (without ANALYZE) does
+	 * not execute the plan, so vectorization is irrelevant anyway.
+	 */
+	if (IsExplainQuery(query_string))
+		return stmt;
+
 	if (!(engine_enable_vectorization			/* Vectorization should be enabled */
 			|| engine_index_scan)				/* or Engine Index Scan */
 		|| stmt->commandType != CMD_SELECT		/* only SELECTS are supported  */
@@ -408,7 +428,12 @@ static bool
 IsCreateTableAs(const char *query)
 {
 	char *c, *t, *a;
-	size_t query_len = strlen(query);
+	size_t query_len;
+
+	if (query == NULL)
+		return false;
+
+	query_len = strlen(query);
 	char *haystack = (char *) palloc(query_len + 1);
 	int32 i;
 
@@ -444,6 +469,25 @@ IsCreateTableAs(const char *query)
 	pfree(haystack);
 
 	return true;
+}
+
+/*
+ * IsExplainQuery
+ *
+ * Returns true if the query string starts with EXPLAIN (case-insensitive),
+ * with optional leading whitespace.
+ */
+static bool
+IsExplainQuery(const char *query)
+{
+	if (query == NULL)
+		return false;
+
+	/* Skip leading whitespace */
+	while (*query == ' ' || *query == '\t' || *query == '\n' || *query == '\r')
+		query++;
+
+	return pg_strncasecmp(query, "explain", 7) == 0;
 }
 
 void engine_planner_init(void)
