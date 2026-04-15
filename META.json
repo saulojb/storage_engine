@@ -6,7 +6,9 @@
    "maintainer": [
       "Saulo José Benvenutti <saulojb@gmail.com>"
    ],
-   "license": "agpl",
+   "license": {
+      "AGPL-3.0": "https://www.gnu.org/licenses/agpl-3.0.html"
+   },
    "provides": {
       "storage_engine": {
          "abstract": "colcompress and rowcompress Table Access Methods with vectorized execution",
@@ -17,12 +19,12 @@
    "prereqs": {
       "build": {
          "requires": {
-            "PostgreSQL": "13.0"
+            "PostgreSQL": "13.0.0"
          }
       },
       "runtime": {
          "requires": {
-            "PostgreSQL": "13.0"
+            "PostgreSQL": "13.0.0"
          }
       }
    },
