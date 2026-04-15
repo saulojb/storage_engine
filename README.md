@@ -193,6 +193,17 @@ SELECT table_name, index_scan FROM engine.colcompress_options WHERE table_name =
 
 For document repositories the combination is compelling: `colcompress` with `zstd` can compress large binary/text documents 3–10×, and with the index scan enabled, retrievals like `WHERE id = $1` or `WHERE document_key = $1` decompress only the matching rows without touching the rest of the stripe.
 
+> **When to use `index_scan = true` vs `colcompress_merge()`**
+>
+> These are two distinct use cases, not competing strategies:
+>
+> | Use case | Strategy |
+> |---|---|
+> | **File/document storage** (XML, PDF, JSON blobs — fetched by primary key or unique key) | `index_scan = true`. You want columnar compression for storage savings and point-lookup speed without full-stripe decompression. Sort order is irrelevant; every fetch targets a specific row. |
+> | **Analytics** (aggregations, date ranges, GROUP BY, pattern scans over millions of rows) | `index_scan = false` + `colcompress_merge()`. Sort the data by the query's filter column (`orderby = 'event_date ASC'`), then merge to produce globally ordered stripes. Stripe-level min/max pruning skips irrelevant stripes entirely before any decompression occurs. |
+>
+> Mixing both on the same table is possible but not ideal: a B-tree index on the `orderby` column will cause the planner to prefer `IndexScan` for range queries, disabling stripe pruning (see [Known Limitations](#b-tree-indexes-on-colcompress-disable-stripe-pruning)). If you need occasional point lookups on an analytical table, rely on the GUC `SET storage_engine.enable_columnar_index_scan = on` at session level rather than creating a B-tree index.
+
 ### DELETE and UPDATE Support
 
 `colcompress` fully supports `DELETE` and `UPDATE` via a **row mask** stored in `engine.row_mask`. Each deleted row is marked as a bit in a per-chunk-group bitmask; the scan engine skips masked rows without rewriting the stripe. `UPDATE` is implemented as a delete-then-insert.
