@@ -17,7 +17,7 @@ Both AMs coexist alongside standard heap tables in the same database. All catalo
   - [Column-Level Caching](#column-level-caching)
   - [Vectorized Execution](#vectorized-execution)
   - [Parallel Scan](#parallel-scan)
-  - [Chunk-Level Min/Max Pruning](#chunk-level-minmax-pruning)
+  - [Stripe-Level and Chunk-Level Min/Max Pruning](#stripe-level-and-chunk-level-minmax-pruning)
   - [Index-Backed Scan](#index-backed-scan)
   - [DELETE and UPDATE Support](#delete-and-update-support)
   - [ON CONFLICT / Upserts](#on-conflict--upserts)
@@ -131,11 +131,28 @@ SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 ```
 
-### Chunk-Level Min/Max Pruning
+### Stripe-Level and Chunk-Level Min/Max Pruning
 
-Every chunk stores `minimum_value` and `maximum_value` for its column in `engine.chunk`. When a query has a WHERE predicate on a column (e.g. `WHERE ts > '2024-01-01'`), the custom scan node evaluates each chunk's range at planning time and skips any chunk whose range cannot satisfy the predicate. This is the same technique used by Parquet row-group statistics and ClickHouse sparse indexes.
+`colcompress` implements **two layers** of zone-map pruning using the `minimum_value` / `maximum_value` statistics stored per chunk in `engine.chunk`.
 
-Pruning effectiveness scales directly with data sortedness. Use the `orderby` option combined with `engine.colcompress_merge()` to establish global sort order and maximize pruning.
+**Stripe-level pruning (coarse)** — Before reading any data, the scan aggregates the min/max across all chunks of each stripe and tests the resulting stripe-wide range against the query's WHERE predicates using PostgreSQL's `predicate_refuted_by`. Any stripe whose range is provably disjoint from the predicate is skipped entirely — no decompression, no I/O. The number of stripes removed this way is reported in `EXPLAIN`:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) FROM events WHERE ts > '2025-01-01';
+
+-- Custom Scan (ColumnarScan) on events  ...
+--   Engine Stripes Removed by Pruning: 41
+--   Engine Stripes Read: 12
+```
+
+Stripe pruning is most effective after `engine.colcompress_merge()` has established a global sort order, but it also works on any partially sorted data.
+
+**Chunk-level pruning (fine)** — Within each stripe that survives the coarse filter, the custom scan evaluates each individual chunk group's min/max range against the same predicates. Chunk groups whose range cannot satisfy the predicate are skipped.
+
+The two layers compose: a query on a large, well-sorted table typically eliminates entire stripes before touching them, then further prunes chunk groups within the remaining stripes, resulting in very small I/O amplification even without an index.
+
+Pruning effectiveness scales directly with data sortedness. Use the `orderby` option combined with `engine.colcompress_merge()` to establish global sort order and maximize pruning at both levels.
 
 ### Index-Backed Scan
 
@@ -198,7 +215,7 @@ ON CONFLICT (user_id, event_type) DO UPDATE SET value = EXCLUDED.value;
 
 ### MergeTree-Like Ordering and colcompress_merge
 
-Inspired by ClickHouse's MergeTree engine, `colcompress` supports a **global sort key** per table. When set, every new stripe written to the table is sorted by the key before compression. The `engine.colcompress_merge()` function rewrites the entire table in a single globally sorted pass, making chunk-level min/max pruning maximally effective across all stripes.
+Inspired by ClickHouse's MergeTree engine, `colcompress` supports a **global sort key** per table. When set, every new stripe written to the table is sorted by the key before compression. The `engine.colcompress_merge()` function rewrites the entire table in a single globally sorted pass, making stripe-level and chunk-level min/max pruning maximally effective across all stripes.
 
 ```sql
 -- Assign a sort key to an existing table

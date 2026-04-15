@@ -327,6 +327,10 @@ extern bool ColumnarReadNextVector(ColumnarReadState *readState, Datum *columnVa
 								   bool *columnNulls, uint64 *rowNumber,
 								   int *newVectorSize);
 extern int64 ColumnarReadChunkGroupsFiltered(ColumnarReadState *state);
+extern int64 ColumnarReadStripesSkipped(ColumnarReadState *state);
+extern List * ColumnarFilterStripes(Relation relation, List *stripeList,
+									TupleDesc tupleDescriptor, List *whereClauseList,
+									Snapshot snapshot, int64 *stripesSkippedOut);
 extern void ColumnarSetAnalyzeCGStride(ColumnarReadState *state, int stride);
 extern void ColumnarRescan(ColumnarReadState *readState, List *scanQual);
 

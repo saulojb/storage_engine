@@ -13,6 +13,9 @@
 #define COLUMNAR_METADATA_H
 
 #include "access/sdir.h"
+#include "access/tupdesc.h"
+#include "fmgr.h"
+#include "utils/snapshot.h"
 
 /*
  * StripeMetadata represents information about a stripe. This information is
@@ -52,6 +55,10 @@ typedef struct EmptyStripeReservation
 } EmptyStripeReservation;
 
 extern List * StripesForRelfilenode(RelFileLocator relfilelocator, ScanDirection scanDirection);
+extern bool ReadStripeColumnMinMax(RelFileLocator relfilelocator, uint64 stripeId,
+								   int16 attrNum, Form_pg_attribute attrForm,
+								   FmgrInfo *compareFunc, Snapshot snapshot,
+								   Datum *minOut, Datum *maxOut);
 extern uint32 DeletedRowsForStripe(RelFileLocator relfilelocator,
 								   uint32 chunkCount,
 								   uint64 stripeId);

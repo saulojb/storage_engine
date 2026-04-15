@@ -2818,6 +2818,12 @@ ColumnarScan_ExplainCustomScan(CustomScanState *node, List *ancestors,
 			ExplainPropertyInteger(
 				"Engine Chunk Groups Removed by Filter",
 				NULL, ColumnarScanChunkGroupsFiltered(columnarScanDesc), es);
+
+			int64 stripped = ColumnarScanStripesSkipped(columnarScanDesc);
+			if (stripped > 0)
+				ExplainPropertyInteger(
+					"Engine Stripes Removed by Pruning",
+					NULL, stripped, es);
 		}
 	}
 
@@ -2912,8 +2918,28 @@ Columnar_InitializeDSMCustomScan(CustomScanState *node,
 	 * Pre-fetch all stripe IDs for this table into the DSM so that workers
 	 * can claim them atomically without catalog access in the hot path.
 	 * This runs in the leader (single-threaded) before any workers start.
+	 *
+	 * Apply stripe-level pruning here so workers only scan stripes that can
+	 * possibly satisfy the WHERE clauses.
 	 */
 	List	   *stripeList = StripesForRelfilenode(rel->rd_locator, ForwardScanDirection);
+
+	/* Stripe-level pruning (parallel path) */
+	if (columnarScanState->qual != NIL)
+	{
+		int64 skipped = 0;
+		stripeList = ColumnarFilterStripes(rel, stripeList,
+										  RelationGetDescr(rel),
+										  columnarScanState->qual,
+										  columnarScanState->snapshot,
+										  &skipped);
+		/*
+		 * skipped is discarded here; the per-worker EXPLAIN counter will
+		 * remain 0 for the parallel path (workers never call ColumnarBeginRead
+		 * with stripe-level pruning — the pruning already happened here).
+		 */
+	}
+
 	int			stripeCount = list_length(stripeList);
 	int			i = 0;
 	ListCell   *lc;

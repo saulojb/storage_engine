@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## 1.0.3
+
+* perf: **stripe-level min/max pruning for colcompress scans** — before reading
+  any stripe, the scan aggregates the per-column min/max statistics from
+  `engine.chunk` across all chunks of the stripe and tests the resulting
+  stripe-wide ranges against the query's WHERE predicates using
+  `predicate_refuted_by`. Any stripe whose range is provably disjoint from the
+  predicate is skipped entirely — no decompression, no I/O. The pruned count is
+  shown in `EXPLAIN`:
+
+  ```
+  Engine Stripes Removed by Pruning: N
+  ```
+
+  Pruning applies to both the serial scan path and the parallel DSM path
+  (parallel workers only receive stripe IDs that survive the filter).
+  Effectiveness scales directly with data sortedness; combine with
+  `engine.colcompress_merge()` and the `orderby` table option to maximise it.
+
 ## 1.0.2
 
 * fix: **index corruption during `COPY` into colcompress tables** — `engine_multi_insert`

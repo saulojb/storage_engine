@@ -836,6 +836,101 @@ ReadStripeSkipList(RelFileLocator relfilelocator, uint64 stripe, TupleDesc tuple
 
 
 /*
+ * ReadStripeColumnMinMax computes the aggregate minimum and maximum values for
+ * a single column across all chunk groups of a given stripe. This is used for
+ * stripe-level pruning: if [stripeMin, stripeMax] cannot satisfy the WHERE
+ * clause predicates, the stripe can be skipped entirely without reading data.
+ *
+ * compareFunc must be the BTORDER_PROC comparison function for the column type.
+ * Returns true if any chunk had min/max statistics, writing results to *minOut
+ * and *maxOut. Returns false if no statistics are available (all-NULL columns).
+ */
+bool
+ReadStripeColumnMinMax(RelFileLocator relfilelocator, uint64 stripeId,
+					   int16 attrNum, Form_pg_attribute attrForm,
+					   FmgrInfo *compareFunc, Snapshot snapshot,
+					   Datum *minOut, Datum *maxOut)
+{
+	uint64 storageId = LookupStorageId(relfilelocator);
+
+	Oid columnarChunkOid = ColumnarChunkRelationId();
+	Relation columnarChunk = table_open(columnarChunkOid, AccessShareLock);
+	Relation index = index_open(ColumnarChunkIndexRelationId(), AccessShareLock);
+
+	/* Scan engine.chunk with prefix key (storage_id, stripe_num, attr_num) */
+	ScanKeyData scanKey[3];
+	ScanKeyInit(&scanKey[0], Anum_engine_chunk_storageid,
+				BTEqualStrategyNumber, F_OIDEQ, UInt64GetDatum(storageId));
+	ScanKeyInit(&scanKey[1], Anum_engine_chunk_stripe,
+				BTEqualStrategyNumber, F_OIDEQ, Int64GetDatum(stripeId));
+	ScanKeyInit(&scanKey[2], Anum_engine_chunk_attr,
+				BTEqualStrategyNumber, F_INT2EQ, Int16GetDatum((int16) attrNum));
+
+	SysScanDesc scanDescriptor = systable_beginscan_ordered(columnarChunk, index,
+															snapshot, 3, scanKey);
+
+	bool hasMinMax = false;
+	Datum stripeMin = (Datum) 0;
+	Datum stripeMax = (Datum) 0;
+
+	HeapTuple heapTuple;
+	while (HeapTupleIsValid(heapTuple = systable_getnext_ordered(scanDescriptor,
+																 ForwardScanDirection)))
+	{
+		Datum datumArray[Natts_engine_chunk];
+		bool isNullArray[Natts_engine_chunk];
+
+		heap_deform_tuple(heapTuple, RelationGetDescr(columnarChunk),
+						  datumArray, isNullArray);
+
+		/* Skip chunks with no min/max (all-NULL column values) */
+		if (isNullArray[Anum_engine_chunk_minimum_value - 1] ||
+			isNullArray[Anum_engine_chunk_maximum_value - 1])
+			continue;
+
+		bytea *minBytea = DatumGetByteaP(datumArray[Anum_engine_chunk_minimum_value - 1]);
+		bytea *maxBytea = DatumGetByteaP(datumArray[Anum_engine_chunk_maximum_value - 1]);
+
+		Datum chunkMin = ByteaToDatum(minBytea, attrForm);
+		Datum chunkMax = ByteaToDatum(maxBytea, attrForm);
+
+		if (!hasMinMax)
+		{
+			stripeMin = chunkMin;
+			stripeMax = chunkMax;
+			hasMinMax = true;
+		}
+		else
+		{
+			/* Update stripe-level min if this chunk's min is smaller */
+			if (DatumGetInt32(FunctionCall2Coll(compareFunc,
+												attrForm->attcollation,
+												chunkMin, stripeMin)) < 0)
+				stripeMin = chunkMin;
+
+			/* Update stripe-level max if this chunk's max is larger */
+			if (DatumGetInt32(FunctionCall2Coll(compareFunc,
+												attrForm->attcollation,
+												chunkMax, stripeMax)) > 0)
+				stripeMax = chunkMax;
+		}
+	}
+
+	systable_endscan_ordered(scanDescriptor);
+	index_close(index, AccessShareLock);
+	table_close(columnarChunk, AccessShareLock);
+
+	if (hasMinMax)
+	{
+		*minOut = stripeMin;
+		*maxOut = stripeMax;
+	}
+
+	return hasMinMax;
+}
+
+
+/*
  * ReadChunkRowMask fetches chunk row mask for columnar relation.
  */
 bytea *

@@ -39,6 +39,7 @@
 
 #include "engine/engine.h"
 #include "engine/engine_storage.h"
+#include "engine/engine_metadata.h"
 #include "engine/engine_tableam.h"
 #include "engine/engine_version_compat.h"
 
@@ -106,6 +107,15 @@ struct ColumnarReadState
 
 	/* Parallel exeuction */
 	ParallelColumnarScan parallelColumnarScan;
+
+	/*
+	 * Stripe-level pruning: pre-filtered list of StripeMetadata* for the
+	 * serial (non-parallel) scan path. NULL until ColumnarBeginRead populates
+	 * it. currentStripeCursor is the next-to-be-read cell.
+	 */
+	List     *filteredStripeList;
+	ListCell *currentStripeCursor;
+	int64     stripesSkipped;
 
 	/*
 	 * ANALYZE chunk-group sampling: read 1 CG, skip (stride-1) CGs.
@@ -179,6 +189,13 @@ static StripeSkipList * SelectedChunkSkipList(StripeSkipList *stripeSkipList,
 											  bool *selectedChunkMask);
 static uint32 StripeSkipListRowCount(StripeSkipList *stripeSkipList);
 static bool * ProjectedColumnMask(uint32 columnCount, List *projectedColumnList);
+static bool StripeCanMatchWhereClause(Relation relation, StripeMetadata *stripeMetadata,
+									  TupleDesc tupleDescriptor, List *whereClauseList,
+									  List *whereClauseVars, Snapshot snapshot);
+static List * FilterStripeList(Relation relation, List *stripeList,
+							   TupleDesc tupleDescriptor, List *whereClauseList,
+							   List *whereClauseVars, Snapshot snapshot,
+							   int64 *stripesSkippedOut);
 static void DeserializeBoolArray(StringInfo boolArrayBuffer, bool *boolArray,
 								 uint32 boolArrayLength);
 static void DeserializeDatumArray(StringInfo datumBuffer, bool *existsArray,
@@ -203,6 +220,99 @@ static bool ReadChunkGroupNextVector(ChunkGroupReadState *chunkGroupReadState, D
 									 int32 *columnValueOffset, int *chunkReadRows,
 									 uint64 *rowNumber,
 									 uint64 stripeFirstRowNumber);
+
+/*
+ * StripeCanMatchWhereClause checks whether a stripe can possibly satisfy the
+ * WHERE clauses by comparing the stripe-level [min, max] range for each
+ * referenced column against the predicate list via predicate_refuted_by().
+ *
+ * Returns false when the stripe is provably unnecessary (can be skipped).
+ * Returns true when the stripe might contain matching rows.
+ */
+static bool
+StripeCanMatchWhereClause(Relation relation, StripeMetadata *stripeMetadata,
+						  TupleDesc tupleDescriptor, List *whereClauseList,
+						  List *whereClauseVars, Snapshot snapshot)
+{
+	ListCell *columnCell;
+
+	foreach(columnCell, whereClauseVars)
+	{
+		Var *column = lfirst(columnCell);
+
+		/* Skip columns without a btree comparator */
+		FmgrInfo *compareFunc = GetFunctionInfoOrNull(column->vartype,
+													  BTREE_AM_OID,
+													  BTORDER_PROC);
+		if (compareFunc == NULL)
+			continue;
+
+		Form_pg_attribute attrForm =
+			TupleDescAttr(tupleDescriptor, column->varattno - 1);
+
+		Datum stripeMin,
+			  stripeMax;
+#if PG_VERSION_NUM >= PG_VERSION_16
+		bool hasMinMax = ReadStripeColumnMinMax(relation->rd_locator,
+#else
+		bool hasMinMax = ReadStripeColumnMinMax(relation->rd_node,
+#endif
+											   stripeMetadata->id,
+											   (int16) column->varattno,
+											   attrForm,
+											   compareFunc,
+											   snapshot,
+											   &stripeMin,
+											   &stripeMax);
+
+		/* No statistics for this column: cannot prune */
+		if (!hasMinMax)
+			continue;
+
+		Node *baseConstraint = BuildBaseConstraint(column);
+		UpdateConstraint(baseConstraint, stripeMin, stripeMax);
+		List *constraintList = list_make1(baseConstraint);
+
+		if (predicate_refuted_by(constraintList, whereClauseList, false))
+			return false; /* stripe provably has no matching rows */
+	}
+
+	return true; /* stripe may contain matching rows */
+}
+
+
+/*
+ * FilterStripeList returns a new list containing only those stripes from
+ * stripeList that StripeCanMatchWhereClause() considers potentially matching.
+ * The number of pruned stripes is added to *stripesSkippedOut.
+ */
+static List *
+FilterStripeList(Relation relation, List *stripeList,
+				 TupleDesc tupleDescriptor, List *whereClauseList,
+				 List *whereClauseVars, Snapshot snapshot,
+				 int64 *stripesSkippedOut)
+{
+	List	 *result = NIL;
+	ListCell *lc;
+
+	foreach(lc, stripeList)
+	{
+		StripeMetadata *stripe = (StripeMetadata *) lfirst(lc);
+
+		if (StripeCanMatchWhereClause(relation, stripe, tupleDescriptor,
+									  whereClauseList, whereClauseVars, snapshot))
+		{
+			result = lappend(result, stripe);
+		}
+		else
+		{
+			(*stripesSkippedOut)++;
+		}
+	}
+
+	return result;
+}
+
 
 /*
  * ColumnarBeginRead initializes a columnar read operation. This function returns a
@@ -230,6 +340,9 @@ ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 	readState->whereClauseList = whereClauseList;
 	readState->whereClauseVars = GetClauseVars(whereClauseList, tupleDescriptor->natts);
 	readState->chunkGroupsFiltered = 0;
+	readState->stripesSkipped = 0;
+	readState->filteredStripeList = NIL;
+	readState->currentStripeCursor = NULL;
 	readState->tupleDescriptor = tupleDescriptor;
 	readState->stripeReadContext = stripeReadContext;
 	readState->stripeReadState = NULL;
@@ -270,6 +383,31 @@ ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 			* engine_index_fetch_tuple would do so when needed.
 			*/
 			ColumnarReadFlushPendingWrites(readState);
+		}
+
+		/*
+		 * Stripe-level pruning (serial scan only): pre-filter the stripe
+		 * list using per-column min/max statistics from engine.chunk.  This
+		 * avoids reading data pages for stripes that provably cannot satisfy
+		 * the WHERE clauses.  The parallel path filters stripes in
+		 * Columnar_InitializeDSMCustomScan before writing them to the DSM.
+		 */
+		if (readState->parallelColumnarScan == NULL &&
+			whereClauseList != NIL && readState->whereClauseVars != NIL)
+		{
+			MemoryContext oldCtx = MemoryContextSwitchTo(readState->scanContext);
+#if PG_VERSION_NUM >= PG_VERSION_16
+			List *allStripes = StripesForRelfilenode(relation->rd_locator,
+#else
+			List *allStripes = StripesForRelfilenode(relation->rd_node,
+#endif
+													 ForwardScanDirection);
+			readState->filteredStripeList =
+				FilterStripeList(relation, allStripes, tupleDescriptor,
+								 whereClauseList, readState->whereClauseVars,
+								 readState->snapshot, &readState->stripesSkipped);
+			readState->currentStripeCursor = list_head(readState->filteredStripeList);
+			MemoryContextSwitchTo(oldCtx);
 		}
 
 		/*
@@ -820,20 +958,47 @@ AdvanceStripeRead(ColumnarReadState *readState)
 
 	if (readState->parallelColumnarScan == 0)
 	{
-		/* if not read any stripes yet, start from the first one .. */
-		uint64 lastReadRowNumber = COLUMNAR_INVALID_ROW_NUMBER;
+		/* Accumulate chunk-group filter stats when a stripe read has just finished */
 		if (StripeReadInProgress(readState))
 		{
-			/* .. otherwise, continue with the next stripe */
-			lastReadRowNumber = StripeGetHighestRowNumber(readState->currentStripeMetadata);
-
 			readState->chunkGroupsFiltered +=
 				readState->stripeReadState->chunkGroupsFiltered;
 		}
 
-		readState->currentStripeMetadata = FindNextStripeByRowNumber(readState->relation,
-																	lastReadRowNumber,
-																	readState->snapshot);
+		if (readState->filteredStripeList != NIL)
+		{
+			/*
+			 * Stripe-level pruning is active: iterate the pre-filtered list
+			 * directly instead of doing a catalog lookup per stripe.
+			 * currentStripeCursor was initialised to list_head() in
+			 * ColumnarBeginRead before the first AdvanceStripeRead call.
+			 */
+			if (readState->currentStripeCursor != NULL)
+			{
+				readState->currentStripeMetadata =
+					(StripeMetadata *) lfirst(readState->currentStripeCursor);
+				readState->currentStripeCursor =
+					lnext(readState->filteredStripeList,
+						  readState->currentStripeCursor);
+			}
+			else
+			{
+				readState->currentStripeMetadata = NULL; /* list exhausted */
+			}
+		}
+		else
+		{
+			/* No pre-filtered list: fall back to per-stripe catalog lookup */
+			uint64 lastReadRowNumber = COLUMNAR_INVALID_ROW_NUMBER;
+			if (StripeReadInProgress(readState))
+				lastReadRowNumber =
+					StripeGetHighestRowNumber(readState->currentStripeMetadata);
+
+			readState->currentStripeMetadata =
+				FindNextStripeByRowNumber(readState->relation,
+										 lastReadRowNumber,
+										 readState->snapshot);
+		}
 	}
 	else
 	{
@@ -1146,6 +1311,36 @@ ReadChunkGroupNextRow(ChunkGroupReadState *chunkGroupReadState, Datum *columnVal
 
 
 /*
+ * ColumnarFilterStripes is a public entry point for stripe-level pruning.
+ * It extracts column variables from whereClauseList, then prunes stripeList
+ * by calling StripeCanMatchWhereClause() for each stripe.
+ *
+ * Used by Columnar_InitializeDSMCustomScan to filter stripes before writing
+ * them into the DSM for parallel workers.
+ *
+ * Returns the filtered stripe list; *stripesSkippedOut receives the count
+ * of pruned stripes.
+ */
+List *
+ColumnarFilterStripes(Relation relation, List *stripeList,
+					  TupleDesc tupleDescriptor, List *whereClauseList,
+					  Snapshot snapshot, int64 *stripesSkippedOut)
+{
+	if (whereClauseList == NIL)
+		return stripeList;
+
+	List *whereClauseVars = GetClauseVars(whereClauseList,
+										  tupleDescriptor->natts);
+	if (whereClauseVars == NIL)
+		return stripeList;
+
+	return FilterStripeList(relation, stripeList, tupleDescriptor,
+							whereClauseList, whereClauseVars,
+							snapshot, stripesSkippedOut);
+}
+
+
+/*
  * ColumnarReadChunkGroupsFiltered
  *
  * Return the number of chunk groups filtered during this read operation.
@@ -1154,6 +1349,17 @@ int64
 ColumnarReadChunkGroupsFiltered(ColumnarReadState *state)
 {
 	return state->chunkGroupsFiltered;
+}
+
+
+/*
+ * ColumnarReadStripesSkipped returns the number of stripes pruned by
+ * stripe-level min/max predicate filtering during this read operation.
+ */
+int64
+ColumnarReadStripesSkipped(ColumnarReadState *state)
+{
+	return state->stripesSkipped;
 }
 
 

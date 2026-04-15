@@ -3041,6 +3041,25 @@ ColumnarScanChunkGroupsFiltered(ColumnarScanDesc columnarScanDesc)
 
 
 /*
+ * Get the number of stripes skipped by stripe-level pruning during the scan.
+ */
+int64
+ColumnarScanStripesSkipped(ColumnarScanDesc columnarScanDesc)
+{
+	ColumnarReadState *readState = columnarScanDesc->cs_readState;
+
+	if (readState != NULL)
+	{
+		return ColumnarReadStripesSkipped(readState);
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+
+/*
  * Implementation of TupleTableSlotOps.copy_heap_tuple for TTSOpsColumnar.
  */
 static HeapTuple

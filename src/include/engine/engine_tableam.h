@@ -62,6 +62,7 @@ extern TableScanDesc engine_beginscan_extended(Relation relation, Snapshot snaps
 extern IndexFetchTableData * engine_index_fetch_begin_extended(Relation rel,
 																 Bitmapset *attr_neededs);
 extern int64 ColumnarScanChunkGroupsFiltered(ColumnarScanDesc columnarScanDesc);
+extern int64 ColumnarScanStripesSkipped(ColumnarScanDesc columnarScanDesc);
 extern bool ColumnarSupportsIndexAM(char *indexAMName);
 extern bool IsColumnarTableAmTable(Oid relationId);
 
