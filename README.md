@@ -503,36 +503,6 @@ Speculative insertion (`INSERT … ON CONFLICT`) requires a unique index on the 
 
 ---
 
-## Benchmarks
-
-**1 000 000 rows · PostgreSQL 18 · median of 3 runs · JIT off · single-thread**
-
-![Benchmark chart — heap vs colcompress vs rowcompress vs citus_columnar](images/benchmark.png)
-
-| Query | heap | colcompress | rowcompress | citus_columnar |
-|---|---:|---:|---:|---:|
-| Q1 count(*) | 41 ms | 46 ms | 322 ms | **39 ms** |
-| Q2 SUM/AVG numeric+double | 213 ms | **136 ms** | 394 ms | 124 ms |
-| Q3 GROUP BY country (×10) | 243 ms | 174 ms | 416 ms | **145 ms** |
-| Q4 GROUP BY + p95 aggregate | 580 ms | **476 ms** | 709 ms | 481 ms |
-| Q5 date range 1 month | **23 ms** | 234 ms | 62 ms | 26 ms |
-| Q6 JSONB `@>` (GIN) | **130 ms** | 427 ms | 350 ms | 249 ms |
-| Q7 JSONB key + GROUP BY | 415 ms | **343 ms** | 589 ms | 384 ms |
-| Q8 array `@>` (GIN) | **66 ms** | 392 ms | 304 ms | 149 ms |
-| Q9 LIKE text scan | 186 ms | **99 ms** | 382 ms | 95 ms |
-| Q10 heavy multi-aggregate | 2095 ms | **2062 ms** | 2224 ms | 2065 ms |
-| **Table size** | 388 MB | **80 MB** | 106 MB | 48 MB |
-
-**Key observations:**
-- `colcompress` uses **4.8× less disk** than heap and is faster on pure OLAP scans (Q2–Q4, Q7, Q9, Q10).
-- `citus_columnar` achieves **8.1× compression** (smallest footprint) and matches `colcompress` on most analytical queries.
-- Heap wins on indexed point/range lookups (Q5, Q6, Q8) where sequential scan overhead of columnar formats dominates.
-- `rowcompress` is slower than heap on most workloads due to decompression overhead without columnar skip benefits.
-
-See [BENCHMARKS.md](BENCHMARKS.md) for full methodology and raw results.
-
----
-
 ## Attribution
 
 `storage_engine` is a fork of **[Hydra Columnar](https://github.com/hydradatabase/hydra)**, which is itself derived from **[citus_columnar](https://github.com/citusdata/citus)** — the columnar extension originally built by Citus Data (now part of Microsoft). The original work is copyright Citus Data / Hydra and licensed under the AGPL-3.0.
