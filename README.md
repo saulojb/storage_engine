@@ -546,35 +546,35 @@ Two scenarios are measured:
 
 | Query | heap | colcompress | rowcompress | citus_columnar |
 |---|---|---|---|---|
-| Q1 `count(*)` | 38.6ms | 43.7ms | 305ms | 36.9ms |
-| Q2 `SUM/AVG` numeric+double | 182.3ms | 118.3ms | 356ms | 121.4ms |
-| Q3 `GROUP BY` country (10 vals) | 214.4ms | 162.3ms | 382ms | 141.4ms |
-| Q4 `GROUP BY` event_type + p95 | 538.2ms | 452.5ms | 680ms | 469.9ms |
-| **Q5 date range 1 month** | 21.1ms | **23.5ms** | 60.0ms | 21.1ms |
-| Q6 JSONB `@>` GIN | 121.7ms | 371.4ms | 322ms | 236.9ms |
-| Q7 JSONB key + GROUP BY | 386.2ms | 309.0ms | 537ms | 354.4ms |
-| Q8 array `@>` GIN | 61.3ms | 329.2ms | 272ms | 143.8ms |
-| Q9 LIKE text scan | 147.0ms | 88.3ms | 333ms | 90.3ms |
-| Q10 heavy multi-agg | 1908ms | 1902ms | 2067ms | 1914ms |
+| Q1 `count(*)` | 39.8ms | 43.0ms | 313ms | 36.6ms |
+| Q2 `SUM/AVG` numeric+double | 188.6ms | 117.4ms | 358ms | 122.9ms |
+| Q3 `GROUP BY` country (10 vals) | 219.0ms | 162.0ms | 395ms | 139.4ms |
+| Q4 `GROUP BY` event_type + p95 | 538.9ms | 448.4ms | 685ms | 469.7ms |
+| **Q5 date range 1 month** | 20.8ms | **22.4ms** | 59.1ms | 20.6ms |
+| Q6 JSONB `@>` GIN | 123.1ms | 162.2ms | 326ms | 238.1ms |
+| Q7 JSONB key + GROUP BY | 388.5ms | 310.3ms | 550ms | 358.2ms |
+| Q8 array `@>` GIN | 63.0ms | 122.7ms | 274ms | 140.9ms |
+| Q9 LIKE text scan | 150.9ms | 90.9ms | 338ms | 89.9ms |
+| Q10 heavy multi-agg | 1953ms | 1939ms | 2109ms | 1925ms |
 
-Q5 on `colcompress` achieves heap-equivalent performance (23.5ms vs 21.1ms heap) because stripe pruning skips 6 of 7 stripes — data is physically sorted by `event_date` via the `orderby` option. lz4 decompression adds negligible overhead over zstd for this stripe-pruned workload while reducing merge time.
+Q5 on `colcompress` achieves heap-equivalent performance (22.4ms vs 20.8ms heap) because stripe pruning skips 6 of 7 stripes — data is physically sorted by `event_date` via the `orderby` option. lz4 decompression adds negligible overhead over zstd for this stripe-pruned workload while reducing merge time.
 
 ### Parallel results — median of 3 runs (JIT on, 16 workers)
 
 | Query | heap | colcompress | rowcompress | citus_columnar |
 |---|---|---|---|---|
-| Q1 `count(*)` | 17.8ms | 16.3ms | 144ms | 37.0ms |
-| Q2 `SUM/AVG` numeric+double | 50.1ms | 30.9ms | 142ms | 121.7ms |
-| Q3 `GROUP BY` country (10 vals) | 57.6ms | 171ms | 151ms | 138ms |
-| Q4 `GROUP BY` event_type + p95 | 539ms | 329ms | 686ms | 473ms |
-| Q5 date range 1 month | 21.2ms | 242ms | 69.5ms | 21.0ms |
-| Q6 JSONB `@>` GIN | 84.5ms | 42.8ms | 465ms | 235ms |
-| Q7 JSONB key + GROUP BY | 391ms | 87.7ms | 692ms | 349ms |
-| Q8 array `@>` GIN | 61.7ms | 33.3ms | 275ms | 147ms |
-| Q9 LIKE text scan | 48.7ms | 26.8ms | 140ms | 91.0ms |
-| Q10 heavy multi-agg | 1951ms | **691ms** | 2085ms | 1958ms |
+| Q1 `count(*)` | 18.3ms | 16.4ms | 148ms | 37.9ms |
+| Q2 `SUM/AVG` numeric+double | 53.5ms | 29.7ms | 166ms | 121.5ms |
+| Q3 `GROUP BY` country (10 vals) | 61.6ms | 166ms | 161ms | 143ms |
+| Q4 `GROUP BY` event_type + p95 | 540ms | 316ms | 674ms | 470ms |
+| **Q5 date range 1 month** | 21.4ms | **28.2ms** | 73.3ms | 21.1ms |
+| Q6 JSONB `@>` GIN | 84.3ms | 40.4ms | 490ms | 245ms |
+| Q7 JSONB key + GROUP BY | 392ms | 65.7ms | 687ms | 362ms |
+| Q8 array `@>` GIN | 61.6ms | 32.7ms | 273ms | 146ms |
+| Q9 LIKE text scan | 48.7ms | 25.4ms | 157ms | 91.7ms |
+| Q10 heavy multi-agg | 1903ms | **641ms** | 2085ms | 1920ms |
 
-Note: Q5 shows higher latency for `colcompress` in parallel mode. Each parallel worker scans its assigned block range independently without a global stripe-pruning pass, so all stripes are read. Stripe pruning is effective only in the single-process sequential scan path.
+Note: Q5 on `colcompress` in parallel mode (28.2ms) is now close to the sequential result (22.4ms). The v1.0.6 fix ensures `disable_cost` is applied to `IndexPath` entries in `rel->partial_pathlist`, so the planner correctly chooses `Parallel Custom Scan (ColcompressScan)` with stripe pruning instead of `Parallel Index Scan`. Stripe pruning (6 of 7 stripes skipped) is therefore active in both sequential and parallel paths when `index_scan=false`.
 
 ### Reproducing the results
 
@@ -595,7 +595,7 @@ python3 tests/bench/chart_parallel.py
 
 See [tests/README.md](tests/README.md) for full environment description and step-by-step instructions.
 
-> Benchmark results above correspond to version 1.0.4 with `lz4` compression and globally sorted stripes.
+> Benchmark results above correspond to version 1.0.6 with `lz4` compression and globally sorted stripes.
 
 ---
 
