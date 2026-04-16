@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## 1.0.6
+
+* fix: **`index_scan=false` bypassed by `Parallel Index Scan`** — `CostColumnarPaths`
+  only iterated `rel->pathlist`, leaving `rel->partial_pathlist` (parallel paths)
+  untouched. When a B-tree index existed on a colcompress table, the planner chose
+  `Parallel Index Scan` even with `index_scan=false`, bypassing stripe pruning
+  entirely. Fixed by iterating `rel->partial_pathlist` in `CostColumnarPaths` and
+  applying `disable_cost` (1e10) to every `IndexPath` found there.
+* fix: **`disable_cost` for `index_scan=false` serial paths** — replaced the
+  proportional penalty (`estimatedRows * cpu_tuple_cost * 100.0`) with PostgreSQL's
+  canonical `disable_cost` constant (1e10), matching the behaviour of
+  `SET enable_indexscan = off`. The old penalty was smaller than the seq-scan cost
+  for low-selectivity queries (~4% of rows), so the planner still preferred
+  `IndexScan` over `ColcompressScan`.
+* bench: updated serial and parallel benchmark results and charts (1M rows,
+  PostgreSQL 18, 4 access methods).
+
 ## 1.0.5
 
 * fix: **EXPLAIN + citus SIGSEGV** — `IsCreateTableAs(NULL)` called `strlen(NULL)` when
