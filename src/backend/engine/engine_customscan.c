@@ -680,6 +680,24 @@ CostColumnarIndexPath(PlannerInfo *root, RelOptInfo *rel, Oid relationId,
 
 	if (!useIndexScan)
 	{
+		/*
+		 * index_scan is disabled for this table (both GUC and per-table flag
+		 * are off).  Add disable_cost so the planner never picks this path,
+		 * exactly like SET enable_indexscan = off does.  A proportional
+		 * penalty is insufficient: for highly-selective queries (e.g. a
+		 * 1-month date range over 2 years of data) the per-row penalty is
+		 * still smaller than reading all stripes sequentially, so the planner
+		 * would choose IndexScan and bypass stripe pruning.
+		 */
+		indexPath->path.total_cost += disable_cost;
+	}
+	else
+	{
+		/*
+		 * index_scan is enabled: add the columnar-specific additional cost
+		 * (chunk-decompression overhead) so the planner can still compare the
+		 * index path against the seq scan path fairly.
+		 */
 		Cost columnarIndexScanCost = ColumnarIndexScanAdditionalCost(root, rel, relationId,
 																	indexPath);
 		indexPath->path.total_cost += columnarIndexScanCost;
