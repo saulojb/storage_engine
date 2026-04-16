@@ -617,6 +617,8 @@ static void
 CostColumnarPaths(PlannerInfo *root, RelOptInfo *rel, Oid relationId)
 {
 	Path *path = NULL;
+
+	/* Re-cost paths in the main pathlist */
 	foreach_ptr(path, rel->pathlist)
 	{
 		if (IsA(path, IndexPath))
@@ -634,6 +636,24 @@ CostColumnarPaths(PlannerInfo *root, RelOptInfo *rel, Oid relationId)
 			 * (e.g. GIN selectivity).  We leave them untouched so the planner
 			 * can compare them fairly against ColumnarScan and IndexScan paths.
 			 */
+		}
+		else if (path->pathtype == T_SeqScan)
+		{
+			CostColumnarSeqPath(rel, relationId, path);
+		}
+	}
+
+	/*
+	 * Also re-cost paths in partial_pathlist (parallel workers).
+	 * Without this, a Parallel Index Scan in partial_pathlist escapes the
+	 * disable_cost penalty when index_scan=false, causing the planner to
+	 * prefer it over the parallel ColcompressScan and bypassing stripe pruning.
+	 */
+	foreach_ptr(path, rel->partial_pathlist)
+	{
+		if (IsA(path, IndexPath))
+		{
+			CostColumnarIndexPath(root, rel, relationId, (IndexPath *) path);
 		}
 		else if (path->pathtype == T_SeqScan)
 		{
