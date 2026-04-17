@@ -61,7 +61,7 @@ psql_ms() {
     local q="${q_tmpl//__TBL__/$tbl}"
     local tmpf
     tmpf=$(mktemp /tmp/bench_XXXXXX.sql)
-    printf '\\timing on\nSET jit=on;\nSET max_parallel_workers_per_gather=16;\n%s;\n' "$q" > "$tmpf"
+    printf '\\timing on\nSET jit=on;\nSET max_parallel_workers_per_gather=4;\n%s;\n' "$q" > "$tmpf"
 
     local -a times=()
     for ((i=0; i<RUNS; i++)); do
@@ -78,7 +78,7 @@ echo "AM,query,median_ms" > "$RESULTS"
 
 echo "============================================================"
 echo " Benchmark — PostgreSQL 18  •  1 000 000 rows"
-echo " Runs per query: $RUNS   JIT: on   Parallelism: 16 workers"
+echo " Runs per query: $RUNS   JIT: on   Parallelism: 4 workers"
 echo "============================================================"
 
 for am in "${AM_ORDER[@]}"; do
