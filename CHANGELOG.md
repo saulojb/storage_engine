@@ -1,5 +1,42 @@
 # CHANGELOG
 
+## 1.0.7
+
+* fix: **GIN `BitmapHeapScan` bypasses `ColcompressScan` with `random_page_cost=1.1`**
+  — On NVMe-tuned servers (`random_page_cost=1.1`), the planner preferred a GIN
+  `Bitmap Heap Scan` over `Custom Scan (ColcompressScan)` for analytical queries
+  with JSONB `@>` or array `@>` predicates when `index_scan=false`. This caused
+  +195–237% regression in serial mode vs baseline (Q6 JSONB: 163ms→479ms,
+  Q8 array: 123ms→414ms). Fixed by adding a `disable_cost` (1e10) penalty to every
+  `BitmapHeapPath` in `CostColumnarPaths` when `index_scan=false`, symmetric with the
+  existing penalty for `IndexPath`. Tables with `index_scan=true` are unaffected.
+  Fix confirmed: serial Q6 175ms (-63%), Q8 141ms (-66%).
+* fix: **`index_scan=false` gate missing in `engine_reader.c` chunk loader** —
+  The single-chunk targeted loading optimisation (`ColumnarReadRowByRowNumber`)
+  was activating unconditionally, including on analytics tables where
+  `index_scan=false`. Added `indexScanEnabled` field to `ColumnarReadState`,
+  populated from `ReadColumnarOptions` in `ColumnarBeginRead`, and gated the
+  single-chunk optimisation on `readState->indexScanEnabled`.
+* fix: **`BitmapHeapPath` penalty also applied to `partial_pathlist`** — parallel
+  bitmap heap paths were not being penalised, allowing GIN scans via parallel
+  workers to bypass `ColcompressScan` even with `index_scan=false`.
+* fix: **infinite loop in index scan point lookup** — `ColumnarReadRowByRowNumber`
+  could loop forever when the requested row number fell beyond the last stripe,
+  producing a hang with no error output.
+* fix: **index scan cost at chunk granularity** — `ColumnarIndexScanAdditionalCost`
+  now computes `perChunkCost` instead of `perStripeCost`, eliminating the ~15×
+  cost inflation that caused the planner to always reject `IndexScan` over
+  `ColcompressScan` for selective point lookups on wide columnar tables.
+* fix: **use projected column count in `ColumnarIndexScanAdditionalCost`** — replaced
+  `RelationIdGetNumberOfAttributes` with `list_length(rel->reltarget->exprs)`, so
+  wide tables with large blob columns (XML/JSON) no longer inflate index scan cost
+  beyond the full-scan cost, restoring planner choice for `index_scan=true` tables.
+* fix: **remove stray `randomAccessPenalty` from `ColumnarIndexScanAdditionalCost`**
+  — the per-row penalty (`estimatedRows * cpu_tuple_cost * 100`) was dead code when
+  `index_scan=false` (path already blocked by `disable_cost`) but was still evaluated
+  when `index_scan=true`, causing the planner to always choose `SeqScan` over
+  `IndexScan` regardless of selectivity. Removed entirely.
+
 ## 1.0.6
 
 * fix: **`index_scan=false` bypassed by `Parallel Index Scan`** — `CostColumnarPaths`
