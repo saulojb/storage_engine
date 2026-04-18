@@ -739,7 +739,21 @@ static Cost
 ColumnarIndexScanAdditionalCost(PlannerInfo *root, RelOptInfo *rel,
 								Oid relationId, IndexPath *indexPath)
 {
-	int numberOfColumnsRead = RelationIdGetNumberOfAttributes(relationId);
+	/*
+	 * Use the number of columns the planner actually needs to read, not the
+	 * total column count of the relation.  For wide tables with large columns
+	 * (e.g. XML/JSON blobs), using RelationIdGetNumberOfAttributes inflates
+	 * perStripeCost enormously even for queries that only touch a handful of
+	 * narrow columns, making the planner always reject the IndexScan path.
+	 *
+	 * rel->reltarget->exprs holds the output expressions needed by the plan
+	 * above this node — typically one Var per projected column.
+	 */
+	int numberOfColumnsRead = (rel->reltarget && rel->reltarget->exprs != NIL)
+		? list_length(rel->reltarget->exprs)
+		: RelationIdGetNumberOfAttributes(relationId);
+	if (numberOfColumnsRead <= 0)
+		numberOfColumnsRead = RelationIdGetNumberOfAttributes(relationId);
 	Cost perStripeCost = ColumnarPerStripeScanCost(rel, relationId, numberOfColumnsRead);
 
 	/*
