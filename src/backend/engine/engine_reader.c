@@ -146,7 +146,8 @@ static StripeReadState * BeginStripeRead(StripeMetadata *stripeMetadata, Relatio
 										 List *whereClauseList, List *whereClauseVars,
 										 MemoryContext stripeReadContext,
 										 Snapshot snapshot,
-										 int analyze_cg_stride);
+										 int analyze_cg_stride,
+										 int targetChunkGroupIndex);
 static void AdvanceStripeRead(ColumnarReadState *readState);
 static bool SnapshotMightSeeUnflushedStripes(Snapshot snapshot);
 static bool ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnValues,
@@ -171,7 +172,8 @@ static StripeBuffers * LoadFilteredStripeBuffers(Relation relation,
 												 List *whereClauseVars,
 												 int64 *chunkGroupsFiltered,
 												 Snapshot snapshot,
-												 int analyze_cg_stride);
+												 int analyze_cg_stride,
+												 int targetChunkGroupIndex);
 static ColumnBuffers * LoadColumnBuffers(Relation relation,
 										 ColumnChunkSkipNode *chunkSkipNodeArray,
 										 uint32 chunkCount, uint64 stripeOffset,
@@ -498,7 +500,8 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *columnValues, bool *col
 														 readState->whereClauseVars,
 														 readState->stripeReadContext,
 														 readState->snapshot,
-														 readState->analyze_cg_stride);
+														 readState->analyze_cg_stride,
+														 -1 /* load all chunks */);
 		}
 
 		if (!ReadStripeNextRow(readState->stripeReadState, columnValues, columnNulls,
@@ -586,6 +589,21 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 		List *whereClauseList = NIL;
 		List *whereClauseVars = NIL;
 		MemoryContext stripeReadContext = readState->stripeReadContext;
+
+		/*
+		 * For index (random-access) reads we know exactly which chunk group
+		 * contains rowNumber.  Pass the target index so LoadFilteredStripeBuffers
+		 * reads only that one chunk group instead of the entire stripe.
+		 * This avoids decompressing all chunks of a potentially huge stripe
+		 * (e.g. with XML/JSON blob columns) just to return a single row.
+		 */
+		int targetChunkGroupIndex = -1; /* -1 = load all chunks (seq scan) */
+		if (stripeMetadata->chunkGroupRowCount > 0)
+		{
+			uint64 stripeRowOffset = rowNumber - stripeMetadata->firstRowNumber;
+			targetChunkGroupIndex = (int)(stripeRowOffset / stripeMetadata->chunkGroupRowCount);
+		}
+
 		readState->stripeReadState = BeginStripeRead(stripeMetadata,
 													 columnarRelation,
 													 relationTupleDesc,
@@ -594,7 +612,8 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 													 whereClauseVars,
 													 stripeReadContext,
 													 snapshot,
-													 0 /* no ANALYZE sampling */);
+													 0 /* no ANALYZE sampling */,
+													 targetChunkGroupIndex);
 
 		readState->currentStripeMetadata = stripeMetadata;
 	}
@@ -649,7 +668,8 @@ ColumnarSetStripeReadState(ColumnarReadState *readState,
 													 whereClauseVars,
 													 stripeReadContext,
 													 snapshot,
-													 0 /* no ANALYZE sampling */);
+													 0 /* no ANALYZE sampling */,
+													 -1 /* load all chunks */);
 
 		readState->currentStripeMetadata = stripeMetadata;
 	}
@@ -914,7 +934,7 @@ static StripeReadState *
 BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDesc,
 				List *projectedColumnList, List *whereClauseList, List *whereClauseVars,
 				MemoryContext stripeReadContext, Snapshot snapshot,
-				int analyze_cg_stride)
+				int analyze_cg_stride, int targetChunkGroupIndex)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(stripeReadContext);
 
@@ -936,7 +956,8 @@ BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDes
 															   &stripeReadState->
 															   chunkGroupsFiltered,
 															   snapshot,
-															   analyze_cg_stride);
+															   analyze_cg_stride,
+															   targetChunkGroupIndex);
 
 	stripeReadState->rowCount = stripeReadState->stripeBuffers->rowCount;
 
@@ -1524,7 +1545,7 @@ LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 						  TupleDesc tupleDescriptor, List *projectedColumnList,
 						  List *whereClauseList, List *whereClauseVars,
 						  int64 *chunkGroupsFiltered, Snapshot snapshot,
-						  int analyze_cg_stride)
+						  int analyze_cg_stride, int targetChunkGroupIndex)
 {
 	uint32 columnIndex = 0;
 	uint32 columnCount = tupleDescriptor->natts;
@@ -1546,6 +1567,18 @@ LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 #endif
 	bool *selectedChunkMask = SelectedChunkMask(stripeSkipList, whereClauseList,
 												whereClauseVars, chunkGroupsFiltered);
+
+	/*
+	 * Index scan (random-access) point lookup: restrict to the single chunk group
+	 * that contains the target row.  This avoids decompressing every chunk group
+	 * in the stripe when only one row is needed.
+	 */
+	if (targetChunkGroupIndex >= 0)
+	{
+		for (uint32 cgIdx = 0; cgIdx < stripeSkipList->chunkCount; cgIdx++)
+			if ((int) cgIdx != targetChunkGroupIndex)
+				selectedChunkMask[cgIdx] = false;
+	}
 
 	/*
 	 * ANALYZE chunk-group sampling: exclude CGs not matching the stride so that
@@ -2312,7 +2345,8 @@ ColumnarReadNextVector(ColumnarReadState *readState,  Datum *columnValues,
 														 readState->whereClauseVars,
 														 readState->stripeReadContext,
 														 readState->snapshot,
-														 readState->analyze_cg_stride);
+														 readState->analyze_cg_stride,
+														 -1 /* load all chunks */);
 		}
 
 		if (!ReadStripeNextVector(readState->stripeReadState, columnValues, columnNulls, 
