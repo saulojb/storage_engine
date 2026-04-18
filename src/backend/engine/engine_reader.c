@@ -73,6 +73,12 @@ typedef struct StripeReadState
 	StripeBuffers *stripeBuffers;   /* allocated in stripeReadContext */
 	List *projectedColumnList;      /* borrowed reference */
 	ChunkGroupReadState *chunkGroupReadState; /* owned */
+	/*
+	 * When >= 0, only this absolute chunk group index was loaded into
+	 * stripeBuffers (index scan point-lookup optimization).  The buffer
+	 * index is always 0 in this case.
+	 */
+	int targetChunkGroupIndex;
 } StripeReadState;
 
 struct ColumnarReadState
@@ -733,6 +739,13 @@ ReadStripeRowByRowNumber(ColumnarReadState *readState,
 	/* find the exact chunk group to be read */
 	uint64 stripeRowOffset = rowNumber - stripeMetadata->firstRowNumber;
 	int chunkGroupIndex = stripeRowOffset / stripeMetadata->chunkGroupRowCount;
+
+	/*
+	 * When only one chunk group was loaded (index scan point-lookup), the buffer
+	 * contains it at position 0, regardless of its absolute index in the stripe.
+	 */
+	int bufferChunkIndex = (stripeReadState->targetChunkGroupIndex >= 0) ? 0 : chunkGroupIndex;
+
 	if (!StripeReadIsCurrentChunkGroup(stripeReadState, chunkGroupIndex))
 	{
 		if (stripeReadState->chunkGroupReadState)
@@ -743,7 +756,7 @@ ReadStripeRowByRowNumber(ColumnarReadState *readState,
 		stripeReadState->chunkGroupIndex = chunkGroupIndex;
 		stripeReadState->chunkGroupReadState = BeginChunkGroupRead(
 			stripeReadState->stripeBuffers,
-			stripeReadState->chunkGroupIndex,
+			bufferChunkIndex,
 			stripeReadState->tupleDescriptor,
 			stripeReadState->projectedColumnList,
 			stripeReadState->stripeReadContext,
@@ -946,6 +959,7 @@ BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDes
 	stripeReadState->chunkGroupReadState = NULL;
 	stripeReadState->projectedColumnList = projectedColumnList;
 	stripeReadState->stripeReadContext = stripeReadContext;
+	stripeReadState->targetChunkGroupIndex = targetChunkGroupIndex;
 
 	stripeReadState->stripeBuffers = LoadFilteredStripeBuffers(rel,
 															   stripeMetadata,
