@@ -632,10 +632,30 @@ CostColumnarPaths(PlannerInfo *root, RelOptInfo *rel, Oid relationId)
 		else if (IsA(path, BitmapHeapPath))
 		{
 			/*
-			 * BitmapHeapPath costs are estimated accurately by the index AM
-			 * (e.g. GIN selectivity).  We leave them untouched so the planner
-			 * can compare them fairly against ColumnarScan and IndexScan paths.
+			 * BitmapHeapPath (e.g. GIN bitmap scan) costs are estimated by the
+			 * index AM.  For tables with index_scan=false (analytics workloads),
+			 * a GIN Bitmap Heap Scan forces random-access reads through
+			 * engine_index_fetch_tuple, which reads one stripe per matched row.
+			 * With 200k matches spread across many chunk groups this is far
+			 * more expensive than a parallel ColcompressScan that decompresses
+			 * once per stripe.  Add disable_cost so the planner always prefers
+			 * the ColcompressScan (or parallel ColcompressScan) path instead.
+			 *
+			 * For tables with index_scan=true (OLTP / document repos), GIN
+			 * bitmap scans are left alone — those tables have fewer rows per
+			 * match and the bitmap path is genuinely cheaper.
 			 */
+			bool useIndexScan = engine_index_scan;
+			if (!useIndexScan)
+			{
+				ColumnarOptions tableOptions = { 0 };
+				if (ReadColumnarOptions(relationId, &tableOptions))
+					useIndexScan = tableOptions.indexScan;
+			}
+			if (!useIndexScan)
+			{
+				((BitmapHeapPath *) path)->path.total_cost += disable_cost;
+			}
 		}
 		else if (path->pathtype == T_SeqScan)
 		{
@@ -654,6 +674,18 @@ CostColumnarPaths(PlannerInfo *root, RelOptInfo *rel, Oid relationId)
 		if (IsA(path, IndexPath))
 		{
 			CostColumnarIndexPath(root, rel, relationId, (IndexPath *) path);
+		}
+		else if (IsA(path, BitmapHeapPath))
+		{
+			bool useIndexScan = engine_index_scan;
+			if (!useIndexScan)
+			{
+				ColumnarOptions tableOptions = { 0 };
+				if (ReadColumnarOptions(relationId, &tableOptions))
+					useIndexScan = tableOptions.indexScan;
+			}
+			if (!useIndexScan)
+				((BitmapHeapPath *) path)->path.total_cost += disable_cost;
 		}
 		else if (path->pathtype == T_SeqScan)
 		{

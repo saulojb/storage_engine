@@ -129,6 +129,15 @@ struct ColumnarReadState
 	 * Propagated to StripeReadState->analyze_cg_stride by each BeginStripeRead call.
 	 */
 	int analyze_cg_stride;
+
+	/*
+	 * True when the table has index_scan=true in its per-table options.
+	 * Only in this mode do we apply the single-chunk-group optimization in
+	 * ColumnarReadRowByRowNumber.  Tables with index_scan=false (analytics)
+	 * use GIN/Bitmap-Heap-Scan paths that return many rows per stripe and
+	 * must never trigger the single-chunk reload loop.
+	 */
+	bool indexScanEnabled;
 };
 
 /* static function declarations */
@@ -366,6 +375,17 @@ ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 	/* Parallel execution */
 	readState->parallelColumnarScan = parallelColumnarScan;
 
+	/*
+	 * Cache whether this table has index_scan=true in its per-table options.
+	 * The single-chunk-group optimization in ColumnarReadRowByRowNumber is
+	 * only safe and beneficial for point-lookup workloads on such tables.
+	 */
+	{
+		ColumnarOptions tableOptions = {0};
+		ReadColumnarOptions(relation->rd_id, &tableOptions);
+		readState->indexScanEnabled = tableOptions.indexScan;
+	}
+
 	if (!randomAccess)
 	{
 		/*
@@ -602,9 +622,14 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 		 * reads only that one chunk group instead of the entire stripe.
 		 * This avoids decompressing all chunks of a potentially huge stripe
 		 * (e.g. with XML/JSON blob columns) just to return a single row.
+		 *
+		 * Only activate this optimization for tables that have index_scan=true
+		 * in their per-table options.  Tables with index_scan=false (analytics
+		 * workloads) use GIN/Bitmap-Heap-Scan paths that return many rows per
+		 * stripe across many chunk groups and must not trigger repeated reloads.
 		 */
-		int targetChunkGroupIndex = -1; /* -1 = load all chunks (seq scan) */
-		if (stripeMetadata->chunkGroupRowCount > 0)
+		int targetChunkGroupIndex = -1; /* -1 = load all chunks */
+		if (readState->indexScanEnabled && stripeMetadata->chunkGroupRowCount > 0)
 		{
 			uint64 stripeRowOffset = rowNumber - stripeMetadata->firstRowNumber;
 			targetChunkGroupIndex = (int)(stripeRowOffset / stripeMetadata->chunkGroupRowCount);
@@ -622,6 +647,44 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 													 targetChunkGroupIndex);
 
 		readState->currentStripeMetadata = stripeMetadata;
+	}
+	else if (readState->indexScanEnabled &&
+			 readState->stripeReadState != NULL &&
+			 readState->stripeReadState->targetChunkGroupIndex >= 0)
+	{
+		/*
+		 * Single-chunk optimization is active (index scan point-lookup mode).
+		 * If the next row is in a DIFFERENT chunk group of the same stripe
+		 * (e.g. a GIN index returning many rows spread across chunk groups),
+		 * fall back to loading the entire stripe so that all subsequent rows
+		 * in this stripe can be served without repeated reloads.
+		 *
+		 * For true point lookups (unique index, 1 TID returned per fetch),
+		 * the stripe will have changed before reaching this branch, so the
+		 * fallback never fires and we keep the 1-chunk-group benefit.
+		 */
+		StripeMetadata *sm = readState->currentStripeMetadata;
+		uint64 stripeRowOffset = rowNumber - sm->firstRowNumber;
+		int neededCG = (sm->chunkGroupRowCount > 0)
+			? (int)(stripeRowOffset / sm->chunkGroupRowCount)
+			: 0;
+
+		if (neededCG != readState->stripeReadState->targetChunkGroupIndex)
+		{
+			/* Reload the stripe loading ALL chunk groups (targetChunkGroupIndex=-1) */
+			readState->stripeReadState = NULL;
+			MemoryContextReset(readState->stripeReadContext);
+
+			readState->stripeReadState = BeginStripeRead(sm,
+														 readState->relation,
+														 RelationGetDescr(readState->relation),
+														 readState->projectedColumnList,
+														 NIL, NIL,
+														 readState->stripeReadContext,
+														 readState->snapshot,
+														 0 /* no ANALYZE sampling */,
+														 -1 /* load all chunk groups */);
+		}
 	}
 
 	return ReadStripeRowByRowNumber(readState, rowNumber, columnValues, columnNulls);
