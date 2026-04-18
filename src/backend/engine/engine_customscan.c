@@ -777,67 +777,64 @@ ColumnarIndexScanAdditionalCost(PlannerInfo *root, RelOptInfo *rel,
 	RelationClose(relation);
 	double estimatedRows = rowCount * indexSelectivity;
 
-	/*
-	 * In the worst case (i.e no correlation between the column & the index),
-	 * we need to read a different stripe for each row.
-	 */
-	double maxStripeReadCount = estimatedRows;
+	uint64 stripeCount = ColumnarTableStripeCount(relationId);
+	double avgStripeRowCount = (stripeCount > 0)
+		? rowCount / (double) stripeCount
+		: (double) rowCount;
 
 	/*
-	 * In the best case (i.e the column is fully correlated with the index),
-	 * we wouldn't read the same stripe again and again thanks
-	 * to locality.
+	 * IndexScan fetches individual rows from compressed chunks, NOT entire
+	 * stripes.  A stripe contains avgChunksPerStripe chunk groups; reading
+	 * one matching row requires decompressing only the one chunk group that
+	 * contains it.  Using full-stripe granularity inflates the cost so much
+	 * (especially for wide tables with XML/JSON blob columns) that the
+	 * planner always rejects IndexScan in favour of ColcompressScan, even
+	 * when the index would be orders of magnitude faster at runtime.
+	 *
+	 * engine_chunk_group_row_limit is the per-chunk-group row count GUC
+	 * (default 10 000).  perChunkCost = perStripeCost / avgChunksPerStripe.
 	 */
-	double avgStripeRowCount =
-		rowCount / (double) ColumnarTableStripeCount(relationId);
-	double minStripeReadCount = estimatedRows / avgStripeRowCount;
+	double avgChunksPerStripe =
+		Max(avgStripeRowCount / engine_chunk_group_row_limit, 1.0);
+	Cost perChunkCost = perStripeCost / avgChunksPerStripe;
 
 	/*
 	 * While being close to 0 means low correlation, being close to -1 or +1
 	 * means high correlation. For index scans on columnar tables, it doesn't
 	 * matter if the column and the index are "correlated" (+1) or
 	 * "anti-correlated" (-1) since both help us avoiding from reading the
-	 * same stripe again and again.
+	 * same chunk group again and again.
 	 */
 	double absIndexCorrelation = Abs(indexCorrelation);
-
-	/*
-	 * To estimate the number of stripes that we need to read, we do linear
-	 * interpolation between minStripeReadCount & maxStripeReadCount. To do
-	 * that, we use complement to 1 of absolute correlation, where being
-	 * close to 0 means high correlation and being close to 1 means low
-	 * correlation.
-	 * In practice, we only want to do an index scan when absIndexCorrelation
-	 * is 1 (or extremely close to it), or when the absolute number of tuples
-	 * returned is very small. Other cases will have a prohibitive cost.
-	 */
 	double complementIndexCorrelation = 1 - absIndexCorrelation;
-	double estimatedStripeReadCount =
-		minStripeReadCount + complementIndexCorrelation * (maxStripeReadCount -
-														   minStripeReadCount);
-
-	/* even in the best case, we will read a single stripe */
-	estimatedStripeReadCount = Max(estimatedStripeReadCount, 1.0);
-
-	Cost scanCost = perStripeCost * estimatedStripeReadCount;
 
 	/*
-	 * Note: we intentionally do NOT add a randomAccessPenalty here.
-	 * This function is only called when index_scan is explicitly enabled
-	 * (either via GUC or per-table option).  The disable_cost penalty for
-	 * the index_scan=false case is applied directly in CostColumnarIndexPath
-	 * before this function is ever reached.  Adding a per-row penalty here
-	 * would cause the planner to always prefer SeqScan over IndexScan even
-	 * when the user has explicitly opted in to index scanning.
+	 * Estimate the number of chunk groups we need to decompress.
+	 * Best case (high correlation): rows cluster in the same chunk groups,
+	 *   so we read estimatedRows / chunkRowCount chunks.
+	 * Worst case (no correlation): every row is in a different chunk group,
+	 *   so we read up to estimatedRows chunks.
 	 */
+	double minChunkReadCount = estimatedRows / engine_chunk_group_row_limit;
+	double maxChunkReadCount = estimatedRows;
+	double estimatedChunkReadCount =
+		minChunkReadCount +
+		complementIndexCorrelation * (maxChunkReadCount - minChunkReadCount);
+
+	/* even in the best case, we decompress at least one chunk group */
+	estimatedChunkReadCount = Max(estimatedChunkReadCount, 1.0);
+
+	Cost scanCost = perChunkCost * estimatedChunkReadCount;
 
 	ereport(DEBUG4, (errmsg("re-costing index scan for columnar table: "
-							"selectivity = %.10f, complement abs "
-							"correlation = %.10f, per stripe cost = %.10f, "
-							"estimated stripe read count = %.10f, "
+							"selectivity = %.10f, complement abs correlation = %.10f, "
+							"per stripe cost = %.10f, avg chunks/stripe = %.2f, "
+							"per chunk cost = %.10f, "
+							"estimated chunk read count = %.10f, "
 							"total additional cost = %.10f",
 							indexSelectivity, complementIndexCorrelation,
-							perStripeCost, estimatedStripeReadCount,
+							perStripeCost, avgChunksPerStripe,
+							perChunkCost, estimatedChunkReadCount,
 							scanCost)));
 
 	return scanCost;
