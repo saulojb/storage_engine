@@ -34,11 +34,28 @@ jit = on                              # system default; overridden per test
 
 ## Prerequisites
 
-1. **Build and install storage_engine** (from the repo root):
-   ```bash
-   cd dist/
-   sudo make -j$(nproc) install
-   ```
+0. **Install build dependencies**:
+  Ubuntu/Debian:
+  ```bash
+  sudo apt update
+  sudo apt install -y build-essential libcurl4-openssl-dev liblz4-dev libzstd-dev postgresql-server-dev-18 python3-pip
+  ```
+
+  RPM-based (dnf):
+  ```bash
+  sudo dnf install -y gcc make libcurl-devel lz4-devel libzstd-devel postgresql18-devel python3-pip
+  ```
+
+  > If you build against PostgreSQL 16 or 17, replace the PostgreSQL dev package
+  > with the matching version (`postgresql-server-dev-16` /
+  > `postgresql-server-dev-17` on Debian/Ubuntu, or `postgresql16-devel` /
+  > `postgresql17-devel` on RPM-based distributions).
+
+1. **Build and install storage_engine** (from this repository root):
+  ```bash
+  ./configure
+  sudo make -j$(nproc) install
+  ```
 
 2. **Install citus** *(optional — needed for the `citus_columnar` column)*:
    ```bash
@@ -60,9 +77,9 @@ jit = on                              # system default; overridden per test
    ```
 
 5. **Install Python dependencies** (for chart generation):
-   ```bash
-   pip install matplotlib numpy
-   ```
+  ```bash
+  pip install -r tests/bench/requirements.txt
+  ```
 
 ---
 

@@ -405,8 +405,28 @@ All views grant `SELECT` to `PUBLIC`.
 
 Requires PostgreSQL server headers and `pg_config` in `PATH`.
 
+Install build dependencies:
+
+Ubuntu/Debian:
+
 ```bash
-cd dist/
+sudo apt update
+sudo apt install -y build-essential libcurl4-openssl-dev liblz4-dev libzstd-dev postgresql-server-dev-18
+```
+
+RPM-based (dnf):
+
+```bash
+sudo dnf install -y gcc make libcurl-devel lz4-devel libzstd-devel postgresql18-devel
+```
+
+> If you build against PostgreSQL 16 or 17, replace the PostgreSQL dev package
+> with the matching version (`postgresql-server-dev-16` /
+> `postgresql-server-dev-17` on Debian/Ubuntu, or `postgresql16-devel` /
+> `postgresql17-devel` on RPM-based distributions).
+
+```bash
+./configure
 sudo make -j$(nproc) install
 ```
 
