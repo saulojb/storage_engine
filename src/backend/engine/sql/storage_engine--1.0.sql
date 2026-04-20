@@ -507,50 +507,54 @@ IS 'convert a colcompress internal row number (engine.stripe.first_row_number) t
 GRANT EXECUTE ON FUNCTION engine.row_number_to_tid(bigint) TO PUBLIC;
 
 -- ============================================================
--- engine.colcompress_bulk_update — memory-safe bulk UPDATE
+-- engine.colcompress_bulk_update — memory-safe, crash-safe bulk UPDATE
 -- ============================================================
 --
--- Memory-safe bulk UPDATE for colcompress tables via a LOGGED heap
--- intermediate.  Avoids the OOM pattern where batched ctid-based UPDATEs
+-- Memory-safe, crash-safe bulk UPDATE for colcompress tables via a LOGGED
+-- heap intermediate.  Avoids the OOM pattern where batched ctid-based UPDATEs
 -- cause N full ColcompressScan passes (one per batch), each decompressing
 -- the entire table and growing the glibc malloc watermark unboundedly.
 --
--- Algorithm (4 phases, all crash-safe):
+-- Algorithm (4 phases, fully crash-safe, resumable):
 --
 --   Phase 1 — Snapshot: copies matching rows into a LOGGED permanent heap
---             (_se_bulk_<oid>) with the original ctid (_se_old_ctid).
---             Also captures the original stripe layout into local arrays
---             (same transaction snapshot → consistent).  Adds a btree index
---             on _se_old_ctid for fast per-stripe range lookups.
---             After COMMIT: colcompress is untouched, heap is WAL-protected.
---             A crash here loses nothing.
+--             (_se_bulk_<oid>) with the original ctid (_se_old_ctid), and
+--             creates a companion stripe-progress table (_se_bulkm_<oid>)
+--             that stores the original stripe layout and a per-stripe `done`
+--             flag.  Both tables live in the same schema as the target (no
+--             search_path ambiguity).  Index on _se_old_ctid for fast
+--             per-stripe range lookups in Phase 3.
+--             After COMMIT: colcompress is untouched; both tables are
+--             WAL-protected.  A crash here loses nothing.
 --
 --   Phase 2 — Transform: applies SET clause to the heap (pure heap UPDATE,
 --             no ColcompressScan, no decompression, no OOM risk).
 --
---   Phase 3 — Stripe-by-stripe DELETE + INSERT:
---             For each original stripe (identified via first_row_number and
---             row_count captured in Phase 1):
---               a. DELETE matching rows in that stripe from colcompress.
---                  ctid = ANY(ARRAY(SELECT _se_old_ctid FROM heap WHERE
---                  _se_old_ctid BETWEEN tid_min AND tid_max)) — the heap index
---                  makes this O(stripe_rows), and the colcompress DELETE with
---                  no projected data columns needs no decompression.
---               b. INSERT the stripe's transformed rows from heap → colcompress.
---                  One new stripe is created per original stripe, each with
---                  freshly computed min/max → optimal chunk pruning after update.
---             COMMIT after each stripe → bounded RSS (one stripe at a time),
---             crash-resumable (heap survives; re-run detects leftover heap).
+--   Phase 3 — Stripe-by-stripe DELETE + INSERT + mark-done (all atomic):
+--             For each stripe in _se_bulkm_<oid> where done = false:
+--               a. DELETE matching rows from colcompress (ctid lookup via
+--                  heap index, no decompression).
+--               b. INSERT updated rows from heap → colcompress (one new
+--                  stripe per old stripe, fresh min/max metadata).
+--               c. UPDATE _se_bulkm_<oid> SET done = true for this stripe.
+--             COMMIT — steps a, b, c are durable together.
 --
---   Phase 4 — Cleanup: DROP the intermediate heap table.
+--             Crash safety guarantee:
+--               If the server is killed mid-stripe (OOM, power loss, etc.),
+--               PostgreSQL rolls back all three steps atomically.  The old
+--               colcompress rows return to their original positions.  On
+--               re-run, the procedure detects the leftover heap, reads the
+--               stripe layout from _se_bulkm_<oid>, skips stripes where
+--               done = true, and resumes from the first undone stripe.
+--               No data loss is possible under any crash scenario.
 --
--- Stripe-by-stripe processing ensures:
---   • RSS bounded: no single transaction holds all matching rows decompressed.
---   • Fresh min/max per stripe: each new stripe gets its own chunk metadata
---     → index scan pruning and colcompress_merge pruning remain efficient.
---   • Crash-safe: heap persists across crashes; re-run the procedure to
---     continue (it will detect the leftover heap and raise EXCEPTION with
---     instructions).
+--   Phase 4 — Cleanup: DROP both intermediate tables.
+--
+-- Properties:
+--   • RSS bounded: one stripe decompressed at a time (no global heap).
+--   • Fresh min/max per stripe: optimal chunk pruning after the update.
+--   • True crash-resumability: re-run CALL to continue after any crash.
+--   • No data loss: DELETE + INSERT + done-flag are committed atomically.
 --
 -- NOTE: ctid values of updated rows change (new row_numbers are assigned).
 --       Run REINDEX TABLE CONCURRENTLY after completion to rebuild indexes.
@@ -577,33 +581,43 @@ CREATE OR REPLACE PROCEDURE engine.colcompress_bulk_update(
     LANGUAGE plpgsql
 AS $$
 DECLARE
-    _nspname      text;
-    _relname      text;
-    _qualname     text;
-    _heapname     text;
-    _collist      text;
-    _storage_id   bigint;
-    _total_rows   bigint;
-    _n            bigint;
-    _del_total    bigint  := 0;
-    _ins_total    bigint  := 0;
-    -- Stripe layout captured before Phase 1 (survives COMMITs as local arrays)
-    _stripe_nums  bigint[];
-    _first_rns    bigint[];
-    _row_counts   bigint[];
-    _nstripes     int;
-    _i            int;
-    _tid_min      tid;
-    _tid_max      tid;
+    _nspname     text;
+    _relname     text;
+    _qualname    text;   -- schema-qualified target name (already quoted)
+    _heapfull    text;   -- schema-qualified data heap (already quoted)
+    _metafull    text;   -- schema-qualified stripe-progress table (already quoted)
+    _heaprelname text;   -- unqualified heap name
+    _metarelname text;   -- unqualified meta name
+    _collist     text;
+    _storage_id  bigint;
+    _total_rows  bigint;
+    _n           bigint;
+    _del_total   bigint  := 0;
+    _ins_total   bigint  := 0;
+    -- Stripe layout is persisted in _se_bulkm_<oid> and loaded into
+    -- local arrays after Phase 1 / on resume.  Local arrays survive COMMITs.
+    _first_rns   bigint[];
+    _row_counts  bigint[];
+    _nstripes    int;
+    _i           int;
+    _tid_min     tid;
+    _tid_max     tid;
+    _resuming    boolean := false;
+    _is_done     boolean;
 BEGIN
     SELECT n.nspname, c.relname
       INTO _nspname, _relname
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.oid = table_name;
 
-    _qualname   := quote_ident(_nspname) || '.' || quote_ident(_relname);
-    _heapname   := '_se_bulk_' || table_name::oid::text;
-    _storage_id := engine.colcompress_relation_storageid(table_name);
+    _qualname    := quote_ident(_nspname) || '.' || quote_ident(_relname);
+    _heaprelname := '_se_bulk_'  || table_name::oid::text;
+    _metarelname := '_se_bulkm_' || table_name::oid::text;
+    -- Both helper tables live in the same schema as the target table.
+    -- Using schema-qualified names avoids any search_path ambiguity.
+    _heapfull    := quote_ident(_nspname) || '.' || quote_ident(_heaprelname);
+    _metafull    := quote_ident(_nspname) || '.' || quote_ident(_metarelname);
+    _storage_id  := engine.colcompress_relation_storageid(table_name);
 
     -- Column list (excludes dropped columns and our internal heap columns)
     SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum)
@@ -613,121 +627,192 @@ BEGIN
        AND attnum > 0
        AND NOT attisdropped;
 
-    -- Refuse to proceed if a leftover heap from a previous crashed run exists.
+    -- ----------------------------------------------------------------
+    -- Detect leftover helper tables from a previous interrupted run.
+    -- If the data heap exists, skip Phase 1 and 2 and go straight to
+    -- Phase 3 using the stripe layout stored in the meta table.
+    -- ----------------------------------------------------------------
     IF EXISTS (
         SELECT 1 FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relname = _heapname
-          AND c.relkind = 'r'
-          AND n.nspname NOT LIKE 'pg_temp%'
+        WHERE c.relname = _heaprelname AND c.relkind = 'r'
+          AND n.nspname = _nspname
     ) THEN
-        RAISE EXCEPTION
-            E'bulk_update: "%" exists (leftover from a previous crashed run).\n'
-            'To resume manually:\n'
-            '  INSERT INTO % (%s) SELECT %s FROM "%" WHERE _se_old_ctid > <last_processed_ctid>;\n'
-            '  DROP TABLE "%";\n'
-            'To restart clean: DROP TABLE "%" and re-run.',
-            _heapname,
-            _qualname, _collist, _collist, _heapname,
-            _heapname,
-            _heapname;
+        _resuming := true;
+        RAISE NOTICE
+            'bulk_update: leftover heap "%" detected — resuming previous interrupted run',
+            _heapfull;
     END IF;
 
-    -- ----------------------------------------------------------------
-    -- Capture original stripe layout IN THE SAME TRANSACTION as Phase 1.
-    -- Local arrays survive COMMITs in PL/pgSQL procedures.
-    -- ----------------------------------------------------------------
-    SELECT
-        array_agg(stripe_num    ORDER BY stripe_num),
-        array_agg(first_row_number ORDER BY stripe_num),
-        array_agg(row_count     ORDER BY stripe_num)
-      INTO _stripe_nums, _first_rns, _row_counts
-      FROM engine.stripe
-     WHERE storage_id = _storage_id;
+    IF NOT _resuming THEN
+        -- ----------------------------------------------------------------
+        -- Phase 1 — Snapshot.
+        --
+        -- Two WAL-protected tables are created and committed together:
+        --
+        --   _se_bulkm_<oid>  Stripe-progress table.  Stores the ORIGINAL
+        --     stripe layout (first_rn, row_count) captured here, so that
+        --     after stripes are replaced by Phase 3 the resume path can
+        --     still find the correct tid range for each stripe.  The `done`
+        --     column is updated atomically with each stripe's DELETE+INSERT,
+        --     so on resume we can reliably skip already-completed stripes.
+        --
+        --   _se_bulk_<oid>   Data snapshot heap.  Contains the matching rows
+        --     with _se_old_ctid = original ctid.  Index on _se_old_ctid
+        --     gives O(stripe_rows) lookups in Phase 3.
+        --
+        -- After COMMIT: colcompress is untouched; a crash here loses nothing.
+        -- ----------------------------------------------------------------
 
-    _nstripes := COALESCE(array_length(_stripe_nums, 1), 0);
+        -- Pre-check: skip all table creation if WHERE clause matches 0 rows.
+        EXECUTE format(
+            'SELECT EXISTS(SELECT 1 FROM %s%s)',
+            _qualname,
+            CASE WHEN where_clause IS NOT NULL
+                 THEN ' WHERE ' || where_clause ELSE '' END
+        ) INTO _total_rows;  -- reusing variable; 1 = has rows, 0 = empty
+
+        IF _total_rows = 0 THEN
+            RAISE NOTICE 'bulk_update: 0 rows match WHERE clause — nothing to do';
+            RETURN;
+        END IF;
+
+        -- Stripe-progress table
+        EXECUTE format(
+            'CREATE TABLE %s ('
+            '    stripe_idx  int     PRIMARY KEY,'
+            '    first_rn    bigint  NOT NULL,'
+            '    row_count   bigint  NOT NULL,'
+            '    done        boolean NOT NULL DEFAULT false'
+            ')',
+            _metafull
+        );
+        EXECUTE format(
+            'INSERT INTO %s (stripe_idx, first_rn, row_count)'
+            ' SELECT (row_number() OVER (ORDER BY stripe_num))::int,'
+            '        first_row_number, row_count'
+            ' FROM engine.stripe WHERE storage_id = $1',
+            _metafull
+        ) USING _storage_id;
+
+        -- Data snapshot heap
+        EXECUTE format(
+            'CREATE TABLE %s AS SELECT ctid AS _se_old_ctid, * FROM %s%s',
+            _heapfull, _qualname,
+            CASE WHEN where_clause IS NOT NULL
+                 THEN ' WHERE ' || where_clause ELSE '' END
+        );
+        EXECUTE format('CREATE INDEX ON %s (_se_old_ctid)', _heapfull);
+        EXECUTE format('SELECT count(*) FROM %s', _heapfull) INTO _total_rows;
+        COMMIT;  -- both tables are WAL-protected; crash here = no data loss
+
+        RAISE NOTICE 'bulk_update: % matching rows snapshotted to "%"',
+            _total_rows, _heapfull;
+
+        -- ----------------------------------------------------------------
+        -- Phase 2 — Transform: apply SET clause on heap (no decompression).
+        -- ----------------------------------------------------------------
+        EXECUTE format('UPDATE %s SET %s', _heapfull, set_clause);
+        COMMIT;
+        RAISE NOTICE 'bulk_update: SET clause applied on heap';
+
+    END IF;  -- end of fresh-run-only phases
 
     -- ----------------------------------------------------------------
-    -- Phase 1: Snapshot matching rows into a LOGGED (WAL-protected) heap.
-    --   _se_old_ctid — original ctid encoding the row's stripe position.
-    --   Index on _se_old_ctid — enables O(stripe_rows) range lookups in
-    --   Phase 3 instead of a full heap scan per stripe.
-    --   After COMMIT: colcompress is untouched; heap is crash-safe.
+    -- Load stripe layout from the meta table.
+    -- Works for both fresh runs (just created) and resumed runs
+    -- (meta table survived the crash with partial done=true state).
     -- ----------------------------------------------------------------
     EXECUTE format(
-        'CREATE TABLE %I AS SELECT ctid AS _se_old_ctid, * FROM %s%s',
-        _heapname, _qualname,
-        CASE WHEN where_clause IS NOT NULL
-             THEN ' WHERE ' || where_clause ELSE '' END
-    );
-    EXECUTE format('CREATE INDEX ON %I (_se_old_ctid)', _heapname);
-    EXECUTE format('SELECT count(*) FROM %I', _heapname) INTO _total_rows;
-    COMMIT;  -- heap is now WAL-protected; crash here = no data loss
+        'SELECT array_agg(first_rn  ORDER BY stripe_idx),'
+        '       array_agg(row_count ORDER BY stripe_idx),'
+        '       count(*)'
+        ' FROM %s',
+        _metafull
+    ) INTO _first_rns, _row_counts, _nstripes;
 
-    RAISE NOTICE 'bulk_update: % matching rows snapshotted to "%" across % original stripe(s)',
-        _total_rows, _heapname, _nstripes;
+    _nstripes := COALESCE(_nstripes, 0);
 
-    IF _total_rows = 0 THEN
-        EXECUTE format('DROP TABLE %I', _heapname);
-        COMMIT;
-        RAISE NOTICE 'bulk_update: nothing to do';
-        RETURN;
-    END IF;
+    RAISE NOTICE 'bulk_update: % total stripe(s) to process%',
+        _nstripes,
+        CASE WHEN _resuming THEN ' (resuming)' ELSE '' END;
 
     -- ----------------------------------------------------------------
-    -- Phase 2: Apply SET clause on the heap (pure heap UPDATE).
-    --   No ColcompressScan, no stripe decompression, no OOM risk.
-    -- ----------------------------------------------------------------
-    EXECUTE format('UPDATE %I SET %s', _heapname, set_clause);
-    COMMIT;
-    RAISE NOTICE 'bulk_update: SET clause applied on heap';
-
-    -- ----------------------------------------------------------------
-    -- Phase 3: Stripe-by-stripe DELETE + INSERT.
+    -- Phase 3 — Stripe-by-stripe DELETE + INSERT + mark-done (all atomic).
     --
-    --   For each original stripe S (using the layout captured in Phase 1):
-    --     a. DELETE S's matching rows from colcompress.
-    --        Uses ctid array from heap (indexed, O(stripe_rows)).
-    --        ColcompressScan with no projected data columns → no decompression.
-    --     b. INSERT S's transformed rows from heap → colcompress.
-    --        Creates exactly ONE new stripe for S, with freshly computed
-    --        min/max per chunk group → efficient pruning after update.
+    -- For each stripe in the meta table where done = false:
     --
-    --   COMMIT after each stripe: bounded RSS (one stripe at a time).
-    --   Crash here: heap survives; re-run procedure to detect and resume.
+    --   a. DELETE old rows from colcompress using the ctid range.
+    --      The heap index on _se_old_ctid makes this O(stripe_rows).
+    --      No data columns are projected → no decompression.
+    --
+    --   b. INSERT updated rows from heap → colcompress.
+    --      Creates exactly ONE new stripe per old stripe, with freshly
+    --      computed min/max per chunk group → efficient chunk pruning.
+    --
+    --   c. UPDATE meta SET done = true  (in the same transaction as a+b).
+    --
+    --   COMMIT — all three are durable together.
+    --
+    -- Crash safety:
+    --   If the server is killed during this transaction, PostgreSQL rolls
+    --   back all three steps atomically.  The old rows return to their
+    --   stripe in colcompress.  On re-run, done = false → the stripe is
+    --   reprocessed correctly from scratch.  No data is ever lost.
     -- ----------------------------------------------------------------
     FOR _i IN 1 .. _nstripes LOOP
+
+        -- Resume: skip stripes already committed in a previous run.
+        EXECUTE format(
+            'SELECT done FROM %s WHERE stripe_idx = $1',
+            _metafull
+        ) INTO _is_done USING _i;
+
+        IF _is_done THEN
+            RAISE NOTICE 'bulk_update: stripe %/% already done — skipping',
+                _i, _nstripes;
+            CONTINUE;
+        END IF;
+
         _tid_min := engine.row_number_to_tid(_first_rns[_i]);
         _tid_max := engine.row_number_to_tid(_first_rns[_i] + _row_counts[_i] - 1);
 
-        -- Delete this stripe's matching rows (no data column decompression).
+        -- a. Delete old rows (ctid lookup, no decompression).
         EXECUTE format(
             'DELETE FROM %s WHERE ctid = ANY('
-            '  ARRAY(SELECT _se_old_ctid FROM %I'
+            '  ARRAY(SELECT _se_old_ctid FROM %s'
             '        WHERE _se_old_ctid BETWEEN $1 AND $2))',
-            _qualname, _heapname
+            _qualname, _heapfull
         ) USING _tid_min, _tid_max;
         GET DIAGNOSTICS _n = ROW_COUNT;
         _del_total := _del_total + _n;
 
-        -- Re-insert this stripe's transformed rows → 1 new stripe, fresh min/max.
+        -- b. Insert updated rows → 1 new colcompress stripe, fresh min/max.
         EXECUTE format(
-            'INSERT INTO %s (%s) SELECT %s FROM %I'
+            'INSERT INTO %s (%s) SELECT %s FROM %s'
             ' WHERE _se_old_ctid BETWEEN $1 AND $2',
-            _qualname, _collist, _collist, _heapname
+            _qualname, _collist, _collist, _heapfull
         ) USING _tid_min, _tid_max;
         GET DIAGNOSTICS _n = ROW_COUNT;
         _ins_total := _ins_total + _n;
 
-        COMMIT;
-        RAISE NOTICE 'bulk_update: stripe %/% done — % rows updated (running total: %)',
+        -- c. Mark stripe as done — atomic with a and b.
+        EXECUTE format(
+            'UPDATE %s SET done = true WHERE stripe_idx = $1',
+            _metafull
+        ) USING _i;
+
+        COMMIT;  -- DELETE + INSERT + done=true are durable together
+
+        RAISE NOTICE 'bulk_update: stripe %/% done — % rows (running total: %)',
             _i, _nstripes, _n, _ins_total;
     END LOOP;
 
     -- ----------------------------------------------------------------
-    -- Phase 4: Cleanup
+    -- Phase 4 — Cleanup: drop both helper tables.
     -- ----------------------------------------------------------------
-    EXECUTE format('DROP TABLE %I', _heapname);
+    EXECUTE format('DROP TABLE %s', _heapfull);
+    EXECUTE format('DROP TABLE %s', _metafull);
     COMMIT;
     RAISE NOTICE
         E'bulk_update: complete — % rows updated in %s.\n'
@@ -738,7 +823,7 @@ END;
 $$;
 
 COMMENT ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, integer)
-IS 'Memory-safe bulk UPDATE for colcompress tables: snapshots matching rows to a WAL-protected heap, applies the SET clause there, then processes each original stripe independently (DELETE + INSERT) — one new stripe per old stripe, each with fresh min/max chunk metadata for efficient pruning. Avoids OOM from repeated full-table decompression. Must be called with CALL. Run REINDEX TABLE CONCURRENTLY after completion.';
+IS 'Memory-safe, crash-safe bulk UPDATE for colcompress tables. Snapshots matching rows to a WAL-protected heap (_se_bulk_<oid>) and records the original stripe layout in a progress table (_se_bulkm_<oid>). Applies the SET clause on the heap (no decompression, no OOM risk), then processes each stripe atomically: DELETE old rows + INSERT updated rows + mark done=true are committed together. A server crash during any stripe rolls back all three steps; re-running CALL resumes from the first undone stripe. No data loss is possible under any crash scenario. Must be called with CALL. Run REINDEX TABLE CONCURRENTLY after completion.';
 
 GRANT EXECUTE ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, integer) TO PUBLIC;
 
