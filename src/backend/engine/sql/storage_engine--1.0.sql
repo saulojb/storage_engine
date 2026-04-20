@@ -504,15 +504,81 @@ GRANT SELECT ON engine.rowcompress_batches TO PUBLIC;
 -- The SET and WHERE clauses are interpolated directly into SQL; the caller
 -- must already hold UPDATE privilege on the target table.
 --
--- Returns: total number of rows updated (int8).
+-- Returns: emits NOTICE with total rows updated.
 --
 CREATE OR REPLACE PROCEDURE engine.colcompress_bulk_update(
     table_name   regclass,
     set_clause   text,
     where_clause text    DEFAULT NULL,
     batch_size   integer DEFAULT 10000)
-    LANGUAGE C
-AS 'MODULE_PATHNAME', 'se_colcompress_bulk_update';
+    LANGUAGE plpgsql
+AS $$
+DECLARE
+    _nspname   text;
+    _relname   text;
+    _qualname  text;
+    _tmpname   text;
+    _rn_start  bigint  := 1;
+    _total_rows bigint;
+    _n         integer;
+    _total     bigint  := 0;
+BEGIN
+    IF batch_size < 100 THEN
+        RAISE EXCEPTION 'bulk_update: batch_size must be >= 100';
+    END IF;
+
+    SELECT n.nspname, c.relname
+      INTO _nspname, _relname
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid = table_name;
+
+    _qualname := quote_ident(_nspname) || '.' || quote_ident(_relname);
+    _tmpname  := '_se_bulk_' || table_name::oid::text;
+
+    -- Drop leftover temp table from a previous failed run, if any
+    EXECUTE format('DROP TABLE IF EXISTS %I', _tmpname);
+
+    -- Phase 1: snapshot all matching CTIDs (survives COMMITs)
+    EXECUTE format(
+        'CREATE TEMP TABLE %I ON COMMIT PRESERVE ROWS AS '
+        'SELECT row_number() OVER () AS rn, ctid AS tid FROM %s%s',
+        _tmpname,
+        _qualname,
+        CASE WHEN where_clause IS NOT NULL
+             THEN ' WHERE ' || where_clause
+             ELSE '' END
+    );
+
+    EXECUTE format('SELECT count(*) FROM %I', _tmpname) INTO _total_rows;
+    RAISE NOTICE 'bulk_update: % rows to process in batches of %', _total_rows, batch_size;
+    COMMIT;
+
+    IF _total_rows = 0 THEN
+        EXECUTE format('DROP TABLE IF EXISTS %I', _tmpname);
+        RETURN;
+    END IF;
+
+    -- Phase 2: batch UPDATE loop — one COMMIT per batch
+    WHILE _rn_start <= _total_rows LOOP
+        EXECUTE format(
+            'UPDATE %s SET %s WHERE ctid = ANY(ARRAY('
+            '    SELECT tid FROM %I WHERE rn BETWEEN $1 AND $2'
+            '))',
+            _qualname, set_clause, _tmpname
+        ) USING _rn_start, _rn_start + batch_size - 1;
+
+        GET DIAGNOSTICS _n = ROW_COUNT;
+        _total    := _total + _n;
+        _rn_start := _rn_start + batch_size;
+        COMMIT;
+    END LOOP;
+
+    -- Phase 3: cleanup
+    EXECUTE format('DROP TABLE IF EXISTS %I', _tmpname);
+
+    RAISE NOTICE 'bulk_update: done — % rows updated in %s', _total, _qualname;
+END;
+$$;
 
 COMMENT ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, integer)
 IS 'Memory-safe bulk UPDATE for colcompress tables: snapshots target CTIDs, then UPDATEs and COMMITs every batch_size rows to prevent OOM on large tables. Must be called with CALL.';
