@@ -4522,3 +4522,195 @@ ereport(NOTICE,
 					(options.orderby && options.orderby[0]) ? " (globally sorted)" : "")));
 PG_RETURN_VOID();
 }
+
+/*
+ * se_colcompress_bulk_update — memory-safe bulk UPDATE for colcompress tables.
+ *
+ * Implements as a PostgreSQL PROCEDURE so it can manage its own transactions
+ * via SPI_OPT_NONATOMIC.  Issues a COMMIT after every batch_size rows so
+ * PostgreSQL's per-transaction memory never grows unbounded.
+ *
+ * Arguments
+ *   table_name   regclass — target colcompress relation
+ *   set_clause   text     — verbatim SET clause (e.g. 'col = col + 1')
+ *   where_clause text     — optional filter (NULL → all rows)
+ *   batch_size   int4     — rows per commit cycle (default 10000, min 100)
+ *
+ * Returns int8: total number of rows updated.
+ *
+ * Must be called with CALL, not SELECT:
+ *   CALL engine.colcompress_bulk_update('schema.tbl', 'col = val', NULL, 5000);
+ */
+PG_FUNCTION_INFO_V1(se_colcompress_bulk_update);
+Datum
+se_colcompress_bulk_update(PG_FUNCTION_ARGS)
+{
+	Oid   relationId = PG_GETARG_OID(0);
+	text *set_text   = PG_GETARG_TEXT_PP(1);
+	bool  where_null = PG_ARGISNULL(2);
+	text *where_text = where_null ? NULL : PG_GETARG_TEXT_PP(2);
+	int32 batch_size = PG_ARGISNULL(3) ? 10000 : PG_GETARG_INT32(3);
+
+	if (batch_size < 100)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("bulk_update: batch_size must be >= 100")));
+
+	/* Validate that the relation is a colcompress table. */
+	Relation rel = table_open(relationId, AccessShareLock);
+	if (!IsColumnarTableAmTable(relationId))
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("table \"%s\" is not a colcompress table",
+						RelationGetRelationName(rel))));
+	}
+
+	/*
+	 * Allocate durable strings in a child of TopMemoryContext so they
+	 * survive SPI_commit(), which resets CurTransactionContext /
+	 * TopTransactionContext.
+	 */
+	MemoryContext procCtx =
+		AllocSetContextCreate(TopMemoryContext,
+							  "BulkUpdateContext",
+							  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext savedCtx = MemoryContextSwitchTo(procCtx);
+
+	char *nspname   = get_namespace_name(RelationGetNamespace(rel));
+	char *relname   = pstrdup(RelationGetRelationName(rel));
+	char *qualname  = quote_qualified_identifier(nspname, relname);
+	char *set_str   = text_to_cstring(set_text);
+	char *where_str = where_null ? NULL : text_to_cstring(where_text);
+	char  tmpname[64];
+	snprintf(tmpname, sizeof(tmpname), "_se_bulk_%u", relationId);
+
+	MemoryContextSwitchTo(savedCtx);
+	table_close(rel, AccessShareLock);
+
+	/* ---- Open SPI in nonatomic (procedure) mode ---- */
+	SPI_connect_ext(SPI_OPT_NONATOMIC);
+	SPI_start_transaction();
+
+	/* Phase 1: Snapshot all matching CTIDs into a temp table. */
+	{
+		MemoryContext old = MemoryContextSwitchTo(procCtx);
+		char *sql = where_str
+			? psprintf(
+				"CREATE TEMP TABLE %s ON COMMIT PRESERVE ROWS AS "
+				"SELECT row_number() OVER () AS rn, ctid AS tid "
+				"FROM %s WHERE %s",
+				tmpname, qualname, where_str)
+			: psprintf(
+				"CREATE TEMP TABLE %s ON COMMIT PRESERVE ROWS AS "
+				"SELECT row_number() OVER () AS rn, ctid AS tid "
+				"FROM %s",
+				tmpname, qualname);
+		MemoryContextSwitchTo(old);
+
+		int ret = SPI_execute(sql, false, 0);
+		pfree(sql);
+
+		if (ret != SPI_OK_UTILITY)
+		{
+			SPI_finish();
+			MemoryContextDelete(procCtx);
+			ereport(ERROR,
+					(errmsg("bulk_update: CREATE TEMP TABLE failed (SPI code %d)", ret)));
+		}
+	}
+
+	/* Count rows to determine the number of batches needed. */
+	int64 total_rows = 0;
+	{
+		MemoryContext old = MemoryContextSwitchTo(procCtx);
+		char *sql = psprintf("SELECT count(*) FROM %s", tmpname);
+		MemoryContextSwitchTo(old);
+
+		int ret = SPI_execute(sql, true, 1);
+		pfree(sql);
+
+		if (ret == SPI_OK_SELECT && SPI_processed == 1)
+		{
+			bool isnull;
+			total_rows = DatumGetInt64(
+				SPI_getbinval(SPI_tuptable->vals[0],
+							  SPI_tuptable->tupdesc, 1, &isnull));
+		}
+	}
+
+	SPI_commit();
+
+	/* Nothing to update — clean up and return early. */
+	if (total_rows == 0)
+	{
+		SPI_start_transaction();
+		MemoryContext old = MemoryContextSwitchTo(procCtx);
+		char *sql = psprintf("DROP TABLE IF EXISTS %s", tmpname);
+		MemoryContextSwitchTo(old);
+		SPI_execute(sql, false, 0);
+		pfree(sql);
+		SPI_commit();
+		SPI_finish();
+		MemoryContextDelete(procCtx);
+		PG_RETURN_INT64(0);
+	}
+
+	/* Phase 2: Batch UPDATE loop — one COMMIT per batch. */
+	int64 batch_start   = 1;
+	int64 total_updated = 0;
+
+	while (batch_start <= total_rows)
+	{
+		SPI_start_transaction();
+
+		int64 batch_end = batch_start + (int64) batch_size - 1;
+
+		MemoryContext old = MemoryContextSwitchTo(procCtx);
+		char *sql = psprintf(
+			"UPDATE %s SET %s WHERE ctid IN "
+			"(SELECT tid FROM %s WHERE rn BETWEEN " INT64_FORMAT " AND " INT64_FORMAT ")",
+			qualname, set_str, tmpname, batch_start, batch_end);
+		MemoryContextSwitchTo(old);
+
+		int ret = SPI_execute(sql, false, 0);
+		pfree(sql);
+
+		if (ret != SPI_OK_UPDATE)
+		{
+			SPI_finish();
+			MemoryContextDelete(procCtx);
+			ereport(ERROR,
+					(errmsg("bulk_update: UPDATE failed at rn=" INT64_FORMAT " (SPI code %d)",
+							batch_start, ret)));
+		}
+
+		total_updated += SPI_processed;
+		batch_start   += batch_size;
+
+		SPI_commit();
+
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	/* Phase 3: Drop the temp table. */
+	SPI_start_transaction();
+	{
+		MemoryContext old = MemoryContextSwitchTo(procCtx);
+		char *sql = psprintf("DROP TABLE IF EXISTS %s", tmpname);
+		MemoryContextSwitchTo(old);
+		SPI_execute(sql, false, 0);
+		pfree(sql);
+	}
+	SPI_commit();
+
+	SPI_finish();
+	MemoryContextDelete(procCtx);
+
+	ereport(NOTICE,
+			(errmsg("bulk_update: " INT64_FORMAT " rows updated in %s",
+					total_updated, qualname)));
+
+	PG_RETURN_INT64(total_updated);
+}

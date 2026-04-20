@@ -483,3 +483,38 @@ IS 'pg_repack-compatible alias for colcompress tables: compacts stripes, re-appl
 GRANT EXECUTE ON FUNCTION engine.colcompress_repack(regclass) TO PUBLIC;
 
 GRANT SELECT ON engine.rowcompress_batches TO PUBLIC;
+
+-- ============================================================
+-- engine.colcompress_bulk_update — memory-safe bulk UPDATE
+-- ============================================================
+--
+-- Performs a batched UPDATE on a colcompress table, issuing a COMMIT
+-- after every batch_size rows.  Prevents OOM errors that occur when
+-- PostgreSQL's per-transaction memory grows unbounded during a single
+-- large UPDATE statement on a colcompress table.
+--
+-- Must be invoked with CALL (it is a PROCEDURE, not a FUNCTION):
+--   CALL engine.colcompress_bulk_update(
+--       'myschema.mytable',   -- target colcompress table
+--       'col = col + 1',      -- SET clause (literal SQL fragment)
+--       'id > 0',             -- WHERE clause (NULL = all rows)
+--       5000                  -- rows per commit (default 10000)
+--   );
+--
+-- The SET and WHERE clauses are interpolated directly into SQL; the caller
+-- must already hold UPDATE privilege on the target table.
+--
+-- Returns: total number of rows updated (int8).
+--
+CREATE OR REPLACE PROCEDURE engine.colcompress_bulk_update(
+    table_name   regclass,
+    set_clause   text,
+    where_clause text    DEFAULT NULL,
+    batch_size   integer DEFAULT 10000)
+    LANGUAGE C
+AS 'MODULE_PATHNAME', 'se_colcompress_bulk_update';
+
+COMMENT ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, integer)
+IS 'Memory-safe bulk UPDATE for colcompress tables: snapshots target CTIDs, then UPDATEs and COMMITs every batch_size rows to prevent OOM on large tables. Must be called with CALL.';
+
+GRANT EXECUTE ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, integer) TO PUBLIC;
