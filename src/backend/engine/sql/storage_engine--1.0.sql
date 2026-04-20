@@ -488,43 +488,67 @@ GRANT SELECT ON engine.rowcompress_batches TO PUBLIC;
 -- engine.colcompress_bulk_update — memory-safe bulk UPDATE
 -- ============================================================
 --
--- Performs a batched UPDATE on a colcompress table, issuing a COMMIT
--- after every batch_size rows.  Prevents OOM errors that occur when
--- PostgreSQL's per-transaction memory grows unbounded during a single
--- large UPDATE statement on a colcompress table.
+-- Memory-safe bulk UPDATE for colcompress tables via a logged heap
+-- intermediate.  Avoids the OOM pattern where batched ctid-based UPDATEs
+-- cause N full ColcompressScan passes (one per batch), each decompress-
+-- ing the entire table and growing the glibc malloc watermark unboundedly.
 --
--- Must be invoked with CALL (it is a PROCEDURE, not a FUNCTION):
+-- Algorithm (4 phases, all crash-safe):
+--
+--   Phase 1 — Snapshot: copies matching rows into a LOGGED permanent heap
+--             table (_se_bulk_<oid>) including the original ctid.  After
+--             COMMIT the original colcompress rows are untouched and the
+--             heap is WAL-protected.  A crash here loses nothing.
+--
+--   Phase 2 — Transform: applies SET clause to the heap (pure heap UPDATE,
+--             no colcompress access, no OOM risk).
+--
+--   Phase 3 — Delete: removes old rows from colcompress in a SINGLE pass.
+--             ctid = ANY(ARRAY(...)) with empty projected columns means the
+--             ColcompressScan reads stripe metadata only (no decompression).
+--             A crash here leaves the heap intact — re-run to re-INSERT.
+--
+--   Phase 4 — Insert: re-inserts transformed rows from heap → colcompress
+--             in a SINGLE INSERT (no loop).  Reads from heap (no
+--             decompression, no OOM risk) → 1 stripe, much faster.
+--             A crash here: heap survives; re-run procedure to resume.
+--
+-- Must be invoked with CALL:
 --   CALL engine.colcompress_bulk_update(
 --       'myschema.mytable',   -- target colcompress table
 --       'col = col + 1',      -- SET clause (literal SQL fragment)
 --       'id > 0',             -- WHERE clause (NULL = all rows)
---       5000                  -- rows per commit (default 10000)
+--       5000                  -- rows per INSERT batch (default 5000)
 --   );
 --
 -- The SET and WHERE clauses are interpolated directly into SQL; the caller
 -- must already hold UPDATE privilege on the target table.
 --
--- Returns: emits NOTICE with total rows updated.
+-- NOTE: between Phase 3 (DELETE committed) and the end of Phase 4 (INSERT)
+-- the table temporarily has fewer rows.  For maintenance windows this is
+-- acceptable; wrap in an explicit lock if concurrent reads must be blocked.
 --
 CREATE OR REPLACE PROCEDURE engine.colcompress_bulk_update(
     table_name   regclass,
     set_clause   text,
     where_clause text    DEFAULT NULL,
-    batch_size   integer DEFAULT 10000)
+    batch_size   integer DEFAULT 5000)
     LANGUAGE plpgsql
 AS $$
 DECLARE
-    _nspname   text;
-    _relname   text;
-    _qualname  text;
-    _tmpname   text;
-    _rn_start  bigint  := 1;
+    _nspname    text;
+    _relname    text;
+    _qualname   text;
+    _heapname   text;
+    _collist    text;
     _total_rows bigint;
-    _n         integer;
-    _total     bigint  := 0;
+    _rn_start   bigint  := 1;
+    _n          integer;
+    _del_total  bigint  := 0;
+    _ins_total  bigint  := 0;
 BEGIN
-    IF batch_size < 100 THEN
-        RAISE EXCEPTION 'bulk_update: batch_size must be >= 100';
+    IF batch_size < 10 THEN
+        RAISE EXCEPTION 'bulk_update: batch_size must be >= 10';
     END IF;
 
     SELECT n.nspname, c.relname
@@ -533,54 +557,108 @@ BEGIN
      WHERE c.oid = table_name;
 
     _qualname := quote_ident(_nspname) || '.' || quote_ident(_relname);
-    _tmpname  := '_se_bulk_' || table_name::oid::text;
+    _heapname := '_se_bulk_' || table_name::oid::text;
 
-    -- Drop leftover temp table from a previous failed run, if any
-    EXECUTE format('DROP TABLE IF EXISTS %I', _tmpname);
+    -- Column list from original table (excludes our internal heap columns)
+    SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum)
+      INTO _collist
+      FROM pg_attribute
+     WHERE attrelid = table_name
+       AND attnum > 0
+       AND NOT attisdropped;
 
-    -- Phase 1: snapshot all matching CTIDs (survives COMMITs)
+    -- Refuse to proceed if a leftover heap from a previous run exists.
+    -- The user must inspect and either resume or drop it manually.
+    IF EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = _heapname
+          AND c.relkind = 'r'
+          AND n.nspname NOT LIKE 'pg_temp%'
+    ) THEN
+        RAISE EXCEPTION
+            'bulk_update: table "%" exists (leftover from a previous crashed run). '
+            'To resume: INSERT INTO % (%s) SELECT %s FROM "%" WHERE _se_rn > <last_n>; '
+            'then DROP TABLE "%" '
+            'To restart clean: DROP TABLE "%" and re-run.',
+            _heapname, _qualname, _collist, _collist, _heapname,
+            _heapname, _heapname;
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- Phase 1: Snapshot matching rows into a LOGGED (WAL-protected) heap.
+    --   _se_old_ctid — original ctid, used for deletion in Phase 3
+    --   _se_rn       — sequential row number, used for INSERT batching
+    --
+    --   After COMMIT: colcompress rows untouched + heap is crash-safe.
+    -- ----------------------------------------------------------------
     EXECUTE format(
-        'CREATE TEMP TABLE %I ON COMMIT PRESERVE ROWS AS '
-        'SELECT row_number() OVER () AS rn, ctid AS tid FROM %s%s',
-        _tmpname,
-        _qualname,
+        'CREATE TABLE %I AS SELECT ctid AS _se_old_ctid, * FROM %s%s',
+        _heapname, _qualname,
         CASE WHEN where_clause IS NOT NULL
-             THEN ' WHERE ' || where_clause
-             ELSE '' END
+             THEN ' WHERE ' || where_clause ELSE '' END
     );
+    EXECUTE format('ALTER TABLE %I ADD COLUMN _se_rn bigserial', _heapname);
+    EXECUTE format('SELECT count(*) FROM %I', _heapname) INTO _total_rows;
+    COMMIT;  -- heap is now durable; crash here = no data loss at all
 
-    EXECUTE format('SELECT count(*) FROM %I', _tmpname) INTO _total_rows;
-    RAISE NOTICE 'bulk_update: % rows to process in batches of %', _total_rows, batch_size;
-    COMMIT;
+    RAISE NOTICE 'bulk_update: % rows snapshotted to "%" (WAL-protected, crash-safe)',
+        _total_rows, _heapname;
 
     IF _total_rows = 0 THEN
-        EXECUTE format('DROP TABLE IF EXISTS %I', _tmpname);
+        EXECUTE format('DROP TABLE %I', _heapname);
+        RAISE NOTICE 'bulk_update: nothing to do';
         RETURN;
     END IF;
 
-    -- Phase 2: batch UPDATE loop — one COMMIT per batch
-    WHILE _rn_start <= _total_rows LOOP
-        EXECUTE format(
-            'UPDATE %s SET %s WHERE ctid = ANY(ARRAY('
-            '    SELECT tid FROM %I WHERE rn BETWEEN $1 AND $2'
-            '))',
-            _qualname, set_clause, _tmpname
-        ) USING _rn_start, _rn_start + batch_size - 1;
+    -- ----------------------------------------------------------------
+    -- Phase 2: Apply SET clause on the heap (pure heap UPDATE).
+    --   No ColcompressScan, no stripe decompression, no OOM risk.
+    -- ----------------------------------------------------------------
+    EXECUTE format('UPDATE %I SET %s', _heapname, set_clause);
+    COMMIT;
+    RAISE NOTICE 'bulk_update: SET clause applied on heap';
 
-        GET DIAGNOSTICS _n = ROW_COUNT;
-        _total    := _total + _n;
-        _rn_start := _rn_start + batch_size;
-        COMMIT;
-    END LOOP;
+    -- ----------------------------------------------------------------
+    -- Phase 3: DELETE old rows from colcompress in a single statement.
+    --   The ctid = ANY(ARRAY(...)) predicate with empty projected columns
+    --   causes ColcompressScan to read stripe metadata only (no column
+    --   decompression) → trivial memory footprint.
+    --   Crash here: heap still holds all transformed rows → re-INSERT.
+    -- ----------------------------------------------------------------
+    EXECUTE format(
+        'DELETE FROM %s WHERE ctid = ANY(ARRAY(SELECT _se_old_ctid FROM %I))',
+        _qualname, _heapname
+    );
+    GET DIAGNOSTICS _del_total = ROW_COUNT;
+    COMMIT;
+    RAISE NOTICE 'bulk_update: % old rows deleted from colcompress', _del_total;
 
-    -- Phase 3: cleanup
-    EXECUTE format('DROP TABLE IF EXISTS %I', _tmpname);
+    -- ----------------------------------------------------------------
+    -- Phase 4: INSERT transformed rows from heap → colcompress (single pass).
+    --   Reads from heap (no ColcompressScan, no decompression → no OOM risk).
+    --   Single INSERT → single stripe → much faster than batched approach.
+    --   Crash here: heap survives; re-run procedure to resume (will detect
+    --   leftover heap and emit resume instructions).
+    -- ----------------------------------------------------------------
+    EXECUTE format(
+        'INSERT INTO %s (%s) SELECT %s FROM %I',
+        _qualname, _collist, _collist, _heapname
+    );
+    GET DIAGNOSTICS _n = ROW_COUNT;
+    _ins_total := _n;
+    COMMIT;
+    RAISE NOTICE 'bulk_update: inserted % rows into colcompress', _ins_total;
 
-    RAISE NOTICE 'bulk_update: done — % rows updated in %s', _total, _qualname;
+    -- ----------------------------------------------------------------
+    -- Phase 5: Cleanup
+    -- ----------------------------------------------------------------
+    EXECUTE format('DROP TABLE %I', _heapname);
+    RAISE NOTICE 'bulk_update: done — % rows updated in %s', _ins_total, _qualname;
 END;
 $$;
 
 COMMENT ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, integer)
-IS 'Memory-safe bulk UPDATE for colcompress tables: snapshots target CTIDs, then UPDATEs and COMMITs every batch_size rows to prevent OOM on large tables. Must be called with CALL.';
+IS 'Memory-safe bulk UPDATE for colcompress tables: snapshots rows to a WAL-protected heap, applies the SET clause there, then DELETEs old colcompress rows (1 scan, no decompression) and re-INSERTs from heap in a single INSERT (1 stripe, fast). Avoids OOM from N full decompression passes. Must be called with CALL.';
 
 GRANT EXECUTE ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, integer) TO PUBLIC;
