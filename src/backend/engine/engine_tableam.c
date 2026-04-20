@@ -506,6 +506,32 @@ tid_to_row_number(ItemPointerData tid)
 
 
 /*
+ * se_row_number_to_tid -- SQL-callable wrapper around row_number_to_tid().
+ *
+ * Converts a colcompress internal row number (from engine.stripe.first_row_number
+ * or first_row_number + row_count - 1) to the ItemPointer (ctid) used to identify
+ * the corresponding tuple.  Used by colcompress_bulk_update to compute per-stripe
+ * ctid bounds so that heap range lookups on _se_old_ctid are efficient.
+ */
+PG_FUNCTION_INFO_V1(se_row_number_to_tid);
+Datum
+se_row_number_to_tid(PG_FUNCTION_ARGS)
+{
+	int64 rowNumber = PG_GETARG_INT64(0);
+
+	if (rowNumber < (int64) COLUMNAR_FIRST_ROW_NUMBER)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("row_number_to_tid: row number must be >= " UINT64_FORMAT,
+						(uint64) COLUMNAR_FIRST_ROW_NUMBER)));
+
+	ItemPointerData *result = (ItemPointerData *) palloc(sizeof(ItemPointerData));
+	*result = row_number_to_tid((uint64) rowNumber);
+	PG_RETURN_POINTER(result);
+}
+
+
+/*
  * ErrorIfInvalidRowNumber errors out if given rowNumber is invalid.
  */
 static void
