@@ -4640,6 +4640,11 @@ se_colcompress_bulk_update(PG_FUNCTION_ARGS)
 		}
 	}
 
+	/* Log total rows found for diagnostics */
+	ereport(NOTICE,
+			(errmsg("bulk_update: phase1 done — temp table %s has " INT64_FORMAT " rows",
+					tmpname, total_rows)));
+
 	SPI_commit();
 
 	/* Nothing to update — clean up and return early. */
@@ -4669,8 +4674,8 @@ se_colcompress_bulk_update(PG_FUNCTION_ARGS)
 
 		MemoryContext old = MemoryContextSwitchTo(procCtx);
 		char *sql = psprintf(
-			"UPDATE %s SET %s WHERE ctid IN "
-			"(SELECT tid FROM %s WHERE rn BETWEEN " INT64_FORMAT " AND " INT64_FORMAT ")",
+			"UPDATE %s SET %s WHERE ctid = ANY("
+			"ARRAY(SELECT tid FROM %s WHERE rn BETWEEN " INT64_FORMAT " AND " INT64_FORMAT "))",
 			qualname, set_str, tmpname, batch_start, batch_end);
 		MemoryContextSwitchTo(old);
 
@@ -4687,6 +4692,11 @@ se_colcompress_bulk_update(PG_FUNCTION_ARGS)
 		}
 
 		total_updated += SPI_processed;
+
+		ereport(NOTICE,
+				(errmsg("bulk_update: batch rn=" INT64_FORMAT "-%ld: %d rows updated",
+						batch_start, batch_end, (int) SPI_processed)));
+
 		batch_start   += batch_size;
 
 		SPI_commit();
@@ -4706,11 +4716,16 @@ se_colcompress_bulk_update(PG_FUNCTION_ARGS)
 	SPI_commit();
 
 	SPI_finish();
+
+	/* Copy summary BEFORE deleting procCtx (qualname lives there) */
+	char summary[512];
+	snprintf(summary, sizeof(summary),
+			 "bulk_update: " INT64_FORMAT " rows updated in %s",
+			 total_updated, qualname);
+
 	MemoryContextDelete(procCtx);
 
-	ereport(NOTICE,
-			(errmsg("bulk_update: " INT64_FORMAT " rows updated in %s",
-					total_updated, qualname)));
+	ereport(NOTICE, (errmsg("%s", summary)));
 
 	PG_RETURN_INT64(total_updated);
 }
