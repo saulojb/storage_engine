@@ -599,7 +599,7 @@ AS $$
 --   CALL engine.colcompress_bulk_update(
 --       'adm.documentos_recebidos',
 --       'rec_version = rec_version + 1',
---       $$documento = 'CTe'$$,
+--       'documento = ''CTe''',
 --       50000,
 --       ARRAY['xml_original', 'json_dados', 'pdf']
 --   );
