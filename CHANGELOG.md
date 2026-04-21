@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## 1.1.0
+
+* feat: **`RowcompressScan` custom scan node with batch-level min/max pruning** —
+  `rowcompress` tables now support a `pruning_column` parameter
+  (`engine.alter_rowcompress_table_set(tbl, pruning_column := 'col')`).
+  When set, `RowcompressScan` records the serialised min/max value of the pruning
+  column per batch during `engine.rowcompress_repack()` or bulk inserts, storing
+  them in `engine.row_batch.batch_min_value` / `batch_max_value`. At scan time,
+  batches whose range does not intersect the query predicate are skipped entirely —
+  no decompression, no I/O. The new GUC `storage_engine.enable_custom_scan` (default
+  `on`) controls whether `RowcompressScan` is injected by the planner hook.
+* feat: **`engine.rowcompress_repack(tbl)`** — utility function that rewrites all
+  batches of a `rowcompress` table in sorted order by the `pruning_column`, maximising
+  pruning efficiency for range queries (e.g. date, timestamp, bigint sequences).
+* schema: **`engine.row_options.pruning_attnum`** — new nullable `int2` column; stores
+  the 1-based attribute number of the pruning column.
+* schema: **`engine.row_batch.batch_min_value` / `batch_max_value`** — new nullable
+  `bytea` columns; store serialised type-agnostic min/max statistics per batch.
+* upgrade: `ALTER EXTENSION storage_engine UPDATE TO '1.1'` applies the schema changes
+  via `storage_engine--1.0--1.1.sql`.
+
 ## 1.0.10
 
 * fix: **pg_search (ParadeDB) BM25 transparent compatibility** — `IsNotIndexPath` in

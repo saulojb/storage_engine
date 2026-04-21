@@ -104,6 +104,20 @@ typedef struct ColumnarScanState
 	bool snapshotRegisteredByUs;
 } ColumnarScanState;
 
+/*
+ * RowcompressScanState — per-scan state for the RowcompressScan custom node.
+ * This is a thin wrapper over the standard rowcompress sequential scan,
+ * adding batch-level min/max pruning and async read-ahead.
+ */
+typedef struct RowcompressScanState
+{
+	CustomScanState css;           /* must be first */
+	TableScanDesc   scanDesc;      /* rowcompress sequential scan */
+	List           *pushdownClauses; /* plain clause exprs for batch pruning */
+	Snapshot        snapshot;
+	bool            snapshotRegisteredByUs;
+} RowcompressScanState;
+
 typedef bool (*PathPredicate)(Path *path);
 
 
@@ -193,6 +207,22 @@ static List * set_deparse_context_planstate(List *dpcontext, Node *node,
 /* other helpers */
 static List * ColumnarVarNeeded(ColumnarScanState *columnarScanState);
 
+/* RowcompressScan forward declarations */
+static void RCAddScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte);
+static Plan * RCScan_PlanCustomPath(PlannerInfo *root, RelOptInfo *rel,
+									struct CustomPath *best_path,
+									List *tlist, List *clauses,
+									List *custom_plans);
+static Node * RCScan_CreateCustomScanState(CustomScan *cscan);
+static void RCScan_BeginCustomScan(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot * RCScan_Next(ScanState *node);
+static bool RCScan_Recheck(ScanState *node, TupleTableSlot *slot);
+static TupleTableSlot * RCScan_ExecCustomScan(CustomScanState *node);
+static void RCScan_EndCustomScan(CustomScanState *node);
+static void RCScan_ReScanCustomScan(CustomScanState *node);
+static void RCScan_ExplainCustomScan(CustomScanState *node, List *ancestors,
+									 ExplainState *es);
+
 /* saved hook value in case of unload */
 static set_rel_pathlist_hook_type PreviousSetRelPathlistHook = NULL;
 static get_relation_info_hook_type PreviousGetRelationInfoHook = NULL;
@@ -229,6 +259,28 @@ const struct CustomExecMethods ColumnarScanExecuteMethods = {
 	.InitializeDSMCustomScan = Columnar_InitializeDSMCustomScan,
 	.ReInitializeDSMCustomScan = Columnar_ReinitializeDSMCustomScan,
 	.InitializeWorkerCustomScan = Columnar_InitializeWorkerCustomScan
+};
+
+/* ----------------------------------------------------------------
+ * RowcompressScan method tables
+ * ---------------------------------------------------------------- */
+static const struct CustomPathMethods RowcompressScanPathMethods = {
+	.CustomName = "RowcompressScan",
+	.PlanCustomPath = RCScan_PlanCustomPath,
+};
+
+static const struct CustomScanMethods RowcompressScanScanMethods = {
+	.CustomName = "RowcompressScan",
+	.CreateCustomScanState = RCScan_CreateCustomScanState,
+};
+
+static const struct CustomExecMethods RowcompressScanExecuteMethods = {
+	.CustomName = "RowcompressScan",
+	.BeginCustomScan = RCScan_BeginCustomScan,
+	.ExecCustomScan = RCScan_ExecCustomScan,
+	.EndCustomScan = RCScan_EndCustomScan,
+	.ReScanCustomScan = RCScan_ReScanCustomScan,
+	.ExplainCustomScan = RCScan_ExplainCustomScan,
 };
 
 static const struct config_enum_entry debug_level_options[] = {
@@ -334,6 +386,9 @@ engine_customscan_init()
 	 */
 	if (GetCustomScanMethods(ColumnarScanScanMethods.CustomName, true) == NULL)
 		RegisterCustomScanMethods(&ColumnarScanScanMethods);
+
+	if (GetCustomScanMethods(RowcompressScanScanMethods.CustomName, true) == NULL)
+		RegisterCustomScanMethods(&RowcompressScanScanMethods);
 }
 
 static void
@@ -447,6 +502,18 @@ ColumnarSetRelPathlistHook(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			/* Direct lappend: skip add_path dominance checks since we just
 			 * removed the path that would have dominated this Seq Scan. */
 			rel->pathlist = lappend(rel->pathlist, seqPath);
+		}
+
+		/*
+		 * When batch-level pruning is configured and custom scans are enabled,
+		 * add a RowcompressScan path that pushes down WHERE-clause predicates
+		 * for batch skipping.  The path replaces the SeqScan (same cost, but
+		 * with actual run-time pruning benefit).
+		 */
+		if (EnableColumnarCustomScan &&
+			RowCompressGetPruningAttnum(rte->relid) > 0)
+		{
+			RCAddScanPath(root, rel, rte);
 		}
 	}
 	RelationClose(relation);
@@ -3234,3 +3301,211 @@ set_deparse_context_planstate(List *dpcontext, Node *node, List *ancestors)
 
 
 #endif
+
+
+/* ================================================================
+ * RowcompressScan custom scan node
+ *
+ * A lightweight custom scan that wraps the standard rowcompress sequential
+ * scan and adds two performance features:
+ *
+ *  1. Batch-level min/max pruning:  batches whose stored [min, max] range is
+ *     refuted by the pushed-down WHERE clauses are skipped entirely without
+ *     decompressing.
+ *
+ *  2. Async read-ahead:  before decompressing the current batch the scan
+ *     issues a PrefetchBuffer() hint for the next batch, overlapping I/O
+ *     with CPU-side decompression.
+ *
+ * Both features are implemented inside the rowcompress TAM
+ * (rowcompress_getnextslot) once rowcompress_set_pushdown_clauses() has been
+ * called on the TableScanDesc.  This custom node's only job is to (a) build
+ * the path/plan with the right clauses, (b) call set_pushdown_clauses at
+ * begin time, and (c) report pruning stats in EXPLAIN.
+ * ================================================================ */
+
+/*
+ * RCAddScanPath — create and add a RowcompressScan CustomPath for a rowcompress
+ * relation.  The path cost mirrors the plain SeqScan cost (we cannot predict
+ * pruning at plan time).  The planner will still prefer this path over the
+ * plain SeqScan because we call add_path() which respects dominance.
+ */
+static void
+RCAddScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	/* Build a reference SeqScan path to copy cost estimates from */
+	Path *seqPath = create_seqscan_path(root, rel, rel->lateral_relids, 0);
+
+	/* Collect plain clause expressions from baserestrictinfo */
+	List *plainClauses = NIL;
+	ListCell *lc;
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+		plainClauses = lappend(plainClauses, rinfo->clause);
+	}
+
+	CustomPath *cpath = makeNode(CustomPath);
+	cpath->path.pathtype    = T_CustomScan;
+	cpath->path.parent      = rel;
+	cpath->path.pathtarget  = rel->reltarget;
+	cpath->path.param_info  = NULL;
+	cpath->path.parallel_aware    = false;
+	cpath->path.parallel_safe     = rel->consider_parallel;
+	cpath->path.parallel_workers  = 0;
+	cpath->path.rows         = seqPath->rows;
+	cpath->path.startup_cost = seqPath->startup_cost;
+	cpath->path.total_cost   = seqPath->total_cost;
+	cpath->flags             = 0;
+	cpath->custom_paths      = NIL;
+	cpath->custom_private    = list_make1(plainClauses);
+	cpath->methods           = &RowcompressScanPathMethods;
+
+	add_path(rel, (Path *) cpath);
+}
+
+static Plan *
+RCScan_PlanCustomPath(PlannerInfo *root, RelOptInfo *rel,
+					  struct CustomPath *best_path,
+					  List *tlist, List *clauses,
+					  List *custom_plans)
+{
+	List *plainClauses = (List *) linitial(best_path->custom_private);
+
+	CustomScan *cscan = makeNode(CustomScan);
+	cscan->scan.scanrelid = best_path->path.parent->relid;
+	cscan->scan.plan.targetlist = tlist;
+	/*
+	 * Per-row qual: executor checks these after the TAM returns each row.
+	 * Batch-level pruning (inside the TAM) may have already eliminated whole
+	 * batches, so many of these checks will never execute in practice.
+	 */
+	cscan->scan.plan.qual = extract_actual_clauses(clauses, false);
+	cscan->custom_exprs   = list_make1(plainClauses);
+	cscan->custom_private = NIL;
+	cscan->custom_scan_tlist = NIL;
+	cscan->methods        = &RowcompressScanScanMethods;
+
+	return (Plan *) cscan;
+}
+
+static Node *
+RCScan_CreateCustomScanState(CustomScan *cscan)
+{
+	RowcompressScanState *state = (RowcompressScanState *)
+		newNode(sizeof(RowcompressScanState), T_CustomScanState);
+	state->css.methods = &RowcompressScanExecuteMethods;
+	return (Node *) state;
+}
+
+static void
+RCScan_BeginCustomScan(CustomScanState *node, EState *estate, int eflags)
+{
+	RowcompressScanState *state = (RowcompressScanState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	Relation rel = node->ss.ss_currentRelation;
+
+	/* Retrieve the plain clause list stored at plan time */
+	state->pushdownClauses = (List *) linitial(cscan->custom_exprs);
+
+	/* Handle snapshot: use estate snapshot, or register a fresh one */
+	state->snapshot = estate->es_snapshot;
+	state->snapshotRegisteredByUs = false;
+
+	/* Open the sequential scan */
+	state->scanDesc = table_beginscan(rel, state->snapshot, 0, NULL);
+
+	/* Push WHERE clauses into the TAM for batch-level min/max pruning */
+	if (state->pushdownClauses != NIL)
+	{
+		rowcompress_set_pushdown_clauses(state->scanDesc,
+										 state->pushdownClauses,
+										 RelationGetDescr(rel));
+	}
+}
+
+static TupleTableSlot *
+RCScan_Next(ScanState *node)
+{
+	RowcompressScanState *state = (RowcompressScanState *) node;
+	TupleTableSlot *slot = node->ss_ScanTupleSlot;
+
+	if (!table_scan_getnextslot(state->scanDesc, ForwardScanDirection, slot))
+		ExecClearTuple(slot);
+
+	return slot;
+}
+
+static bool
+RCScan_Recheck(ScanState *node, TupleTableSlot *slot)
+{
+	/* All row-level predicates are evaluated by ExecScan's qual loop */
+	return true;
+}
+
+static TupleTableSlot *
+RCScan_ExecCustomScan(CustomScanState *node)
+{
+	return ExecScan(&node->ss,
+					(ExecScanAccessMtd) RCScan_Next,
+					(ExecScanRecheckMtd) RCScan_Recheck);
+}
+
+static void
+RCScan_EndCustomScan(CustomScanState *node)
+{
+	RowcompressScanState *state = (RowcompressScanState *) node;
+
+	if (state->scanDesc)
+		table_endscan(state->scanDesc);
+
+	if (state->snapshotRegisteredByUs)
+		UnregisterSnapshot(state->snapshot);
+}
+
+static void
+RCScan_ReScanCustomScan(CustomScanState *node)
+{
+	RowcompressScanState *state = (RowcompressScanState *) node;
+
+	if (state->scanDesc)
+	{
+		table_rescan(state->scanDesc, NULL);
+
+		/* Re-install the pushdown clauses after rescan */
+		if (state->pushdownClauses != NIL)
+		{
+			Relation rel = node->ss.ss_currentRelation;
+			rowcompress_set_pushdown_clauses(state->scanDesc,
+											 state->pushdownClauses,
+											 RelationGetDescr(rel));
+		}
+	}
+}
+
+static void
+RCScan_ExplainCustomScan(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	RowcompressScanState *state = (RowcompressScanState *) node;
+
+	if (state->scanDesc != NULL)
+	{
+		int64 pruned = rowcompress_get_batches_pruned(state->scanDesc);
+		ExplainPropertyInteger("Batches Pruned", NULL, pruned, es);
+	}
+
+#if PG_VERSION_NUM >= 130000
+	if (state->pushdownClauses != NIL && es->verbose)
+	{
+		/* Show which clauses are being pushed down for batch pruning */
+		List *context = set_deparse_context_planstate(
+			es->deparse_cxt,
+			(Node *) node,
+			ancestors);
+		const char *clsStr = ColumnarPushdownClausesStr(context,
+														state->pushdownClauses);
+		ExplainPropertyText("Batch Pruning Clauses", clsStr, es);
+	}
+#endif
+}
+

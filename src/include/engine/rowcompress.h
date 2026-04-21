@@ -43,9 +43,11 @@
  */
 typedef struct RowCompressOptions
 {
-	uint32         batchSize;       /* max rows per compressed batch */
-	CompressionType compression;    /* compression algorithm */
-	int            compressionLevel; /* compression level */
+	uint32          batchSize;        /* max rows per compressed batch */
+	CompressionType compression;      /* compression algorithm */
+	int             compressionLevel; /* compression level */
+	int16           pruningAttnum;    /* 1-based attnum for batch-level min/max pruning;
+	                                   * 0 means pruning disabled */
 } RowCompressOptions;
 
 /*
@@ -61,11 +63,35 @@ typedef struct RowCompressBatchMetadata
 	uint64  dataLength;      /* total on-disk size (header + offsets + data) */
 	uint8  *deletedMask;     /* per-row deletion bitmask; NULL = no deleted rows */
 	uint32  deletedMaskLen;  /* number of bytes in deletedMask */
+	/* Batch-level pruning statistics (populated iff hasMinMax = true) */
+	bool    hasMinMax;       /* true when min/max stats are available */
+	bytea  *rawMinValue;     /* serialised minimum of the pruning column */
+	bytea  *rawMaxValue;     /* serialised maximum of the pruning column */
 } RowCompressBatchMetadata;
+
+/*
+ * RCPruningCtx — per-scan context used by the RowcompressScan custom node
+ * to evaluate batch-level min/max pruning.
+ */
+typedef struct RCPruningCtx
+{
+	List              *clauses;         /* pushed-down WHERE clauses */
+	int16              pruningAttnum;   /* 1-based attribute number */
+	Form_pg_attribute  pruningAttrForm; /* type / collation info */
+	Var               *pruningVar;      /* Var node referencing the pruning column */
+	Node              *baseConstraint;  /* reusable (var >= min) AND (var <= max) node */
+} RCPruningCtx;
 
 /* Public API */
 extern void rowcompress_tableam_init(void);
 extern bool IsRowCompressTableAmTable(Oid relationId);
+extern int16 RowCompressGetPruningAttnum(Oid relid);
+
+/* Scan-level pruning API (used by RowcompressScan custom node) */
+extern void rowcompress_set_pushdown_clauses(TableScanDesc sscan,
+											 List *clauses,
+											 TupleDesc tupdesc);
+extern int64 rowcompress_get_batches_pruned(TableScanDesc sscan);
 
 /* User-facing management functions (exposed as SQL UDFs) */
 extern Datum alter_rowcompress_table_set(PG_FUNCTION_ARGS);

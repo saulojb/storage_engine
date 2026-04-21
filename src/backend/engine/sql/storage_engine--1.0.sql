@@ -146,7 +146,8 @@ CREATE TABLE engine.row_options (
     regclass          regclass NOT NULL PRIMARY KEY,
     batch_size        integer  NOT NULL DEFAULT 10000,
     compression       name     NOT NULL DEFAULT 'zstd',
-    compression_level integer  NOT NULL DEFAULT 3
+    compression_level integer  NOT NULL DEFAULT 3,
+    pruning_attnum    int2     DEFAULT NULL  -- 1-based attnum for batch-level min/max pruning
 ) WITH (user_catalog_table = true);
 
 COMMENT ON TABLE engine.row_options
@@ -163,6 +164,8 @@ CREATE TABLE engine.row_batch (
     first_row_number bigint  NOT NULL,
     row_count        integer NOT NULL,
     deleted_mask     bytea,
+    batch_min_value  bytea,  -- serialized min of pruning column (NULL = no stats)
+    batch_max_value  bytea,  -- serialized max of pruning column (NULL = no stats)
     PRIMARY KEY (storage_id, batch_num)
 ) WITH (user_catalog_table = true);
 
@@ -302,14 +305,15 @@ CREATE OR REPLACE FUNCTION engine.alter_rowcompress_table_set(
     table_name        regclass,
     batch_size        int  DEFAULT NULL,
     compression       name DEFAULT NULL,
-    compression_level int  DEFAULT NULL)
+    compression_level int  DEFAULT NULL,
+    pruning_column    text DEFAULT NULL)
     RETURNS void
     LANGUAGE C
 AS 'MODULE_PATHNAME', 'alter_rowcompress_table_set';
 
 COMMENT ON FUNCTION engine.alter_rowcompress_table_set(
-    regclass, int, name, int)
-IS 'set one or more options on a rowcompress table; NULL means no change';
+    regclass, int, name, int, text)
+IS 'set one or more options on a rowcompress table; NULL means no change; pruning_column enables batch-level min/max pruning';
 
 --
 -- engine.alter_rowcompress_table_reset — reset options to defaults

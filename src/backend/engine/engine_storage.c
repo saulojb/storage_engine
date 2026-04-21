@@ -548,8 +548,34 @@ ColumnarStorageWrite(Relation rel, uint64 logicalOffset, char *data, uint32 amou
 
 
 /*
+ * ColumnarStoragePrefetch - issue kernel read-ahead hints for the blocks
+ * covering [logicalOffset, logicalOffset + amount).  Uses PrefetchBuffer so
+ * the actual I/O is asynchronous and overlaps with CPU-side batch processing.
+ * Safe to call with amount == 0 (no-op).
+ */
+void
+ColumnarStoragePrefetch(Relation rel, uint64 logicalOffset, uint64 amount)
+{
+	if (amount == 0 || !ColumnarLogicalOffsetIsValid(logicalOffset))
+		return;
+
+	uint64 fetched = 0;
+
+	while (fetched < amount)
+	{
+		PhysicalAddr addr = LogicalToPhysical(logicalOffset + fetched);
+
+		PrefetchBuffer(rel, MAIN_FORKNUM, addr.blockno);
+
+		/* Advance to the next block boundary */
+		uint64 remaining_in_block = (uint64) BLCKSZ - addr.offset;
+		fetched += Min(amount - fetched, remaining_in_block);
+	}
+}
+
+
+/*
  * ColumnarStorageTruncate - truncate the columnar storage such that
- * newDataReservation will be the first unused logical offset available. Free
  * pages at the end of the relation.
  *
  * Caller must hold AccessExclusiveLock on the relation.

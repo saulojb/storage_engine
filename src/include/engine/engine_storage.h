@@ -59,6 +59,8 @@ extern void ColumnarStorageRead(Relation rel, uint64 logicalOffset,
 								char *data, uint32 amount);
 extern void ColumnarStorageWrite(Relation rel, uint64 logicalOffset,
 								 char *data, uint32 amount);
+extern void ColumnarStoragePrefetch(Relation rel, uint64 logicalOffset,
+									uint64 amount);
 extern bool ColumnarStorageTruncate(Relation rel, uint64 newDataReservation);
 
 #endif /* COLUMNAR_STORAGE_H */

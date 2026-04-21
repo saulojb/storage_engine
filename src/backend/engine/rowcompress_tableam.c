@@ -60,7 +60,11 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/rel.h"
+#include "utils/datum.h"
+#include "utils/typcache.h"
 #include "catalog/objectaccess.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
 
 #if PG_VERSION_NUM >= PG_VERSION_16
 #include "storage/relfilelocator.h"
@@ -162,6 +166,10 @@ typedef struct RowCompressScanDesc
 	/* ANALYZE state: physical pages per batch (used in scan_analyze_next_block) */
 	uint32         analyzeBlocksPerBatch;
 
+	/* Batch-level pruning: set by rowcompress_set_pushdown_clauses() */
+	RCPruningCtx  *pruningCtx;     /* NULL = pruning disabled for this scan */
+	int64          batchesPruned;  /* number of batches skipped via pruning */
+
 #if PG_VERSION_NUM < PG_VERSION_18
 	struct TBMIterateResult *tbmres;
 #else
@@ -243,8 +251,10 @@ typedef struct IndexFetchRowCompressData
 #define Anum_rowcompress_batch_first_row_number  5
 #define Anum_rowcompress_batch_row_count         6
 #define Anum_rowcompress_batch_deleted_mask      7
+#define Anum_rowcompress_batch_min_value         8
+#define Anum_rowcompress_batch_max_value         9
 
-#define Natts_rowcompress_batch                  7
+#define Natts_rowcompress_batch                  9
 
 /*
  * RC_IS_DELETED — returns true if the bit for rowOffset is set in the
@@ -260,7 +270,8 @@ typedef struct IndexFetchRowCompressData
 #define Anum_rowcompress_options_batch_size        2
 #define Anum_rowcompress_options_compression       3
 #define Anum_rowcompress_options_compression_level 4
-#define Natts_rowcompress_options                  4
+#define Anum_rowcompress_options_pruning_attnum    5
+#define Natts_rowcompress_options                  5
 
 
 /* ================================================================
@@ -287,7 +298,8 @@ static Oid RCOptionsRelationId(void);
 
 static void RCInsertBatchMetadata(uint64 storageId, uint64 batchNum,
 								  uint64 firstRowNumber, uint32 rowCount,
-								  uint64 fileOffset, uint64 dataLength);
+								  uint64 fileOffset, uint64 dataLength,
+								  bytea *minValue, bytea *maxValue);
 static List *RCGetBatches(uint64 storageId);
 static RowCompressBatchMetadata *RCFindBatchForRowNumber(uint64 storageId,
 														  uint64 rowNumber);
@@ -491,7 +503,8 @@ RCOptionsRelationId(void)
 static void
 RCInsertBatchMetadata(uint64 storageId, uint64 batchNum,
 					  uint64 firstRowNumber, uint32 rowCount,
-					  uint64 fileOffset, uint64 dataLength)
+					  uint64 fileOffset, uint64 dataLength,
+					  bytea *minValue, bytea *maxValue)
 {
 	Datum values[Natts_rowcompress_batch];
 	bool  nulls[Natts_rowcompress_batch];
@@ -505,6 +518,16 @@ RCInsertBatchMetadata(uint64 storageId, uint64 batchNum,
 	values[Anum_rowcompress_batch_first_row_number - 1]  = UInt64GetDatum(firstRowNumber);
 	values[Anum_rowcompress_batch_row_count - 1]         = UInt32GetDatum(rowCount);
 	nulls[Anum_rowcompress_batch_deleted_mask - 1]       = true;  /* no deletions yet */
+
+	if (minValue != NULL)
+		values[Anum_rowcompress_batch_min_value - 1] = PointerGetDatum(minValue);
+	else
+		nulls[Anum_rowcompress_batch_min_value - 1] = true;
+
+	if (maxValue != NULL)
+		values[Anum_rowcompress_batch_max_value - 1] = PointerGetDatum(maxValue);
+	else
+		nulls[Anum_rowcompress_batch_max_value - 1] = true;
 
 	Relation batchRel = table_open(RCBatchRelationId(), RowExclusiveLock);
 	TupleDesc tupdesc = RelationGetDescr(batchRel);
@@ -579,6 +602,31 @@ RCGetBatches(uint64 storageId)
 		{
 			meta->deletedMask    = NULL;
 			meta->deletedMaskLen = 0;
+		}
+
+		/* Read batch_min_value / batch_max_value (nullable bytea, v1.1+) */
+		meta->hasMinMax = false;
+		meta->rawMinValue = NULL;
+		meta->rawMaxValue = NULL;
+		if (tupdesc->natts >= Anum_rowcompress_batch_min_value)
+		{
+			Datum minDatum = heap_getattr(tup, Anum_rowcompress_batch_min_value,
+										  tupdesc, &isNull);
+			bool minIsNull = isNull;
+			Datum maxDatum = heap_getattr(tup, Anum_rowcompress_batch_max_value,
+										  tupdesc, &isNull);
+			bool maxIsNull = isNull;
+
+			if (!minIsNull && !maxIsNull)
+			{
+				bytea *minB = DatumGetByteaP(minDatum);
+				bytea *maxB = DatumGetByteaP(maxDatum);
+				meta->rawMinValue = palloc(VARSIZE_ANY(minB));
+				meta->rawMaxValue = palloc(VARSIZE_ANY(maxB));
+				memcpy(meta->rawMinValue, minB, VARSIZE_ANY(minB));
+				memcpy(meta->rawMaxValue, maxB, VARSIZE_ANY(maxB));
+				meta->hasMinMax = true;
+			}
 		}
 
 		batchList = lappend(batchList, meta);
@@ -913,6 +961,16 @@ RCReadOptions(Oid relationId, RowCompressOptions *options)
 
 		options->compressionLevel = DatumGetInt32(
 			heap_getattr(tup, Anum_rowcompress_options_compression_level, tupdesc, &isNull));
+
+		/* Read pruning_attnum (nullable int2, added in v1.1) */
+		options->pruningAttnum = 0;
+		if (tupdesc->natts >= Anum_rowcompress_options_pruning_attnum)
+		{
+			Datum paDatum = heap_getattr(tup, Anum_rowcompress_options_pruning_attnum,
+										 tupdesc, &isNull);
+			if (!isNull)
+				options->pruningAttnum = DatumGetInt16(paDatum);
+		}
 	}
 
 	systable_endscan(scan);
@@ -979,6 +1037,11 @@ RCSetOptions(Oid relationId, const RowCompressOptions *options)
 	values[Anum_rowcompress_options_compression - 1]        = CStringGetDatum(
 		CompressionTypeStr(options->compression));
 	values[Anum_rowcompress_options_compression_level - 1]  = Int32GetDatum(options->compressionLevel);
+
+	if (options->pruningAttnum > 0)
+		values[Anum_rowcompress_options_pruning_attnum - 1] = Int16GetDatum(options->pruningAttnum);
+	else
+		nulls[Anum_rowcompress_options_pruning_attnum - 1]  = true;
 
 	Relation  optRel  = table_open(RCOptionsRelationId(), RowExclusiveLock);
 	TupleDesc tupdesc = RelationGetDescr(optRel);
@@ -1100,6 +1163,178 @@ RCGetOrCreateWriteState(Relation rel)
 	return ws;
 }
 
+/* ================================================================
+ * PRUNING HELPERS
+ * ================================================================ */
+
+/*
+ * RCDatumToBytea — serialise a Datum to bytea so it can be stored in the
+ * catalog.  For pass-by-value types we store the raw 8-byte Datum value;
+ * for varlena types we store the detoasted content.
+ */
+static bytea *
+RCDatumToBytea(Datum val, Form_pg_attribute attr)
+{
+	Size dataSize;
+	bytea *result;
+
+	if (attr->attbyval)
+	{
+		/* Store the 8-byte Datum directly */
+		dataSize = sizeof(Datum);
+		result   = (bytea *) palloc(VARHDRSZ + dataSize);
+		SET_VARSIZE(result, VARHDRSZ + dataSize);
+		memcpy(VARDATA(result), &val, dataSize);
+	}
+	else if (attr->attlen > 0)
+	{
+		/* Fixed-length pass-by-reference (e.g. interval, point) */
+		dataSize = (Size) attr->attlen;
+		result   = (bytea *) palloc(VARHDRSZ + dataSize);
+		SET_VARSIZE(result, VARHDRSZ + dataSize);
+		memcpy(VARDATA(result), DatumGetPointer(val), dataSize);
+	}
+	else
+	{
+		/* Variable-length varlena: detoast first */
+		struct varlena *detoasted = PG_DETOAST_DATUM(val);
+		dataSize = VARSIZE_ANY(detoasted);
+		result   = (bytea *) palloc(dataSize);
+		memcpy(result, detoasted, dataSize);
+		if ((Pointer) detoasted != DatumGetPointer(val))
+			pfree(detoasted);
+	}
+
+	return result;
+}
+
+/*
+ * RCByteaToDatum — deserialise a bytea produced by RCDatumToBytea back to
+ * a Datum.  The returned Datum is valid for the lifetime of the palloc.
+ */
+static Datum
+RCByteaToDatum(bytea *b, Form_pg_attribute attr)
+{
+	if (attr->attbyval)
+	{
+		Datum val;
+		memcpy(&val, VARDATA(b), sizeof(Datum));
+		return val;
+	}
+	else if (attr->attlen > 0)
+	{
+		/* Return pointer into the bytea payload */
+		return PointerGetDatum(VARDATA(b));
+	}
+	else
+	{
+		/* varlena: the whole bytea IS the value */
+		return PointerGetDatum(b);
+	}
+}
+
+/*
+ * RCBuildBaseConstraint — build a reusable clause list of the form
+ *   (var >= $min) AND (var <= $max)
+ * The Const nodes are placeholders; RCUpdateConstraint fills in real values.
+ *
+ * Mirrors BuildBaseConstraint in engine_reader.c.
+ */
+static Node *
+RCBuildBaseConstraint(Var *var)
+{
+	/*
+	 * We build:
+	 *   BoolExpr AND [
+	 *     OpExpr (var >= minConst),
+	 *     OpExpr (var <= maxConst)
+	 *   ]
+	 * where minConst / maxConst are placeholder Int4Const(0) nodes that
+	 * RCUpdateConstraint replaces with real values before each pruning test.
+	 */
+	Oid typeOid = var->vartype;
+
+	/* Look up >= and <= operators for this type's btree opclass */
+	TypeCacheEntry *typeCache = lookup_type_cache(typeOid,
+												  TYPECACHE_BTREE_OPFAMILY);
+	if (!OidIsValid(typeCache->btree_opf))
+		return NULL; /* no btree support; pruning impossible */
+
+	Oid geOp = get_opfamily_member(typeCache->btree_opf, typeOid, typeOid,
+								   BTGreaterEqualStrategyNumber);
+	Oid leOp = get_opfamily_member(typeCache->btree_opf, typeOid, typeOid,
+								   BTLessEqualStrategyNumber);
+
+	if (!OidIsValid(geOp) || !OidIsValid(leOp))
+		return NULL;
+
+	Const *minConst = makeConst(typeOid, -1, var->varcollid, -1,
+								(Datum) 0, true /* isnull */, var->vartype < FLOAT4OID);
+	Const *maxConst = makeConst(typeOid, -1, var->varcollid, -1,
+								(Datum) 0, true /* isnull */, var->vartype < FLOAT4OID);
+
+	OpExpr *geClause = (OpExpr *) make_opclause(geOp, BOOLOID, false,
+												 (Expr *) copyObject(var),
+												 (Expr *) minConst,
+												 InvalidOid, var->varcollid);
+	set_opfuncid(geClause);
+
+	OpExpr *leClause = (OpExpr *) make_opclause(leOp, BOOLOID, false,
+												 (Expr *) copyObject(var),
+												 (Expr *) maxConst,
+												 InvalidOid, var->varcollid);
+	set_opfuncid(leClause);
+
+	return (Node *) make_andclause(list_make2(geClause, leClause));
+}
+
+/*
+ * RCUpdateConstraint — overwrite the placeholder Const nodes inside the
+ * baseConstraint built by RCBuildBaseConstraint with the real batch min/max.
+ */
+static void
+RCUpdateConstraint(Node *baseConstraint, Datum minValue, Datum maxValue)
+{
+	BoolExpr *andNode = (BoolExpr *) baseConstraint;
+	Assert(IsA(andNode, BoolExpr) && andNode->boolop == AND_EXPR);
+
+	OpExpr *geClause = (OpExpr *) linitial(andNode->args); /* var >= min */
+	OpExpr *leClause = (OpExpr *) lsecond(andNode->args);  /* var <= max */
+
+	Const *minConst = (Const *) lsecond(geClause->args);
+	Const *maxConst = (Const *) lsecond(leClause->args);
+
+	minConst->constvalue = minValue;
+	minConst->constisnull = false;
+	maxConst->constvalue = maxValue;
+	maxConst->constisnull = false;
+}
+
+/*
+ * RCBatchCanBePruned — returns true if the batch's min/max stats guarantee
+ * that no row in the batch can satisfy the pushed-down WHERE clauses.
+ */
+static bool
+RCBatchCanBePruned(RowCompressScanDesc *scan,
+				   RowCompressBatchMetadata *meta,
+				   TupleDesc tupdesc)
+{
+	RCPruningCtx *ctx = scan->pruningCtx;
+	if (ctx == NULL || !meta->hasMinMax)
+		return false;
+
+	Form_pg_attribute attrForm =
+		TupleDescAttr(tupdesc, ctx->pruningAttnum - 1);
+
+	Datum batchMin = RCByteaToDatum(meta->rawMinValue, attrForm);
+	Datum batchMax = RCByteaToDatum(meta->rawMaxValue, attrForm);
+
+	RCUpdateConstraint(ctx->baseConstraint, batchMin, batchMax);
+
+	return predicate_refuted_by(list_make1(ctx->baseConstraint),
+								ctx->clauses, false);
+}
+
 /*
  * RCFlushBatch compresses and writes all buffered rows to disk,
  * then inserts a batch metadata row.
@@ -1121,11 +1356,71 @@ RCFlushBatch(RowCompressWriteState *ws, Relation rel)
 
 	uint32 *rowOffsets = palloc(ws->rowCount * sizeof(uint32));
 
+	/*
+	 * Set up min/max tracking for the pruning column, if configured.
+	 * typeCache is NULL when pruning is disabled or the type has no btree cmp.
+	 */
+	bool hasMinMax = false;
+	Datum batchMin = (Datum) 0;
+	Datum batchMax = (Datum) 0;
+	TypeCacheEntry *mmTypeCache  = NULL;
+	Form_pg_attribute mmAttrForm = NULL;
+
+	if (ws->options.pruningAttnum > 0 &&
+		ws->tupdesc != NULL &&
+		ws->options.pruningAttnum <= ws->tupdesc->natts)
+	{
+		mmAttrForm  = TupleDescAttr(ws->tupdesc, ws->options.pruningAttnum - 1);
+		mmTypeCache = lookup_type_cache(mmAttrForm->atttypid,
+										TYPECACHE_CMP_PROC_FINFO);
+		if (!OidIsValid(mmTypeCache->cmp_proc))
+			mmTypeCache = NULL; /* no comparator available */
+	}
+
 	ListCell *lc;
 	int idx = 0;
 	foreach(lc, ws->rowList)
 	{
 		RowDataEntry *entry = (RowDataEntry *) lfirst(lc);
+
+		/* Track min/max for the pruning column */
+		if (mmTypeCache != NULL)
+		{
+			HeapTupleData htup;
+			htup.t_len  = entry->tupleLen;
+			htup.t_data = (HeapTupleHeader) entry->tupleData;
+			bool isnull;
+			Datum val = heap_getattr(&htup, ws->options.pruningAttnum,
+									 ws->tupdesc, &isnull);
+			if (!isnull)
+			{
+				if (!hasMinMax)
+				{
+					batchMin = datumCopy(val, mmAttrForm->attbyval,
+										 mmAttrForm->attlen);
+					batchMax = datumCopy(val, mmAttrForm->attbyval,
+										 mmAttrForm->attlen);
+					hasMinMax = true;
+				}
+				else
+				{
+					int cmpMin = DatumGetInt32(
+						FunctionCall2Coll(&mmTypeCache->cmp_proc_finfo,
+										  mmAttrForm->attcollation,
+										  val, batchMin));
+					int cmpMax = DatumGetInt32(
+						FunctionCall2Coll(&mmTypeCache->cmp_proc_finfo,
+										  mmAttrForm->attcollation,
+										  val, batchMax));
+					if (cmpMin < 0)
+						batchMin = datumCopy(val, mmAttrForm->attbyval,
+											 mmAttrForm->attlen);
+					if (cmpMax > 0)
+						batchMax = datumCopy(val, mmAttrForm->attbyval,
+											 mmAttrForm->attlen);
+				}
+			}
+		}
 
 		/* MAXALIGN the current write position */
 		while (uncompBuf.len % MAXIMUM_ALIGNOF != 0)
@@ -1179,9 +1474,17 @@ ColumnarStorageWrite(rel, fileOffset + sizeof(header) + offsetsBytes,
  dataToStore->data, dataToStore->len);
 
 /* Insert metadata row (transactional; rolled back if transaction aborts) */
-RCInsertBatchMetadata(ws->storageId, batchId,
-  ws->firstRowNumber, ws->rowCount,
-  fileOffset, totalSize);
+	bytea *minBytea = NULL;
+	bytea *maxBytea = NULL;
+	if (hasMinMax && mmAttrForm != NULL)
+	{
+		minBytea = RCDatumToBytea(batchMin, mmAttrForm);
+		maxBytea = RCDatumToBytea(batchMax, mmAttrForm);
+	}
+	RCInsertBatchMetadata(ws->storageId, batchId,
+						  ws->firstRowNumber, ws->rowCount,
+						  fileOffset, totalSize,
+						  minBytea, maxBytea);
 
 pfree(rowOffsets);
 pfree(uncompBuf.data);
@@ -1568,26 +1871,50 @@ for (;;)
 if (scan->batchRowCount == 0 || scan->currentRowIndex >= scan->batchRowCount)
 {
 	RowCompressBatchMetadata *meta;
+	TupleDesc td = RelationGetDescr(scan->rc_base.rs_rd);
 
 	if (scan->rc_base.rs_parallel != NULL)
 	{
-		/* Parallel mode: atomically claim the next batch index */
+		/* Parallel mode: atomically claim batch indices, skipping prunable ones */
 		RowCompressParallelScanDesc pdscan =
 			(RowCompressParallelScanDesc) scan->rc_base.rs_parallel;
-		uint64 batchIdx =
-			pg_atomic_fetch_add_u64(&pdscan->rc_next_batch_idx, 1);
-		if (batchIdx >= (uint64) list_length(scan->batchList))
-			return false;
-		meta = (RowCompressBatchMetadata *)
-			list_nth(scan->batchList, (int) batchIdx);
+		for (;;)
+		{
+			uint64 batchIdx =
+				pg_atomic_fetch_add_u64(&pdscan->rc_next_batch_idx, 1);
+			if (batchIdx >= (uint64) list_length(scan->batchList))
+				return false;
+			meta = (RowCompressBatchMetadata *)
+				list_nth(scan->batchList, (int) batchIdx);
+			if (!RCBatchCanBePruned(scan, meta, td))
+				break;
+			scan->batchesPruned++;
+		}
 	}
 	else
 	{
-		/* Sequential mode: advance the list cursor */
-		if (scan->currentBatchCell == NULL)
-			return false;
-		meta = (RowCompressBatchMetadata *) lfirst(scan->currentBatchCell);
-		scan->currentBatchCell = lnext(scan->batchList, scan->currentBatchCell);
+		/* Sequential mode: advance list cursor, skipping prunable batches */
+		for (;;)
+		{
+			if (scan->currentBatchCell == NULL)
+				return false;
+			meta = (RowCompressBatchMetadata *) lfirst(scan->currentBatchCell);
+			scan->currentBatchCell = lnext(scan->batchList, scan->currentBatchCell);
+
+			if (!RCBatchCanBePruned(scan, meta, td))
+				break;
+			scan->batchesPruned++;
+		}
+
+		/* Async prefetch for the next (not-yet-decided) batch */
+		if (scan->currentBatchCell != NULL)
+		{
+			RowCompressBatchMetadata *nextMeta =
+				(RowCompressBatchMetadata *) lfirst(scan->currentBatchCell);
+			ColumnarStoragePrefetch(scan->rc_base.rs_rd,
+									nextMeta->fileOffset,
+									(uint64) nextMeta->dataLength);
+		}
 	}
 
 	if (!RCLoadBatch(scan, meta))
@@ -2570,6 +2897,7 @@ EState      *estate   = CreateExecutorState();
 ExprContext *econtext = GetPerTupleExprContext(estate);
 econtext->ecxt_scantuple = table_slot_create(relation, NULL);
 ExprState   *predicate   = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+(void) predicate; /* partial-index predicate filtering not yet implemented */
 
 TableScanDesc scan = table_beginscan_strat(relation, snapshot, 0, NULL, true, false);
 
@@ -2938,9 +3266,11 @@ static const TableAmRoutine rowcompress_methods = {
  *       table_name        regclass,
  *       batch_size        int  DEFAULT NULL,
  *       compression       name DEFAULT NULL,
- *       compression_level int  DEFAULT NULL)
+ *       compression_level int  DEFAULT NULL,
+ *       pruning_column    text DEFAULT NULL)
  *
  * Only non-NULL arguments are changed; the rest keep their current value.
+ * Pass pruning_column = '' (empty string) to disable pruning.
  */
 PG_FUNCTION_INFO_V1(alter_rowcompress_table_set);
 Datum
@@ -3014,6 +3344,57 @@ alter_rowcompress_table_set(PG_FUNCTION_ARGS)
 		}
 		ereport(DEBUG1, (errmsg("updating compression level to %d",
 								options.compressionLevel)));
+	}
+
+	/* pruning_column => not null */
+	if (!PG_ARGISNULL(4))
+	{
+		text *colNameText = PG_GETARG_TEXT_PP(4);
+		char *colNameStr  = text_to_cstring(colNameText);
+
+		if (colNameStr[0] == '\0')
+		{
+			/* Empty string = disable pruning */
+			options.pruningAttnum = 0;
+			ereport(DEBUG1, (errmsg("disabling rowcompress batch pruning")));
+		}
+		else
+		{
+			TupleDesc td = RelationGetDescr(rel);
+			int16     attno = 0;
+
+			for (int i = 0; i < td->natts; i++)
+			{
+				Form_pg_attribute a = TupleDescAttr(td, i);
+				if (!a->attisdropped &&
+					strcmp(NameStr(a->attname), colNameStr) == 0)
+				{
+					attno = a->attnum;
+					break;
+				}
+			}
+
+			if (attno == 0)
+				ereport(ERROR,
+						(errmsg("column \"%s\" does not exist in table \"%s\"",
+								colNameStr,
+								RelationGetRelationName(rel))));
+
+			/* Verify the type has a btree comparator */
+			Form_pg_attribute pattrForm = TupleDescAttr(td, attno - 1);
+			TypeCacheEntry *tc = lookup_type_cache(pattrForm->atttypid,
+												   TYPECACHE_CMP_PROC_FINFO);
+			if (!OidIsValid(tc->cmp_proc))
+				ereport(ERROR,
+						(errmsg("column \"%s\" has type %s which has no btree comparator",
+								colNameStr,
+								format_type_be(pattrForm->atttypid)),
+						 errhint("choose a column with a btree-comparable data type")));
+
+			options.pruningAttnum = attno;
+			ereport(DEBUG1, (errmsg("setting pruning column to \"%s\" (attnum %d)",
+									colNameStr, attno)));
+		}
 	}
 
 	RCSetOptions(relationId, &options);
@@ -3264,4 +3645,111 @@ RCObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 	/* Delete all batch rows for this storage and the options row */
 	RCDeleteBatches(storageId);
 	RCDeleteOptions(objectId, true);
+}
+
+/* ================================================================
+ * PUBLIC PRUNING / SCAN API (called from RowcompressScan custom node)
+ * ================================================================ */
+
+/*
+ * RowCompressGetPruningAttnum — return the 1-based pruning attnum configured
+ * for the given rowcompress relation, or 0 if pruning is not configured.
+ * Returns 0 when the options row does not exist or the extension is not
+ * initialised.
+ */
+int16
+RowCompressGetPruningAttnum(Oid relid)
+{
+	RowCompressOptions opts;
+	if (!RCReadOptions(relid, &opts))
+		return 0;
+	return opts.pruningAttnum;
+}
+
+/*
+ * rowcompress_set_pushdown_clauses — attach WHERE-clause pruning context to
+ * an open rowcompress scan.
+ *
+ * Called by RowcompressScan_BeginCustomScan after table_beginscan().  The
+ * clauses list should contain RestrictInfo-unwrapped Expr nodes (plain Expr
+ * pointers, not RestrictInfo wrappers).
+ *
+ * The function looks for the Var that references pruningAttnum and builds the
+ * (var >= min) AND (var <= max) template used by RCBatchCanBePruned.
+ */
+void
+rowcompress_set_pushdown_clauses(TableScanDesc sscan,
+								 List *clauses,
+								 TupleDesc tupdesc)
+{
+	RowCompressScanDesc *scan = (RowCompressScanDesc *) sscan;
+
+	scan->pruningCtx = NULL;
+
+	if (clauses == NIL || scan->options.pruningAttnum <= 0)
+		return;
+
+	int16 pattnum = scan->options.pruningAttnum;
+	if (pattnum > tupdesc->natts)
+		return;
+
+	Form_pg_attribute attrForm = TupleDescAttr(tupdesc, pattnum - 1);
+
+	/*
+	 * Find a Var in the clause list that references the pruning column.
+	 * We look for a Var at any level (pull_var_clause with default flags).
+	 */
+	Var *pruningVar = NULL;
+	ListCell *lc;
+	foreach(lc, clauses)
+	{
+		Node *clause = (Node *) lfirst(lc);
+		List *vars = pull_var_clause(clause,
+									 PVC_RECURSE_AGGREGATES |
+									 PVC_RECURSE_WINDOWFUNCS |
+									 PVC_INCLUDE_PLACEHOLDERS);
+		ListCell *vlc;
+		foreach(vlc, vars)
+		{
+			Var *v = (Var *) lfirst(vlc);
+			if (!IsA(v, Var))
+				continue;
+			if (v->varattno == pattnum)
+			{
+				pruningVar = copyObject(v);
+				break;
+			}
+		}
+		list_free(vars);
+		if (pruningVar != NULL)
+			break;
+	}
+
+	if (pruningVar == NULL)
+		return; /* pruning column not referenced in WHERE */
+
+	Node *baseConstraint = RCBuildBaseConstraint(pruningVar);
+	if (baseConstraint == NULL)
+		return; /* no btree opfamily for this type */
+
+	RCPruningCtx *ctx = palloc(sizeof(RCPruningCtx));
+	ctx->clauses         = clauses;
+	ctx->pruningAttnum   = pattnum;
+	ctx->pruningAttrForm = attrForm;
+	ctx->pruningVar      = pruningVar;
+	ctx->baseConstraint  = baseConstraint;
+
+	scan->pruningCtx    = ctx;
+	scan->batchesPruned = 0;
+}
+
+/*
+ * rowcompress_get_batches_pruned — return the number of batches skipped by
+ * the pruning optimisation during this scan (for EXPLAIN output).
+ */
+int64
+rowcompress_get_batches_pruned(TableScanDesc sscan)
+{
+	RowCompressScanDesc *scan = (RowCompressScanDesc *) sscan;
+	return scan->batchesPruned;
 }
