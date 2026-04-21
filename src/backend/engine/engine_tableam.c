@@ -826,16 +826,70 @@ engine_index_fetch_tuple(struct IndexFetchTableData *sscan,
 
 	StripeWriteStateEnum stripeWriteState = StripeWriteState(stripeMetadata);
 
-	if (stripeWriteState == STRIPE_WRITE_FLUSHED &&
-		!ColumnarReadRowByRowNumber(scan->cs_readState, rowNumber,
-									slot->tts_values, slot->tts_isnull))
+	if (stripeWriteState == STRIPE_WRITE_FLUSHED)
 	{
 		/*
-		 * FindStripeWithMatchingFirstRowNumber doesn't verify upper row
-		 * number boundary of found stripe. For this reason, we didn't
-		 * certainly know if given row number belongs to one of the stripes.
+		 * Fast path: check the in-memory row-mask write state first.
+		 *
+		 * engine_tuple_update() deletes the old row by calling UpdateRowMask()
+		 * (which sets the deleted bit in RowMaskWriteStateMap) and then calls
+		 * engine_tuple_insert() to place the new row at a fresh TID.  The
+		 * B-tree unique-constraint check subsequently calls us to verify
+		 * whether the old index entry (pointing at the now-deleted row) is
+		 * still alive.
+		 *
+		 * Problem: ColumnarReadRowByRowNumber() reads the deleted bit via
+		 * ReadChunkRowMask(), which uses the snapshot stored in cs_readState.
+		 * If that snapshot was taken before UpdateRowMask() wrote the bit to
+		 * engine.row_mask (which happens lazily at flush time), the MVCC read
+		 * returns the pre-deletion mask and the row appears alive, causing a
+		 * spurious duplicate-key error.
+		 *
+		 * Solution: consult RowMaskWriteStateMap directly (no snapshot
+		 * involved) before falling back to the full read path.  If the bit is
+		 * set here the row was deleted in the current (sub-)transaction and we
+		 * can return "not visible" immediately.
 		 */
-		return false;
+#if PG_VERSION_NUM >= PG_VERSION_16
+		RowMaskWriteStateEntry *deletedEntry =
+			RowMaskFindWriteState(columnarRelation->rd_locator.relNumber,
+								  GetCurrentSubTransactionId(), rowNumber);
+#else
+		RowMaskWriteStateEntry *deletedEntry =
+			RowMaskFindWriteState(columnarRelation->rd_node.relNode,
+								  GetCurrentSubTransactionId(), rowNumber);
+#endif
+		if (deletedEntry != NULL)
+		{
+			int64  offset  = (int64)(rowNumber - deletedEntry->startRowNumber);
+			int    maskBits = (int)(VARSIZE(deletedEntry->mask) - VARHDRSZ) * 8;
+
+			if (offset >= 0 && offset < maskBits &&
+				(VARDATA(deletedEntry->mask)[(int)(offset / 8)] &
+				 (1 << ((int)(offset % 8)))) != 0)
+			{
+				/*
+				 * Row was deleted in the current transaction.
+				 * Not a constraint conflict — the old index entry is dead.
+				 */
+				if (!scan->is_select_query)
+					pfree(stripeMetadata);
+				return false;
+			}
+		}
+
+		if (!ColumnarReadRowByRowNumber(scan->cs_readState, rowNumber,
+										slot->tts_values, slot->tts_isnull))
+		{
+			/*
+			 * FindStripeWithMatchingFirstRowNumber doesn't verify upper row
+			 * number boundary of found stripe. For this reason, we didn't
+			 * certainly know if given row number belongs to one of the stripes.
+			 */
+			if (!scan->is_select_query)
+				pfree(stripeMetadata);
+			return false;
+		}
 	}
 	else if (stripeWriteState == STRIPE_WRITE_ABORTED)
 	{
@@ -990,7 +1044,40 @@ engine_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 {
 	uint64 rowNumber = tid_to_row_number(slot->tts_tid);
 	StripeMetadata *stripeMetadata = FindStripeByRowNumber(rel, rowNumber, snapshot);
-	return stripeMetadata != NULL;
+	if (stripeMetadata == NULL)
+		return false;
+
+	/*
+	 * The stripe exists, but the row may have been deleted.  Check the
+	 * in-memory row-mask write state first (handles rows deleted in the
+	 * current transaction that have not yet been flushed to engine.row_mask),
+	 * then fall back to the on-disk deleted_rows count as a fast pre-check.
+	 */
+#if PG_VERSION_NUM >= PG_VERSION_16
+	RowMaskWriteStateEntry *rwse =
+		RowMaskFindWriteState(rel->rd_locator.relNumber,
+							  GetCurrentSubTransactionId(), rowNumber);
+#else
+	RowMaskWriteStateEntry *rwse =
+		RowMaskFindWriteState(rel->rd_node.relNode,
+							  GetCurrentSubTransactionId(), rowNumber);
+#endif
+	if (rwse != NULL)
+	{
+		int64 offset   = (int64)(rowNumber - rwse->startRowNumber);
+		int   maskBits = (int)(VARSIZE(rwse->mask) - VARHDRSZ) * 8;
+
+		if (offset >= 0 && offset < maskBits &&
+			(VARDATA(rwse->mask)[(int)(offset / 8)] &
+			 (1 << ((int)(offset % 8)))) != 0)
+		{
+			pfree(stripeMetadata);
+			return false;	/* deleted in current transaction */
+		}
+	}
+
+	pfree(stripeMetadata);
+	return true;
 }
 
 

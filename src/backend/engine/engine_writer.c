@@ -318,7 +318,25 @@ ColumnarWriteRowInternal(ColumnarWriteState *writeState, Datum *columnValues,
 		*/
 		bool fits = true;
 
-		for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+		/*
+		 * Memory-based flush guard: if the stripe write context has grown
+		 * beyond 256 MB (e.g. many large XML/JSON rows in a single UPDATE
+		 * batch), flush the current stripe before adding the next row.
+		 * This prevents OOM in engine_tuple_update() when stripe_row_count
+		 * is large but individual rows carry heavy VARLENA columns.
+		 *
+		 * The threshold is intentionally generous (256 MB) so that normal
+		 * bulk-insert workloads are unaffected; only pathological row sizes
+		 * trigger an early flush.
+		 */
+#define SE_MAX_STRIPE_MEM_BYTES (256ULL * 1024 * 1024)
+		if (MemoryContextMemAllocated(writeState->stripeWriteContext, false) >
+			SE_MAX_STRIPE_MEM_BYTES)
+		{
+			fits = false;
+		}
+
+		for (columnIndex = 0; columnIndex < columnCount && fits; columnIndex++)
 		{
 
 			/* Check for nulls, skip if null. */
