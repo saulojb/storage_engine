@@ -582,41 +582,26 @@ CREATE OR REPLACE PROCEDURE engine.colcompress_bulk_update(
     LANGUAGE plpgsql
 AS $$
 -- -----------------------------------------------------------------------
--- skip_columns — performance optimization for large/blob columns.
+-- skip_columns: columns excluded from Phase 1 snapshot.
+-- They are buffered per-batch in a TEMP TABLE ON COMMIT DROP during
+-- Phase 3, allowing DELETE-before-INSERT without losing blob data.
+-- Each batch decompresses only batch_size rows of blobs at a time.
+-- Keep batch_size small for blob-heavy tables (e.g. 5000).
 --
--- When the colcompress table is the sole copy of the data (no heap source),
--- Phase 1 must decompress and materialize ALL matching rows into the
--- snapshot heap, including large columns (bytea, text blobs, jsonb).
--- This can be extremely expensive (hundreds of MB of WAL + heap I/O).
---
--- Solution: pass the names of columns that will NOT be changed by
--- set_clause as skip_columns.  The procedure will:
---   • Exclude them from the heap snapshot (Phase 1 becomes tiny and fast).
---   • Read them directly from colcompress in Phase 3 via a ctid-range JOIN,
---     taking advantage of sequential stripe access (no random decompression).
---
--- Example:
---   CALL engine.colcompress_bulk_update(
---       'adm.documentos_recebidos',
---       'rec_version = rec_version + 1',
---       'documento = ''CTe''',
---       50000,
---       ARRAY['xml_original', 'json_dados', 'pdf']
---   );
---
--- Safety: columns listed in skip_columns MUST NOT appear in set_clause.
+-- Safety: columns in skip_columns MUST NOT appear in set_clause.
 -- -----------------------------------------------------------------------
 DECLARE
     _nspname           text;
     _relname           text;
-    _qualname          text;          -- schema-qualified target (quoted)
-    _heapfull          text;          -- schema-qualified snapshot heap (quoted)
-    _metafull          text;          -- schema-qualified stripe-progress table (quoted)
-    _heaprelname       text;          -- unqualified heap name
-    _metarelname       text;          -- unqualified meta name
-    _collist           text;          -- all columns (INSERT target)
-    _small_collist     text;          -- columns to snapshot (excludes skip_columns)
-    _mixed_select_list text;          -- Phase 3 INSERT SELECT: h.<col> or c.<col>
+    _qualname          text;
+    _heapfull          text;
+    _metafull          text;
+    _heaprelname       text;
+    _metarelname       text;
+    _collist           text;
+    _small_collist     text;
+    _blob_collist      text;
+    _mixed_select_list text;
     _has_skip          boolean;
     _storage_id        bigint;
     _total_rows        bigint;
@@ -648,15 +633,15 @@ BEGIN
     _metafull    := quote_ident(_nspname) || '.' || quote_ident(_metarelname);
     _storage_id  := engine.colcompress_relation_storageid(table_name);
 
-    -- Full column list (INSERT target, preserves attribute order)
     SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum)
       INTO _collist
       FROM pg_attribute
      WHERE attrelid = table_name AND attnum > 0 AND NOT attisdropped;
 
     -- ----------------------------------------------------------------
-    -- Detect resume: if the snapshot heap exists, a previous run was
-    -- interrupted.  Auto-detect skip_columns from heap structure.
+    -- Detect resume from a previous interrupted run.
+    -- Auto-detect skip_columns from heap structure (columns present in
+    -- the original table but absent from the snapshot heap were skipped).
     -- ----------------------------------------------------------------
     IF EXISTS (
         SELECT 1 FROM pg_class c
@@ -666,8 +651,6 @@ BEGIN
     ) THEN
         _resuming := true;
 
-        -- Any column present in the original table but absent from the
-        -- snapshot heap was excluded via skip_columns in the original run.
         SELECT COALESCE(array_agg(a.attname ORDER BY a.attnum), ARRAY[]::text[])
           INTO _detected_skip
           FROM pg_attribute a
@@ -695,29 +678,32 @@ BEGIN
 
     _has_skip := skip_columns IS NOT NULL AND array_length(skip_columns, 1) > 0;
 
-    -- Validate: skip_columns must not be referenced by set_clause
     IF _has_skip AND EXISTS (
         SELECT 1 FROM unnest(skip_columns) AS sc
          WHERE position(lower(sc) IN lower(set_clause)) > 0
     ) THEN
         RAISE EXCEPTION
-            'bulk_update: a column listed in skip_columns appears in set_clause — '
-            'skip_columns must only contain columns that are NOT modified';
+            'bulk_update: a column listed in skip_columns appears in set_clause';
     END IF;
 
-    -- Heap snapshot columns: all columns except skip_columns
+    -- Heap snapshot columns (excludes skip_columns)
     SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum)
       INTO _small_collist
       FROM pg_attribute
      WHERE attrelid = table_name AND attnum > 0 AND NOT attisdropped
        AND (NOT _has_skip OR NOT attname = ANY(skip_columns));
 
-    -- Phase 3 INSERT SELECT list:
-    --   skip_columns  → 'c.<col>'  read from colcompress (sequential range scan)
-    --   other columns → 'h.<col>'  read from heap (already modified by set_clause)
+    -- Blob column list for per-batch temp table
+    IF _has_skip THEN
+        SELECT string_agg(quote_ident(col), ', ')
+          INTO _blob_collist
+          FROM unnest(skip_columns) AS col;
+    END IF;
+
+    -- Phase 3 SELECT list: 't.<col>' for skip_columns (temp), 'h.<col>' for others (heap)
     SELECT string_agg(
                CASE WHEN _has_skip AND attname = ANY(skip_columns)
-                    THEN 'c.' || quote_ident(attname)
+                    THEN 't.' || quote_ident(attname)
                     ELSE 'h.' || quote_ident(attname)
                END,
                ', ' ORDER BY attnum
@@ -729,13 +715,8 @@ BEGIN
     IF NOT _resuming THEN
         -- ----------------------------------------------------------------
         -- Phase 1 — Snapshot.
-        --
         -- _se_bulkm_<oid>: stripe-progress table with ORIGINAL stripe layout.
-        -- _se_bulk_<oid>:  snapshot heap containing matching rows.
-        --   With skip_columns: only small/modified columns are stored here;
-        --   blob columns stay in colcompress and are read in Phase 3 via JOIN.
-        --   Without skip_columns: all columns stored (original behavior).
-        --
+        -- _se_bulk_<oid>:  snapshot heap (all cols, or minus skip_columns).
         -- After COMMIT: colcompress untouched; crash here loses nothing.
         -- ----------------------------------------------------------------
         EXECUTE format(
@@ -767,7 +748,6 @@ BEGIN
             _metafull
         ) USING _storage_id;
 
-        -- Snapshot only _small_collist (omits skip_columns when specified)
         EXECUTE format(
             'CREATE TABLE %s AS SELECT ctid AS _se_old_ctid, %s FROM %s%s',
             _heapfull, _small_collist, _qualname,
@@ -791,9 +771,6 @@ BEGIN
 
     END IF;
 
-    -- ----------------------------------------------------------------
-    -- Count total and pending stripes.
-    -- ----------------------------------------------------------------
     EXECUTE format(
         'SELECT count(*), count(*) FILTER (WHERE NOT done) FROM %s',
         _metafull
@@ -807,28 +784,33 @@ BEGIN
         CASE WHEN _resuming THEN ' (resuming)' ELSE '' END;
 
     -- ----------------------------------------------------------------
-    -- Phase 3 — Batched INSERT + DELETE + mark-done (crash-safe).
+    -- Phase 3 — Batched DELETE-then-INSERT + mark-done (crash-safe).
     --
-    -- Order: INSERT first, then DELETE — both in the same transaction.
+    -- WITHOUT skip_columns:
+    --   a. DELETE old rows by ctid (no blob decompression).
+    --   b. INSERT from heap (all columns present).
+    --   c. UPDATE meta SET done=true.
+    --   COMMIT.
     --
-    -- With skip_columns:
-    --   INSERT joins the heap (small/modified cols) with the ORIGINAL
-    --   colcompress rows (blob cols) using their ctid range.  The old
-    --   rows are still present when INSERT runs (same transaction), so
-    --   the JOIN finds them via a sequential stripe range scan — the most
-    --   efficient access pattern for column-oriented storage.
-    --   DELETE then removes the old rows by ctid in the same transaction.
+    -- WITH skip_columns:
+    --   0. CREATE TEMP TABLE _se_blobs_tmp ON COMMIT DROP AS
+    --        SELECT ctid AS _se_ctid, <skip_cols> FROM colcompress
+    --        WHERE ctid BETWEEN $1 AND $2.
+    --      Only batch_size rows buffered — bounded memory cost.
+    --      ON COMMIT DROP: destroyed automatically at COMMIT (and on crash).
+    --   a. DELETE old rows by ctid (blobs safe in temp table).
+    --   b. INSERT joining heap (small/modified cols) with temp (blob cols).
+    --   c. UPDATE meta SET done=true.
+    --   COMMIT — ON COMMIT DROP destroys _se_blobs_tmp.
     --
-    -- Without skip_columns:
-    --   INSERT reads all columns directly from the heap (original behavior).
-    --   DELETE removes old rows by ctid.
+    -- Why DELETE-before-INSERT (not INSERT-before-DELETE):
+    --   INSERT-first causes duplicate key violations when the table has
+    --   unique constraints: the old rows are still visible in the same
+    --   transaction.  DELETE-first avoids this entirely.
     --
-    -- Crash safety: a server kill during the transaction rolls back both
-    -- INSERT and DELETE atomically.  On re-run done = false → batch is
-    -- retried from scratch.  No data loss is possible under any scenario.
-    --
-    -- Performance: larger batch_size → fewer commits, larger INSERT
-    -- batches, fuller colcompress stripes, better compression.
+    -- Crash safety: a server kill rolls back DELETE+INSERT+done atomically.
+    --   Temp table is never durable — vanishes on crash.  On re-run,
+    --   done=false -> batch retried from scratch.  No data loss possible.
     -- ----------------------------------------------------------------
     LOOP
         EXECUTE format(
@@ -850,30 +832,18 @@ BEGIN
         _tid_min := engine.row_number_to_tid(_batch_first_rn);
         _tid_max := engine.row_number_to_tid(_batch_last_rn);
 
-        -- a. INSERT new rows first (old rows still visible in this txn).
+        -- 0. With skip_columns: buffer blob cols for this batch into a temp table.
+        --    ON COMMIT DROP ensures automatic cleanup at COMMIT (and on crash).
         IF _has_skip THEN
-            -- Read blob cols from colcompress via sequential ctid range scan;
-            -- read small/modified cols from the (tiny) heap.
             EXECUTE format(
-                'INSERT INTO %s (%s)'
-                ' SELECT %s'
-                ' FROM %s c JOIN %s h ON h._se_old_ctid = c.ctid'
-                ' WHERE c.ctid BETWEEN $1 AND $2',
-                _qualname, _collist, _mixed_select_list,
-                _qualname, _heapfull
-            ) USING _tid_min, _tid_max;
-        ELSE
-            -- No skip_columns: read everything from heap (original behavior).
-            EXECUTE format(
-                'INSERT INTO %s (%s) SELECT %s FROM %s'
-                ' WHERE _se_old_ctid BETWEEN $1 AND $2',
-                _qualname, _collist, _collist, _heapfull
+                'CREATE TEMP TABLE _se_blobs_tmp ON COMMIT DROP AS'
+                ' SELECT ctid AS _se_ctid, %s FROM %s'
+                ' WHERE ctid BETWEEN $1 AND $2',
+                _blob_collist, _qualname
             ) USING _tid_min, _tid_max;
         END IF;
-        GET DIAGNOSTICS _n = ROW_COUNT;
-        _ins_total := _ins_total + _n;
 
-        -- b. DELETE old rows (ctid lookup — no decompression of blob cols).
+        -- a. DELETE old rows by ctid (no blob decompression needed).
         EXECUTE format(
             'DELETE FROM %s WHERE ctid = ANY('
             '  ARRAY(SELECT _se_old_ctid FROM %s'
@@ -883,23 +853,43 @@ BEGIN
         GET DIAGNOSTICS _n = ROW_COUNT;
         _del_total := _del_total + _n;
 
+        -- b. INSERT updated rows into colcompress.
+        IF _has_skip THEN
+            -- Join heap (small/modified cols) with temp table (blob cols).
+            EXECUTE format(
+                'INSERT INTO %s (%s)'
+                ' SELECT %s'
+                ' FROM %s h JOIN _se_blobs_tmp t ON t._se_ctid = h._se_old_ctid'
+                ' WHERE h._se_old_ctid BETWEEN $1 AND $2',
+                _qualname, _collist, _mixed_select_list, _heapfull
+            ) USING _tid_min, _tid_max;
+        ELSE
+            EXECUTE format(
+                'INSERT INTO %s (%s) SELECT %s FROM %s'
+                ' WHERE _se_old_ctid BETWEEN $1 AND $2',
+                _qualname, _collist, _collist, _heapfull
+            ) USING _tid_min, _tid_max;
+        END IF;
+        GET DIAGNOSTICS _n = ROW_COUNT;
+        _ins_total := _ins_total + _n;
+
         -- c. Mark entire batch as done — atomic with a and b.
         EXECUTE format(
             'UPDATE %s SET done = true WHERE stripe_idx BETWEEN $1 AND $2',
             _metafull
         ) USING _batch_stripe_lo, _batch_stripe_hi;
 
-        COMMIT;  -- INSERT + DELETE + done=true are durable together
+        COMMIT;  -- DELETE + INSERT + done=true; ON COMMIT DROP fires here
 
         _done_count := _done_count + _batch_count;
         RAISE NOTICE
             'bulk_update: stripes %–% done (%/% total) — % rows inserted (running: %)',
             _batch_stripe_lo, _batch_stripe_hi,
-            _done_count, _total_stripes, _ins_total - _del_total + _n, _ins_total;
+            _done_count, _total_stripes, _n, _ins_total;
     END LOOP;
 
     -- ----------------------------------------------------------------
-    -- Phase 4 — Cleanup: drop both helper tables.
+    -- Phase 4 — Cleanup.
     -- ----------------------------------------------------------------
     EXECUTE format('DROP TABLE %s', _heapfull);
     EXECUTE format('DROP TABLE %s', _metafull);
@@ -913,7 +903,8 @@ END;
 $$;
 
 COMMENT ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, integer, text[])
-IS 'Memory-safe, crash-safe bulk UPDATE for colcompress tables. Records the original stripe layout in a progress table (_se_bulkm_<oid>) and snapshots matching rows to a WAL-protected heap (_se_bulk_<oid>). With skip_columns, large/blob columns are excluded from the snapshot (Phase 1 is tiny and fast) and read directly from colcompress via a sequential ctid-range JOIN during Phase 3 INSERT. Each batch atomically INSERTs new rows, DELETEs old rows, and marks done=true in the same transaction. A server crash rolls back the entire batch; re-running CALL resumes from the first undone stripe. No data loss is possible under any crash scenario. Must be called with CALL. Run REINDEX TABLE CONCURRENTLY after completion.';
+IS 'Memory-safe, crash-safe bulk UPDATE for colcompress tables. Snapshots matching rows (minus skip_columns) to a WAL-protected heap. With skip_columns, blob columns are excluded from Phase 1 (tiny snapshot) and buffered per-batch in a TEMP TABLE ON COMMIT DROP during Phase 3, keeping peak memory proportional to batch_size. Phase 3 order: buffer blobs -> DELETE old rows -> INSERT (heap + temp) -> mark done=true -> COMMIT (temp auto-destroyed). A server crash rolls back the entire batch; re-running CALL resumes from the first undone stripe. No data loss possible. Use smaller batch_size with skip_columns for large-blob tables. Run REINDEX TABLE CONCURRENTLY after completion.';
 
 GRANT EXECUTE ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, integer, text[]) TO PUBLIC;
+
 
