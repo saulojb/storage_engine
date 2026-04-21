@@ -426,7 +426,6 @@ sudo dnf install -y gcc make libcurl-devel lz4-devel libzstd-devel postgresql18-
 > `postgresql17-devel` on RPM-based distributions).
 
 ```bash
-./configure
 sudo make -j$(nproc) install
 ```
 

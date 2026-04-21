@@ -1,0 +1,21 @@
+# Makefile.global for storage_engine
+# Portable replacement for the autoconf-generated Makefile.global.
+# No ./configure needed — uses PG_CONFIG from PATH or environment.
+#
+# Override pg_config if needed:
+#   PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config sudo make install
+
+PG_CONFIG ?= pg_config
+
+citus_abs_top_srcdir := $(abspath $(citus_top_builddir))
+citus_abs_srcdir     := $(citus_abs_top_srcdir)/$(citus_subdir)
+
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+
+vpath_build      := no
+citus_top_srcdir := $(citus_top_builddir)
+
+USE_PGXS = 1
+include $(PGXS)
+
+override CPPFLAGS := -I'$(citus_abs_top_srcdir)/src/include' $(CPPFLAGS)

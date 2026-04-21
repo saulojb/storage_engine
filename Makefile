@@ -1,54 +1,14 @@
-# Citus toplevel Makefile
+# storage_engine toplevel Makefile
+# Build:   sudo make -j$(nproc) install
+# Custom:  PG_CONFIG=/path/to/pg_config sudo make install
 
-# Hint that configure should be run first
-ifeq (,$(wildcard Makefile.global))
-  $(error ./configure needs to be run before compiling Citus)
+PG_CONFIG ?= pg_config
+
+ifeq (,$(shell $(PG_CONFIG) --version 2>/dev/null))
+  $(error pg_config not found in PATH. Install postgresql-server-dev-XX or set PG_CONFIG=/path/to/pg_config)
 endif
 
-include Makefile.global
+all install clean:
+	$(MAKE) -C src/backend/engine $@ PG_CONFIG='$(PG_CONFIG)'
 
-citus_subdir = .
-citus_top_builddir = .
-extension_dir = $(shell $(PG_CONFIG) --sharedir)/extension
-
-all: extension
-
-# build extension
-extension: $(citus_top_builddir)/src/include/citus_version.h
-	$(MAKE) -C src/backend/engine all
-	
-install-extension: extension
-	$(MAKE) -C src/backend/engine install
-
-install-headers: extension
-	@mkdir -p '$(DESTDIR)$(includedir_server)'
-	$(INSTALL_DATA) $(citus_top_builddir)/src/include/citus_version.h '$(DESTDIR)$(includedir_server)/'
-
-clean-extension:
-	$(MAKE) -C src/backend/engine/ clean
-
-.PHONY: extension install-extension clean-extension
-
-# Add to generic targets
-install: install-extension install-headers
-
-install-all: install-headers
-	$(MAKE) -C src/backend/engine/ install-all
-
-clean: clean-extension clean-regression
-
-# apply or check style
-reindent:
-	${citus_abs_top_srcdir}/ci/fix_style.sh
-
-.PHONY: reindent
-
-check: all install-all check-all
-
-check-all:
-	$(MAKE) -C src/test/regress check-all
-
-clean-regression:
-	$(MAKE) -C src/test/regress clean-regression
-
-.PHONY: all check clean install install-all
+.PHONY: all install clean
