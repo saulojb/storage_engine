@@ -1,5 +1,44 @@
 # CHANGELOG
 
+## 1.0.9
+
+* docs: **pg_search 0.23 (ParadeDB) compatibility** — colcompress tables are fully
+  compatible with pg_search BM25 full-text search. The BM25 index (`CREATE INDEX
+  USING bm25`) works transparently via `index_fetch_tuple`; `@@@`, `===`,
+  `pdb.score()`, and `pdb.snippet()` all function correctly. To avoid
+  `ColcompressScan` intercepting the planner before pg_search's `ParadeDB Base Scan`
+  path is selected, use `SET storage_engine.enable_custom_scan = false` for queries
+  that use `@@@`. A future release will auto-detect the `@@@` operator in
+  `ColumnarSetRelPathlistHook` and skip the hook transparently.
+* docs: **native regex alternative to BM25 for analytics** — `~*` (POSIX
+  case-insensitive regex) on colcompress tables uses `ColcompressScan` with full
+  parallelism and stripe-level projection pushdown, achieving the same recall as
+  BM25 at 3× lower latency (60 ms vs ~200 ms for 150k rows, 8 parallel workers).
+  Prefer `~*` over `@@@` for counter/aggregation patterns; reserve BM25 for ranked
+  retrieval and fuzzy matching.
+* bench: updated serial and parallel benchmark results; added baseline CSV for
+  regression tracking.
+
+## 1.0.8
+
+* fix: **`UPDATE` duplicate-key error on colcompress tables with unique indexes** —
+  `engine_index_fetch_tuple` now consults the in-memory `RowMaskWriteStateMap`
+  bitmask before falling back to `ColumnarReadRowByRowNumber` for flushed stripes.
+  Previously, `engine_tuple_update()` marked the old row deleted (via `UpdateRowMask`)
+  and immediately inserted the new version; the unique-constraint recheck via
+  `index_fetch_tuple` read a stale pre-deletion snapshot from the B-tree entry's old
+  TID and returned "tuple still alive", causing a spurious duplicate-key error on
+  every `UPDATE`.
+* fix: **deleted rows visible within same command** — `engine_tuple_satisfies_snapshot`
+  now also consults `RowMaskWriteStateMap`, so rows deleted within the current
+  transaction are correctly reported as invisible during the same command, preventing
+  false positives in constraint checks.
+* fix: **OOM crash in `engine_tuple_update` with large VARLENA columns** —
+  `ColumnarWriteRowInternal` adds a memory-based flush guard: if the
+  `stripeWriteContext` exceeds 256 MB (`SE_MAX_STRIPE_MEM_BYTES`), the current stripe
+  is flushed before buffering the next row. This prevents OOM crashes when stripe
+  row-count limits are generous but rows carry large VARLENA columns (XML, JSON, PDF).
+
 ## 1.0.7
 
 * fix: **GIN `BitmapHeapScan` bypasses `ColcompressScan` with `random_page_cost=1.1`**
