@@ -526,10 +526,22 @@ RemovePathsByPredicate(RelOptInfo *rel, PathPredicate removePathPredicate)
  * IsNotIndexPath returns true if given path is not an IndexPath or a
  * BitmapHeapPath.  We keep both so that the planner can consider GIN/GiST
  * bitmap index scans alongside plain IndexScans and ColumnarScanPaths.
+ *
+ * We also preserve CustomPath nodes from pg_search (ParadeDB Base Scan) so
+ * that BM25 full-text search via the @@@ operator works transparently on
+ * colcompress tables without requiring enable_custom_scan = false.
  */
 static bool
 IsNotIndexPath(Path *path)
 {
+	if (IsA(path, CustomPath))
+	{
+		CustomPath *cp = (CustomPath *) path;
+
+		if (strcmp(cp->methods->CustomName, "ParadeDB Base Scan") == 0)
+			return false;	/* preserve — let pg_search win */
+	}
+
 	return !IsA(path, IndexPath) && !IsA(path, BitmapHeapPath);
 }
 
