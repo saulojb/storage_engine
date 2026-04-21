@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## 1.1.1
+
+* fix: **remove Citus autoconf build artifacts** — the root `Makefile` was the
+  Citus 11.1devel toplevel Makefile and required `./configure` (a Citus-specific
+  autoconf script) to be run before any build could proceed. This caused
+  `configure: error: C compiler cannot create executables` and other
+  Citus-specific probe failures for users with non-standard toolchains (ccache
+  without a backing compiler, aarch64/ARM Linux, NixOS, etc.).
+  The root `Makefile` is now a simple delegator to `src/backend/engine`.
+  A portable, pre-generated `Makefile.global` is now tracked in the repository
+  and uses `pg_config` from `PATH` — no `./configure` step is needed.
+  The six Citus autoconf artifacts (`configure`, `configure.in`, `autogen.sh`,
+  `aclocal.m4`, `Makefile.global.in`, `src/include/citus_config.h.in`) are
+  removed from the repository.
+  Build is now simply:
+  ```bash
+  sudo make -j$(nproc) install
+  # or with an explicit pg_config:
+  PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config sudo make install
+  ```
+
 ## 1.1.0
 
 * feat: **`RowcompressScan` custom scan node with batch-level min/max pruning** —
