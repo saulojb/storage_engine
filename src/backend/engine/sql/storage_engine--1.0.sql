@@ -620,7 +620,19 @@ DECLARE
     _tid_max           tid;
     _resuming          boolean := false;
     _detected_skip     text[];
+    _saved_timeout     text;
+    _saved_lock_timeout text;
 BEGIN
+    -- Disable statement_timeout and lock_timeout for the duration of this
+    -- maintenance procedure.  Long-running batches (large blobs, many rows)
+    -- would otherwise be cancelled by the server's configured timeouts.
+    -- Both are restored at the end (and on any error, the session ends or
+    -- the caller can reconnect — no permanent side-effect).
+    _saved_timeout      := current_setting('statement_timeout');
+    _saved_lock_timeout := current_setting('lock_timeout');
+    PERFORM set_config('statement_timeout', '0', false);
+    PERFORM set_config('lock_timeout',      '0', false);
+
     SELECT n.nspname, c.relname
       INTO _nspname, _relname
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -893,6 +905,9 @@ BEGIN
     -- ----------------------------------------------------------------
     EXECUTE format('DROP TABLE %s', _heapfull);
     EXECUTE format('DROP TABLE %s', _metafull);
+    -- Restore timeouts before final COMMIT so the session is clean.
+    PERFORM set_config('statement_timeout', _saved_timeout,      false);
+    PERFORM set_config('lock_timeout',      _saved_lock_timeout, false);
     COMMIT;
     RAISE NOTICE
         E'bulk_update: complete — % rows updated in %s.\n'
