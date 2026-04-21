@@ -577,7 +577,7 @@ CREATE OR REPLACE PROCEDURE engine.colcompress_bulk_update(
     table_name   regclass,
     set_clause   text,
     where_clause text    DEFAULT NULL,
-    batch_size   integer DEFAULT 5000)
+    batch_size   integer DEFAULT 50000)
     LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -592,18 +592,20 @@ DECLARE
     _storage_id  bigint;
     _total_rows  bigint;
     _n           bigint;
-    _del_total   bigint  := 0;
-    _ins_total   bigint  := 0;
-    -- Stripe layout is persisted in _se_bulkm_<oid> and loaded into
-    -- local arrays after Phase 1 / on resume.  Local arrays survive COMMITs.
-    _first_rns   bigint[];
-    _row_counts  bigint[];
-    _nstripes    int;
-    _i           int;
-    _tid_min     tid;
-    _tid_max     tid;
-    _resuming    boolean := false;
-    _is_done     boolean;
+    _del_total       bigint  := 0;
+    _ins_total       bigint  := 0;
+    -- Batch processing state for Phase 3
+    _total_stripes   int;
+    _nstripes        int;    -- pending (not done) stripe count
+    _done_count      int     := 0;
+    _batch_stripe_lo int;    -- first stripe_idx in current batch
+    _batch_stripe_hi int;    -- last  stripe_idx in current batch
+    _batch_first_rn  bigint; -- first_rn of the first stripe in batch
+    _batch_last_rn   bigint; -- last row number of the last stripe in batch
+    _batch_count     bigint; -- number of stripes collected for this batch
+    _tid_min         tid;
+    _tid_max         tid;
+    _resuming        boolean := false;
 BEGIN
     SELECT n.nspname, c.relname
       INTO _nspname, _relname
@@ -666,11 +668,11 @@ BEGIN
 
         -- Pre-check: skip all table creation if WHERE clause matches 0 rows.
         EXECUTE format(
-            'SELECT EXISTS(SELECT 1 FROM %s%s)',
+            'SELECT CASE WHEN EXISTS(SELECT 1 FROM %s%s) THEN 1 ELSE 0 END',
             _qualname,
             CASE WHEN where_clause IS NOT NULL
                  THEN ' WHERE ' || where_clause ELSE '' END
-        ) INTO _total_rows;  -- reusing variable; 1 = has rows, 0 = empty
+        ) INTO _total_rows;
 
         IF _total_rows = 0 THEN
             RAISE NOTICE 'bulk_update: 0 rows match WHERE clause — nothing to do';
@@ -719,65 +721,75 @@ BEGIN
     END IF;  -- end of fresh-run-only phases
 
     -- ----------------------------------------------------------------
-    -- Load stripe layout from the meta table.
-    -- Works for both fresh runs (just created) and resumed runs
-    -- (meta table survived the crash with partial done=true state).
+    -- Count total and pending stripes.
     -- ----------------------------------------------------------------
     EXECUTE format(
-        'SELECT array_agg(first_rn  ORDER BY stripe_idx),'
-        '       array_agg(row_count ORDER BY stripe_idx),'
-        '       count(*)'
-        ' FROM %s',
+        'SELECT count(*), count(*) FILTER (WHERE NOT done) FROM %s',
         _metafull
-    ) INTO _first_rns, _row_counts, _nstripes;
+    ) INTO _total_stripes, _nstripes;
 
-    _nstripes := COALESCE(_nstripes, 0);
+    _total_stripes := COALESCE(_total_stripes, 0);
+    _nstripes      := COALESCE(_nstripes, 0);
 
-    RAISE NOTICE 'bulk_update: % total stripe(s) to process%',
-        _nstripes,
+    RAISE NOTICE 'bulk_update: % stripe(s) pending out of % total%',
+        _nstripes, _total_stripes,
         CASE WHEN _resuming THEN ' (resuming)' ELSE '' END;
 
     -- ----------------------------------------------------------------
-    -- Phase 3 — Stripe-by-stripe DELETE + INSERT + mark-done (all atomic).
+    -- Phase 3 — Batched DELETE + INSERT + mark-done (crash-safe).
     --
-    -- For each stripe in the meta table where done = false:
+    -- Each iteration collects consecutive undone stripes whose combined
+    -- row_count is approximately batch_size, then processes them in a
+    -- single transaction:
     --
-    --   a. DELETE old rows from colcompress using the ctid range.
-    --      The heap index on _se_old_ctid makes this O(stripe_rows).
-    --      No data columns are projected → no decompression.
+    --   a. DELETE old rows from colcompress by batch ctid range.
+    --      One ARRAY(SELECT _se_old_ctid …) covers all batch stripes.
     --
-    --   b. INSERT updated rows from heap → colcompress.
-    --      Creates exactly ONE new stripe per old stripe, with freshly
-    --      computed min/max per chunk group → efficient chunk pruning.
+    --   b. INSERT all updated heap rows in the range into colcompress.
+    --      A larger INSERT fills colcompress stripes more fully →
+    --      fewer stripes → better future scan performance and
+    --      compression ratio.
     --
-    --   c. UPDATE meta SET done = true  (in the same transaction as a+b).
+    --   c. UPDATE meta SET done = true for all stripes in the batch.
     --
     --   COMMIT — all three are durable together.
     --
-    -- Crash safety:
-    --   If the server is killed during this transaction, PostgreSQL rolls
-    --   back all three steps atomically.  The old rows return to their
-    --   stripe in colcompress.  On re-run, done = false → the stripe is
-    --   reprocessed correctly from scratch.  No data is ever lost.
+    -- Crash safety (identical guarantee to the stripe-by-stripe design):
+    --   A server kill mid-batch rolls back all three steps atomically.
+    --   On re-run the batch stripes all have done = false → reprocessed
+    --   correctly from scratch.  No data loss is possible.
+    --
+    -- Performance tuning:
+    --   Larger batch_size → fewer commits, larger INSERT batches, better
+    --   colcompress stripe packing.  Default 50 000 is a good starting
+    --   point; increase for tables with small rows or abundant RAM.
     -- ----------------------------------------------------------------
-    FOR _i IN 1 .. _nstripes LOOP
-
-        -- Resume: skip stripes already committed in a previous run.
+    LOOP
+        -- Collect the next batch: include consecutive undone stripes
+        -- while the cumulative row_count of *preceding* stripes is
+        -- < batch_size.  Guarantees at least one stripe per iteration
+        -- even when a single stripe exceeds batch_size.
         EXECUTE format(
-            'SELECT done FROM %s WHERE stripe_idx = $1',
+            'WITH cum AS ('
+            '  SELECT stripe_idx, first_rn, row_count,'
+            '         sum(row_count) OVER (ORDER BY stripe_idx) AS cumrows'
+            '  FROM %s WHERE NOT done'
+            ')'
+            ' SELECT min(stripe_idx), max(stripe_idx),'
+            '        min(first_rn), max(first_rn + row_count - 1),'
+            '        count(*)'
+            ' FROM cum WHERE cumrows - row_count < $1',
             _metafull
-        ) INTO _is_done USING _i;
+        ) INTO _batch_stripe_lo, _batch_stripe_hi,
+               _batch_first_rn,  _batch_last_rn,  _batch_count
+        USING batch_size;
 
-        IF _is_done THEN
-            RAISE NOTICE 'bulk_update: stripe %/% already done — skipping',
-                _i, _nstripes;
-            CONTINUE;
-        END IF;
+        EXIT WHEN _batch_stripe_lo IS NULL;
 
-        _tid_min := engine.row_number_to_tid(_first_rns[_i]);
-        _tid_max := engine.row_number_to_tid(_first_rns[_i] + _row_counts[_i] - 1);
+        _tid_min := engine.row_number_to_tid(_batch_first_rn);
+        _tid_max := engine.row_number_to_tid(_batch_last_rn);
 
-        -- a. Delete old rows (ctid lookup, no decompression).
+        -- a. Delete old rows from the batch ctid range (no decompression).
         EXECUTE format(
             'DELETE FROM %s WHERE ctid = ANY('
             '  ARRAY(SELECT _se_old_ctid FROM %s'
@@ -787,7 +799,7 @@ BEGIN
         GET DIAGNOSTICS _n = ROW_COUNT;
         _del_total := _del_total + _n;
 
-        -- b. Insert updated rows → 1 new colcompress stripe, fresh min/max.
+        -- b. Insert the batch from heap into colcompress (one large INSERT).
         EXECUTE format(
             'INSERT INTO %s (%s) SELECT %s FROM %s'
             ' WHERE _se_old_ctid BETWEEN $1 AND $2',
@@ -796,16 +808,20 @@ BEGIN
         GET DIAGNOSTICS _n = ROW_COUNT;
         _ins_total := _ins_total + _n;
 
-        -- c. Mark stripe as done — atomic with a and b.
+        -- c. Mark entire batch as done — atomic with a and b.
         EXECUTE format(
-            'UPDATE %s SET done = true WHERE stripe_idx = $1',
+            'UPDATE %s SET done = true'
+            ' WHERE stripe_idx BETWEEN $1 AND $2',
             _metafull
-        ) USING _i;
+        ) USING _batch_stripe_lo, _batch_stripe_hi;
 
         COMMIT;  -- DELETE + INSERT + done=true are durable together
 
-        RAISE NOTICE 'bulk_update: stripe %/% done — % rows (running total: %)',
-            _i, _nstripes, _n, _ins_total;
+        _done_count := _done_count + _batch_count;
+        RAISE NOTICE
+            'bulk_update: stripes %–% done (%/% total) — % rows inserted (running: %)',
+            _batch_stripe_lo, _batch_stripe_hi,
+            _done_count, _total_stripes, _n, _ins_total;
     END LOOP;
 
     -- ----------------------------------------------------------------
