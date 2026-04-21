@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 1.0.10
+
+* fix: **pg_search (ParadeDB) BM25 transparent compatibility** — `IsNotIndexPath` in
+  `engine_customscan.c` now preserves `CustomPath` nodes whose `CustomName` equals
+  `"ParadeDB Base Scan"`. Previously, `RemovePathsByPredicate(rel, IsNotIndexPath)`
+  discarded pg_search's planner path, causing the `@@@` operator to fall through as a
+  `Filter` inside `ColcompressScan`, which then failed with "Unsupported query shape".
+  BM25 full-text search on colcompress tables now works **transparently** — no need for
+  `SET storage_engine.enable_custom_scan = false`. `pdb.score()`, `pdb.snippet()`, `===`,
+  and multi-field `AND @@@` all work correctly. `ColcompressScan` continues to handle all
+  other query shapes (projection pushdown, stripe pruning, parallel scan) without change.
+
 ## 1.0.9
 
 * docs: **pg_search 0.23 (ParadeDB) compatibility** — colcompress tables are fully
