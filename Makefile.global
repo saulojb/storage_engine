@@ -19,3 +19,4 @@ USE_PGXS = 1
 include $(PGXS)
 
 override CPPFLAGS := -I'$(citus_abs_top_srcdir)/src/include' $(CPPFLAGS)
+override CFLAGS  += -Wno-declaration-after-statement

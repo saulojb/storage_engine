@@ -139,7 +139,6 @@ static Path * AddColumnarScanPath(PlannerInfo *root, RelOptInfo *rel,
 /* helper functions to be used when costing paths or altering them */
 static void RemovePathsByPredicate(RelOptInfo *rel, PathPredicate removePathPredicate);
 static bool IsNotIndexPath(Path *path);
-static bool IsIndexPath(Path *path);
 static bool IsRowCompressRangeIndexPath(Path *path);
 static Cost ColumnarIndexScanAdditionalCost(PlannerInfo *root, RelOptInfo *rel,
 											Oid relationId, IndexPath *indexPath);
@@ -609,18 +608,6 @@ IsNotIndexPath(Path *path)
 	}
 
 	return !IsA(path, IndexPath) && !IsA(path, BitmapHeapPath);
-}
-
-
-/*
- * IsIndexPath returns true if given path is a plain IndexPath (Index Scan).
- * This is used to prune regular index-scan paths for rowcompress tables where
- * a sequential scan is typically more efficient than a random-access index scan.
- */
-static bool
-IsIndexPath(Path *path)
-{
-	return IsA(path, IndexPath);
 }
 
 

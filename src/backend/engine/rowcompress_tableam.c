@@ -441,9 +441,6 @@ static void rowcompress_index_validate_scan(Relation relation, Relation indexRel
 											IndexInfo *indexInfo, Snapshot snapshot,
 											ValidateIndexState *validateIndexState);
 static bool rowcompress_relation_needs_toast_table(Relation rel);
-static void rowcompress_estimate_rel_size(Relation rel, int32 *attr_widths,
-										  BlockNumber *pages, double *tuples,
-										  double *allvisfrac);
 static bool rowcompress_scan_sample_next_block(TableScanDesc scan,
 											   SampleScanState *scanstate);
 static bool rowcompress_scan_sample_next_tuple(TableScanDesc scan,
@@ -636,34 +633,6 @@ RCGetBatches(uint64 storageId)
 	table_close(batchRel, AccessShareLock);
 
 	return batchList;
-}
-
-/*
- * RCFindBatchForRowNumber finds the batch that contains a given row number.
- * Returns NULL if not found.
- */
-static RowCompressBatchMetadata *
-RCFindBatchForRowNumber(uint64 storageId, uint64 rowNumber)
-{
-	List *batches = RCGetBatches(storageId);
-	ListCell *lc;
-
-	foreach(lc, batches)
-	{
-		RowCompressBatchMetadata *meta = (RowCompressBatchMetadata *) lfirst(lc);
-		if (rowNumber >= meta->firstRowNumber &&
-			rowNumber < meta->firstRowNumber + meta->rowCount)
-		{
-			/* Return a copy; caller frees the rest */
-			RowCompressBatchMetadata *result = palloc(sizeof(RowCompressBatchMetadata));
-			*result = *meta;
-			list_free_deep(batches);
-			return result;
-		}
-	}
-
-	list_free_deep(batches);
-	return NULL;
 }
 
 /*
@@ -2588,16 +2557,6 @@ rowcompress_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 		RCWriteStateContext = NULL;
 	}
 	RCWriteStateList = NIL;
-}
-
-static void
-rowcompress_relation_set_new_filenode_compat(Relation rel,
-  const RelFileLocator *newrnode,
-  char persistence,
-  TransactionId *freezeXid,
-  MultiXactId *minmulti)
-{
-rowcompress_relation_set_new_filenode(rel, newrnode, persistence, freezeXid, minmulti);
 }
 
 static bool
