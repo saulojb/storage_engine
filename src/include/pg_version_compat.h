@@ -38,6 +38,10 @@
 #define relNumber   relNode
 #define spcOid      spcNode
 #define dbOid       dbNode
+/* PG16 renamed RelFileNodeEquals → RelFileLocatorEquals */
+#define RelFileLocatorEquals(a, b) RelFileNodeEquals(a, b)
+/* PG16 renamed TableAmRoutine.relation_set_new_filenode → relation_set_new_filelocator */
+#define relation_set_new_filelocator relation_set_new_filenode
 #endif
 
 /*

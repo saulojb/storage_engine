@@ -301,8 +301,6 @@ static void RCInsertBatchMetadata(uint64 storageId, uint64 batchNum,
 								  uint64 fileOffset, uint64 dataLength,
 								  bytea *minValue, bytea *maxValue);
 static List *RCGetBatches(uint64 storageId);
-static RowCompressBatchMetadata *RCFindBatchForRowNumber(uint64 storageId,
-														  uint64 rowNumber);
 static RowCompressBatchMetadata *RCFindBatchInList(List *batches, uint64 rowNumber);
 static void RCMarkRowDeleted(uint64 storageId, uint64 batchNum, uint32 rowCount, uint32 rowOffset);
 static void RCDeleteBatches(uint64 storageId);
