@@ -156,8 +156,10 @@ static void AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel,
 /* hooks and callbacks */
 static void ColumnarSetRelPathlistHook(PlannerInfo *root, RelOptInfo *rel, Index rti,
 									   RangeTblEntry *rte);
+#if PG_VERSION_NUM < PG_VERSION_19
 static void ColumnarGetRelationInfoHook(PlannerInfo *root, Oid relationObjectId,
 										bool inhparent, RelOptInfo *rel);
+#endif
 
 static Plan * ColumnarScanPath_PlanCustomPath(PlannerInfo *root,
 											  RelOptInfo *rel,
@@ -223,7 +225,9 @@ static void RCScan_ExplainCustomScan(CustomScanState *node, List *ancestors,
 
 /* saved hook value in case of unload */
 static set_rel_pathlist_hook_type PreviousSetRelPathlistHook = NULL;
+#if PG_VERSION_NUM < PG_VERSION_19
 static get_relation_info_hook_type PreviousGetRelationInfoHook = NULL;
+#endif
 
 static bool EnableColumnarCustomScan = true;
 static bool EnableColumnarQualPushdown = true;
@@ -313,8 +317,10 @@ engine_customscan_init()
 	PreviousSetRelPathlistHook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = ColumnarSetRelPathlistHook;
 
+#if PG_VERSION_NUM < PG_VERSION_19
 	PreviousGetRelationInfoHook = get_relation_info_hook;
 	get_relation_info_hook = ColumnarGetRelationInfoHook;
+#endif
 
 	/* register customscan specific GUC's — skip if already defined */
 	if (GetConfigOption("storage_engine.enable_custom_scan", true, false) == NULL)
@@ -483,7 +489,8 @@ ColumnarSetRelPathlistHook(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		 *     directly to rel->pathlist (bypassing dominance checks) only
 		 *     when no Seq Scan is present.
 		 */
-		RemovePathsByPredicate(rel, IsRowCompressRangeIndexPath);
+		if (!RowCompressGetIndexScan(rte->relid))
+			RemovePathsByPredicate(rel, IsRowCompressRangeIndexPath);
 
 		/* Guarantee at least one Seq Scan path after the removal above */
 		bool hasSeqScan = false;
@@ -521,6 +528,7 @@ ColumnarSetRelPathlistHook(PlannerInfo *root, RelOptInfo *rel, Index rti,
 }
 
 
+#if PG_VERSION_NUM < PG_VERSION_19
 static void
 ColumnarGetRelationInfoHook(PlannerInfo *root, Oid relationObjectId,
 							bool inhparent, RelOptInfo *rel)
@@ -555,6 +563,7 @@ ColumnarGetRelationInfoHook(PlannerInfo *root, Oid relationObjectId,
 	 * and the table's own parallel_workers storage option.
 	 */
 }
+#endif /* PG_VERSION_NUM < PG_VERSION_19 */
 
 
 /*
@@ -609,6 +618,16 @@ IsNotIndexPath(Path *path)
 		if (strcmp(cp->methods->CustomName, "ParadeDB Base Scan") == 0)
 			return false;	/* preserve — let pg_search win */
 	}
+
+#if PG_VERSION_NUM >= PG_VERSION_19
+	/*
+	 * PG19 removed get_relation_info_hook, so we can no longer zero
+	 * canreturn early to suppress index-only scans.  Remove them here
+	 * instead: in PG19 an index-only scan path has pathtype T_IndexOnlyScan.
+	 */
+	if (IsA(path, IndexPath) && path->pathtype == T_IndexOnlyScan)
+		return true;
+#endif
 
 	return !IsA(path, IndexPath) && !IsA(path, BitmapHeapPath);
 }
@@ -3426,7 +3445,11 @@ RCScan_BeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 	state->snapshotRegisteredByUs = false;
 
 	/* Open the sequential scan */
+#if PG_VERSION_NUM >= PG_VERSION_19
+	state->scanDesc = table_beginscan(rel, state->snapshot, 0, NULL, 0);
+#else
 	state->scanDesc = table_beginscan(rel, state->snapshot, 0, NULL);
+#endif
 
 	/* Push WHERE clauses into the TAM for batch-level min/max pruning */
 	if (state->pushdownClauses != NIL)

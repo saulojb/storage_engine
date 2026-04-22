@@ -48,6 +48,8 @@ typedef struct RowCompressOptions
 	int             compressionLevel; /* compression level */
 	int16           pruningAttnum;    /* 1-based attnum for batch-level min/max pruning;
 	                                   * 0 means pruning disabled */
+	bool            indexScan;        /* true = allow index scans (OLTP mode);
+	                                   * false (default) = remove range index paths */
 } RowCompressOptions;
 
 /*
@@ -86,6 +88,7 @@ typedef struct RCPruningCtx
 extern void rowcompress_tableam_init(void);
 extern bool IsRowCompressTableAmTable(Oid relationId);
 extern int16 RowCompressGetPruningAttnum(Oid relid);
+extern bool  RowCompressGetIndexScan(Oid relid);
 
 /* Scan-level pruning API (used by RowcompressScan custom node) */
 extern void rowcompress_set_pushdown_clauses(TableScanDesc sscan,

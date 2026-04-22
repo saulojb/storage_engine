@@ -39,6 +39,9 @@
 #include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
+#if PG_VERSION_NUM >= PG_VERSION_19
+#include "utils/tuplesort.h"
+#endif
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/tidbitmap.h"
@@ -271,7 +274,8 @@ typedef struct IndexFetchRowCompressData
 #define Anum_rowcompress_options_compression       3
 #define Anum_rowcompress_options_compression_level 4
 #define Anum_rowcompress_options_pruning_attnum    5
-#define Natts_rowcompress_options                  5
+#define Anum_rowcompress_options_index_scan        6
+#define Natts_rowcompress_options                  6
 
 
 /* ================================================================
@@ -347,7 +351,11 @@ static bool rowcompress_getnextslot(TableScanDesc sscan, ScanDirection direction
 static Size rowcompress_parallelscan_estimate(Relation rel);
 static Size rowcompress_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan);
 static void rowcompress_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan);
-static IndexFetchTableData *rowcompress_index_fetch_begin(Relation rel);
+static IndexFetchTableData *rowcompress_index_fetch_begin(Relation rel
+#if PG_VERSION_NUM >= PG_VERSION_19
+								  , uint32 flags
+#endif
+								  );
 static void rowcompress_index_fetch_reset(IndexFetchTableData *scan);
 static void rowcompress_index_fetch_end(IndexFetchTableData *scan);
 static bool rowcompress_index_fetch_tuple(struct IndexFetchTableData *scan,
@@ -368,21 +376,49 @@ static TransactionId rowcompress_compute_xid_horizon_for_tuples(Relation rel,
 																 int nitems);
 #endif
 static void rowcompress_tuple_insert(Relation relation, TupleTableSlot *slot,
-									 CommandId cid, int options, BulkInsertState bistate);
+									 CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+									 uint32 options,
+#else
+									 int options,
+#endif
+									 BulkInsertState bistate);
 static void rowcompress_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
-												  CommandId cid, int options,
+												  CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+												  uint32 options,
+#else
+												  int options,
+#endif
 												  BulkInsertState bistate, uint32 specToken);
 static void rowcompress_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 												   uint32 specToken, bool succeeded);
 static void rowcompress_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
-									 CommandId cid, int options, BulkInsertState bistate);
+									 CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+									 uint32 options,
+#else
+									 int options,
+#endif
+									 BulkInsertState bistate);
 static TM_Result rowcompress_tuple_delete(Relation relation, ItemPointer tid,
-										  CommandId cid, Snapshot snapshot,
+										  CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+										  uint32 options,
+#endif
+										  Snapshot snapshot,
 										  Snapshot crosscheck, bool wait,
-										  TM_FailureData *tmfd, bool changingPart);
+										  TM_FailureData *tmfd
+#if PG_VERSION_NUM < PG_VERSION_19
+										  , bool changingPart
+#endif
+										  );
 #if PG_VERSION_NUM >= PG_VERSION_16
 static TM_Result rowcompress_tuple_update(Relation relation, ItemPointer otid,
 										  TupleTableSlot *slot, CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+										  uint32 options,
+#endif
 										  Snapshot snapshot, Snapshot crosscheck,
 										  bool wait, TM_FailureData *tmfd,
 										  LockTupleMode *lockmode,
@@ -399,7 +435,12 @@ static TM_Result rowcompress_tuple_lock(Relation relation, ItemPointer tid,
 										CommandId cid, LockTupleMode mode,
 										LockWaitPolicy wait_policy, uint8 flags,
 										TM_FailureData *tmfd);
-static void rowcompress_finish_bulk_insert(Relation relation, int options);
+static void rowcompress_finish_bulk_insert(Relation relation,
+#if PG_VERSION_NUM >= PG_VERSION_19
+								uint32 options);
+#else
+								int options);
+#endif
 static void rowcompress_relation_set_new_filenode(Relation rel,
 												  const RelFileLocator *newrnode,
 												  char persistence,
@@ -410,12 +451,20 @@ static void rowcompress_relation_copy_data(Relation rel, const RelFileLocator *n
 static void rowcompress_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 												  Relation OldIndex, bool use_sort,
 												  TransactionId OldestXmin,
+#if PG_VERSION_NUM >= PG_VERSION_19
+												  Snapshot snapshot,
+#endif
 												  TransactionId *xid_cutoff,
 												  MultiXactId *multi_cutoff,
 												  double *num_tuples,
 												  double *tups_vacuumed,
 												  double *tups_recently_dead);
-static void rowcompress_vacuum_rel(Relation rel, VacuumParams *params,
+static void rowcompress_vacuum_rel(Relation rel,
+#if PG_VERSION_NUM >= PG_VERSION_19
+								   const VacuumParams *params,
+#else
+								   VacuumParams *params,
+#endif
 								   BufferAccessStrategy bstrategy);
 #if PG_VERSION_NUM >= PG_VERSION_17
 static bool rowcompress_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream);
@@ -424,7 +473,9 @@ static bool rowcompress_scan_analyze_next_block(TableScanDesc scan, BlockNumber 
 												BufferAccessStrategy bstrategy);
 #endif
 static bool rowcompress_scan_analyze_next_tuple(TableScanDesc scan,
+#if PG_VERSION_NUM < PG_VERSION_19
 												TransactionId OldestXmin,
+#endif
 												double *liverows, double *deadrows,
 												TupleTableSlot *slot);
 static double rowcompress_index_build_range_scan(Relation relation, Relation indexRelation,
@@ -885,6 +936,7 @@ RCReadOptions(Oid relationId, RowCompressOptions *options)
 	options->batchSize        = ROWCOMPRESS_DEFAULT_BATCH_SIZE;
 	options->compression      = ROWCOMPRESS_DEFAULT_COMPRESSION;
 	options->compressionLevel = ROWCOMPRESS_DEFAULT_COMPRESSION_LEVEL;
+	options->indexScan        = false;
 
 	Oid optOid = RCOptionsRelationId();
 	if (!OidIsValid(optOid))
@@ -937,6 +989,16 @@ RCReadOptions(Oid relationId, RowCompressOptions *options)
 										 tupdesc, &isNull);
 			if (!isNull)
 				options->pruningAttnum = DatumGetInt16(paDatum);
+		}
+
+		/* Read index_scan (nullable bool, added in v1.2) */
+		options->indexScan = false;
+		if (tupdesc->natts >= Anum_rowcompress_options_index_scan)
+		{
+			Datum isDatum = heap_getattr(tup, Anum_rowcompress_options_index_scan,
+										 tupdesc, &isNull);
+			if (!isNull)
+				options->indexScan = DatumGetBool(isDatum);
 		}
 	}
 
@@ -1010,6 +1072,11 @@ RCSetOptions(Oid relationId, const RowCompressOptions *options)
 	else
 		nulls[Anum_rowcompress_options_pruning_attnum - 1]  = true;
 
+	if (options->indexScan)
+		values[Anum_rowcompress_options_index_scan - 1] = BoolGetDatum(true);
+	else
+		nulls[Anum_rowcompress_options_index_scan - 1]  = true;
+
 	Relation  optRel  = table_open(RCOptionsRelationId(), RowExclusiveLock);
 	TupleDesc tupdesc = RelationGetDescr(optRel);
 	HeapTuple tuple   = heap_form_tuple(tupdesc, values, nulls);
@@ -1049,7 +1116,11 @@ RCDetoastValues(TupleDesc tupdesc, Datum *orig_values, bool *isnull)
 	{
 		if (!isnull[i] &&
 			TupleDescAttr(tupdesc, i)->attlen == -1 &&
+#if PG_VERSION_NUM >= PG_VERSION_19
+			VARATT_IS_EXTENDED(DatumGetPointer(values[i])))
+#else
 			VARATT_IS_EXTENDED(values[i]))
+#endif
 		{
 			if (values == orig_values)
 			{
@@ -1955,7 +2026,11 @@ rc_tid_to_row_number(ItemPointerData tid)
  * ================================================================ */
 
 static IndexFetchTableData *
-rowcompress_index_fetch_begin(Relation rel)
+rowcompress_index_fetch_begin(Relation rel
+#if PG_VERSION_NUM >= PG_VERSION_19
+								  , uint32 flags
+#endif
+								  )
 {
 	IndexFetchRowCompressData *fetch =
 		palloc0(sizeof(IndexFetchRowCompressData));
@@ -2161,7 +2236,13 @@ return InvalidTransactionId;
 
 static void
 rowcompress_tuple_insert(Relation relation, TupleTableSlot *slot,
-  CommandId cid, int options, BulkInsertState bistate)
+  CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+  uint32 options,
+#else
+  int options,
+#endif
+  BulkInsertState bistate)
 {
 RowCompressWriteState *ws = RCGetOrCreateWriteState(relation);
 
@@ -2216,7 +2297,12 @@ RCFlushBatch(ws, relation);
 
 static void
 rowcompress_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
-  CommandId cid, int options,
+  CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+  uint32 options,
+#else
+  int options,
+#endif
   BulkInsertState bistate,
   uint32 specToken)
 {
@@ -2232,7 +2318,13 @@ rowcompress_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 
 static void
 rowcompress_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
-  CommandId cid, int options, BulkInsertState bistate)
+  CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+  uint32 options,
+#else
+  int options,
+#endif
+  BulkInsertState bistate)
 {
 for (int i = 0; i < ntuples; i++)
 rowcompress_tuple_insert(relation, slots[i], cid, options, bistate);
@@ -2347,8 +2439,16 @@ RCFindBatchInList(List *batches, uint64 rowNumber)
 
 static TM_Result
 rowcompress_tuple_delete(Relation relation, ItemPointer tid,
-  CommandId cid, Snapshot snapshot, Snapshot crosscheck,
-  bool wait, TM_FailureData *tmfd, bool changingPart)
+  CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+  uint32 options,
+#endif
+  Snapshot snapshot, Snapshot crosscheck,
+  bool wait, TM_FailureData *tmfd
+#if PG_VERSION_NUM < PG_VERSION_19
+  , bool changingPart
+#endif
+  )
 {
 	uint64 rowNumber = rc_tid_to_row_number(*tid);
 	uint64 storageId = RCStorageId(relation);
@@ -2374,7 +2474,14 @@ rowcompress_tuple_delete(Relation relation, ItemPointer tid,
 	return TM_Ok;
 }
 
-#if PG_VERSION_NUM >= PG_VERSION_16
+#if PG_VERSION_NUM >= PG_VERSION_19
+static TM_Result
+rowcompress_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
+  CommandId cid, uint32 options,
+  Snapshot snapshot, Snapshot crosscheck,
+  bool wait, TM_FailureData *tmfd,
+  LockTupleMode *lockmode, TU_UpdateIndexes *updateIndexes)
+#elif PG_VERSION_NUM >= PG_VERSION_16
 static TM_Result
 rowcompress_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
   CommandId cid, Snapshot snapshot, Snapshot crosscheck,
@@ -2441,7 +2548,12 @@ TM_FailureData *tmfd)
 }
 
 static void
-rowcompress_finish_bulk_insert(Relation relation, int options)
+rowcompress_finish_bulk_insert(Relation relation,
+#if PG_VERSION_NUM >= PG_VERSION_19
+								uint32 options)
+#else
+								int options)
+#endif
 {
 /* nothing to do; flush happens at commit via XactCallback */
 }
@@ -2500,6 +2612,9 @@ static void
 rowcompress_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
    Relation OldIndex, bool use_sort,
    TransactionId OldestXmin,
+#if PG_VERSION_NUM >= PG_VERSION_19
+   Snapshot snapshot,
+#endif
    TransactionId *xid_cutoff,
    MultiXactId *multi_cutoff,
    double *num_tuples,
@@ -2517,7 +2632,11 @@ rowcompress_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	 * Scan OldHeap with SnapshotAny.  rowcompress_getnextslot already skips
 	 * rows flagged in deleted_mask, so the copy is automatically compacted.
 	 */
-	TableScanDesc sscan = table_beginscan(OldHeap, SnapshotAny, 0, NULL);
+	TableScanDesc sscan = table_beginscan(OldHeap, SnapshotAny, 0, NULL
+#if PG_VERSION_NUM >= PG_VERSION_19
+									  , 0
+#endif
+									  );
 	TupleTableSlot *slot = table_slot_create(OldHeap, NULL);
 
 	*num_tuples    = 0;
@@ -2569,7 +2688,12 @@ return false;
  * ================================================================ */
 
 static void
-rowcompress_vacuum_rel(Relation rel, VacuumParams *params,
+rowcompress_vacuum_rel(Relation rel,
+#if PG_VERSION_NUM >= PG_VERSION_19
+   const VacuumParams *params,
+#else
+   VacuumParams *params,
+#endif
    BufferAccessStrategy bstrategy)
 {
 pgstat_progress_start_command(PROGRESS_COMMAND_VACUUM, RelationGetRelid(rel));
@@ -2642,7 +2766,12 @@ newRelFrozenXid, newRelminMxid, false);
 #endif
 #endif /* PG < 16 */
 
-#if PG_VERSION_NUM >= PG_VERSION_18
+#if PG_VERSION_NUM >= PG_VERSION_19
+pgstat_report_vacuum(rel,
+ Max(new_live_tuples, 0),
+ 0,
+ GetCurrentTimestamp());
+#elif PG_VERSION_NUM >= PG_VERSION_18
 pgstat_report_vacuum(RelationGetRelid(rel),
  rel->rd_rel->relisshared,
  Max(new_live_tuples, 0),
@@ -2712,7 +2841,10 @@ return true;
 
 
 static bool
-rowcompress_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
+rowcompress_scan_analyze_next_tuple(TableScanDesc scan,
+#if PG_VERSION_NUM < PG_VERSION_19
+ TransactionId OldestXmin,
+#endif
 double *liverows, double *deadrows,
 TupleTableSlot *slot)
 {
@@ -2992,7 +3124,11 @@ rowcompress_fetch_bitmap_tuple(RowCompressScanDesc *scan,
 {
 	if (scan->bitmapFetch == NULL)
 		scan->bitmapFetch = (IndexFetchRowCompressData *)
-			rowcompress_index_fetch_begin(scan->rc_base.rs_rd);
+			rowcompress_index_fetch_begin(scan->rc_base.rs_rd
+#if PG_VERSION_NUM >= PG_VERSION_19
+														, 0
+#endif
+														);
 
 	return rowcompress_index_fetch_tuple((IndexFetchTableData *) scan->bitmapFetch,
 								 &tid,
@@ -3224,7 +3360,8 @@ static const TableAmRoutine rowcompress_methods = {
  *       batch_size        int  DEFAULT NULL,
  *       compression       name DEFAULT NULL,
  *       compression_level int  DEFAULT NULL,
- *       pruning_column    text DEFAULT NULL)
+ *       pruning_column    text DEFAULT NULL,
+ *       index_scan        bool DEFAULT NULL)
  *
  * Only non-NULL arguments are changed; the rest keep their current value.
  * Pass pruning_column = '' (empty string) to disable pruning.
@@ -3354,6 +3491,14 @@ alter_rowcompress_table_set(PG_FUNCTION_ARGS)
 		}
 	}
 
+	/* index_scan => not null */
+	if (!PG_ARGISNULL(5))
+	{
+		options.indexScan = PG_GETARG_BOOL(5);
+		ereport(DEBUG1, (errmsg("setting index_scan to %s",
+								options.indexScan ? "true" : "false")));
+	}
+
 	RCSetOptions(relationId, &options);
 
 	table_close(rel, NoLock);
@@ -3369,7 +3514,8 @@ alter_rowcompress_table_set(PG_FUNCTION_ARGS)
  *       table_name        regclass,
  *       batch_size        bool DEFAULT false,
  *       compression       bool DEFAULT false,
- *       compression_level bool DEFAULT false)
+ *       compression_level bool DEFAULT false,
+ *       index_scan        bool DEFAULT false)
  *
  * Set an argument to true to reset it to the system default.
  */
@@ -3423,6 +3569,13 @@ alter_rowcompress_table_reset(PG_FUNCTION_ARGS)
 		options.compressionLevel = ROWCOMPRESS_DEFAULT_COMPRESSION_LEVEL;
 		ereport(DEBUG1, (errmsg("resetting compression level to %d",
 								options.compressionLevel)));
+	}
+
+	/* index_scan => true */
+	if (!PG_ARGISNULL(4) && PG_GETARG_BOOL(4))
+	{
+		options.indexScan = false;
+		ereport(DEBUG1, (errmsg("resetting index_scan to false")));
 	}
 
 	RCSetOptions(relationId, &options);
@@ -3621,6 +3774,20 @@ RowCompressGetPruningAttnum(Oid relid)
 	if (!RCReadOptions(relid, &opts))
 		return 0;
 	return opts.pruningAttnum;
+}
+
+/*
+ * RowCompressGetIndexScan — return the per-table index_scan flag for the
+ * given rowcompress relation.  Returns false when no options row exists or
+ * the extension is not initialised.
+ */
+bool
+RowCompressGetIndexScan(Oid relid)
+{
+	RowCompressOptions opts;
+	if (!RCReadOptions(relid, &opts))
+		return false;
+	return opts.indexScan;
 }
 
 /*
