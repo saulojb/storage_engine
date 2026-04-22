@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 1.1.4
+
+* fix: **`ORDER BY` silently dropped with parallel `ColcompressScan`** —
+  When a query had `ORDER BY` and the planner chose a parallel `ColcompressScan`,
+  PostgreSQL emitted `Gather(ColcompressScan)` without any `Sort` node above it,
+  returning rows in arbitrary worker-completion order instead of the requested
+  order. Root cause: `ColcompressScan` paths have `pathkeys = NIL` (columnar
+  data has no inherent physical order), so `generate_useful_gather_paths()`
+  found no pre-sorted partial paths and could not build `Gather Merge`. Fix:
+  when `root->query_pathkeys != NIL`, a `Sort(ColcompressScan)` partial path is
+  added to `partial_pathlist` alongside the unsorted one. The planner can now
+  choose `Gather Merge(Sort(ColcompressScan))` and correctly satisfies `ORDER BY`.
+* fix: **double `_PG_init()` when Citus is in `shared_preload_libraries`** —
+  On PG15 the Citus APT package dynamically loads `citus_columnar.so` via
+  `dlopen()` at load time, which re-entered `_PG_init()` for any co-loaded
+  extension. This caused:
+  `ERROR: attempt to redefine parameter "storage_engine.compression"` and
+  `ERROR: extensible node type "ColumnarScan" already exists`.
+  Fix: added `GetConfigOption()` early-return guard in `engine_guc_init()` and
+  an `if (GetConfigOption(...) == NULL)` block guard in `engine_customscan_init()`,
+  mirroring the `GetCustomScanMethods()` guard already in place for
+  `RegisterCustomScanMethods`. The init functions are now idempotent.
+
 ## 1.1.3
 
 * fix: **remove `citus_config.h` dependency from vendored safeclib** —
