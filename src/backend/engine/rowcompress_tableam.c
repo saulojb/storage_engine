@@ -46,7 +46,6 @@
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
-#include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "access/detoast.h"
 #include "catalog/storage.h"
