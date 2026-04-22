@@ -29,9 +29,11 @@
 /*
  * PG16 renamed RelFileNode → RelFileLocator and rd_node → rd_locator.
  * Field names changed: spcNode→spcOid, dbNode→dbOid, relNode→relNumber.
- * These aliases let the rest of the code use PG16 names unchanged on PG15.
+ * These macros let the rest of the code use PG16 names unchanged on PG15.
+ * Note: the RelFileLocator typedef itself lives in engine.h (after postgres.h)
+ * because this header is included before postgres.h and RelFileNode wouldn't
+ * be visible here yet.
  */
-typedef RelFileNode RelFileLocator;
 #define rd_locator  rd_node
 #define relNumber   relNode
 #define spcOid      spcNode
