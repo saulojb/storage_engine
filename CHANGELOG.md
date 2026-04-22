@@ -1,7 +1,6 @@
 # CHANGELOG
 
-## 1.2
-
+## 1.2.0
 * feat: **`index_scan` per-table option for `rowcompress`** —
   `rowcompress` now supports `index_scan` as a per-table flag, providing
   feature parity with `colcompress`. Default (`false`) keeps the analytical

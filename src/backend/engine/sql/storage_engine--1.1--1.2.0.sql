@@ -1,15 +1,15 @@
--- storage_engine--1.1--1.2.sql
+-- storage_engine--1.1--1.2.0.sql
 --
--- Upgrade script: 1.1 → 1.2
+-- Upgrade script: 1.1 → 1.2.0
 --
--- New in 1.2:
+-- New in 1.2.0:
 --   • engine.row_options gains index_scan bool column
 --   • engine.alter_rowcompress_table_set gets an index_scan parameter
 --   • engine.alter_rowcompress_table_reset gets an index_scan parameter
 --   • engine.rowcompress_options view updated to include index_scan
 --
 
-\echo Use "ALTER EXTENSION storage_engine UPDATE TO '1.2'" to load this file. \quit
+\echo Use "ALTER EXTENSION storage_engine UPDATE TO '1.2.0'" to load this file. \quit
 
 -- 1. New column on row_options --------------------------------------------------
 ALTER TABLE engine.row_options
