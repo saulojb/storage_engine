@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## 1.2
+
+* feat: **`index_scan` per-table option for `rowcompress`** —
+  `rowcompress` now supports `index_scan` as a per-table flag, providing
+  feature parity with `colcompress`. Default (`false`) keeps the analytical
+  mode: range index paths are removed by the planner hook so queries use
+  the batch-compressed sequential scan with batch-level min/max pruning.
+  When set to `true`, index scans are allowed (OLTP / document-store mode).
+  New 6th argument to `engine.alter_rowcompress_table_set()` and new 5th
+  argument to `engine.alter_rowcompress_table_reset()`. The `engine.rowcompress_options`
+  view now exposes the `index_scan` column. Upgrade via
+  `ALTER EXTENSION storage_engine UPDATE TO '1.2'`.
+
+## 1.1.5
+
+* compat: **PostgreSQL 19 support** — `storage_engine.so` now compiles and
+  runs on PostgreSQL 19 (devel). README compatibility table updated.
+* fix: **META.json PGXN license field** — changed `license` value to the
+  PGXN-recognized string `agpl_3`.
+
 ## 1.1.4
 
 * fix: **`ORDER BY` silently dropped with parallel `ColcompressScan`** —
