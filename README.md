@@ -429,6 +429,17 @@ sudo dnf install -y gcc make libcurl-devel lz4-devel libzstd-devel postgresql18-
 sudo make -j$(nproc) install
 ```
 
+If multiple PostgreSQL versions are installed, pass `PG_CONFIG` **after** `sudo make`
+(placing it before `sudo` won't work — `sudo` discards environment variables by default):
+
+```bash
+# Correct: variable is a make argument, not an env var for sudo
+sudo make -j$(nproc) install PG_CONFIG=/usr/lib/postgresql/15/bin/pg_config
+
+# Also works: sudo -E preserves the calling environment
+PG_CONFIG=/usr/lib/postgresql/15/bin/pg_config sudo -E make -j$(nproc) install
+```
+
 Add to `postgresql.conf`:
 
 ```
