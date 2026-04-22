@@ -25,6 +25,17 @@
 #define RelationPhysicalIdentifierNumber_compat(a) (a.relNode)
 #define RelidByRelfilenumber(a, b) RelidByRelfilenode(a, b)
 #define tuplesort_getdatum_compat(a, b, c, d, e, f) tuplesort_getdatum(a, b, d, e, f)
+
+/*
+ * PG16 renamed RelFileNode → RelFileLocator and rd_node → rd_locator.
+ * Field names changed: spcNode→spcOid, dbNode→dbOid, relNode→relNumber.
+ * These aliases let the rest of the code use PG16 names unchanged on PG15.
+ */
+typedef RelFileNode RelFileLocator;
+#define rd_locator  rd_node
+#define relNumber   relNode
+#define spcOid      spcNode
+#define dbOid       dbNode
 #endif
 
 /*

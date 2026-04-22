@@ -601,7 +601,11 @@ engine_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 	 * The snapshot is serialised by table_parallelscan_initialize() right
 	 * after our AM-specific data, at the offset we report below.
 	 */
+#if PG_VERSION_NUM >= PG_VERSION_16
 	pcscan->base.phs_locator = rel->rd_locator;
+#else
+	pcscan->base.phs_relid = RelationGetRelid(rel);
+#endif
 	pcscan->base.phs_syncscan = false; /* columnar has no synchronised seq-scans */
 	pcscan->base.phs_snapshot_any = false;
 	pcscan->base.phs_snapshot_off = MAXALIGN(
