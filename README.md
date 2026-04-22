@@ -456,6 +456,12 @@ shared_preload_libraries = 'pg_cron,citus,storage_engine'
 
 `citus` **must appear before** `storage_engine`. PostgreSQL registers planner hooks in load order; citus expects to be the outermost hook in the chain. Reversing the order causes PostgreSQL to refuse to start.
 
+> **PG15 note:** `citus.so` on PostgreSQL 15 registers the `"ColumnarScan"` extensible node type without a guard against double-registration. If the Citus PG15 package also auto-loads `citus_columnar.so` (e.g. as a dependency), a second `RegisterCustomScanMethods("ColumnarScan")` call occurs at startup and PostgreSQL aborts with:
+> ```
+> extensible node type "ColumnarScan" already exists
+> ```
+> This is a **Citus-side issue**, not caused by `storage_engine` (which only registers `ColcompressScan`, `RowcompressScan`, `StorageEngineIndexScan`, and `StorageEngineVectorAgg`). The combination `citus + storage_engine` on **PG16–18** is unaffected. On PG15, use `storage_engine` standalone or with `citus_columnar` (Hydra) — not with the full `citus.so`.
+
 Restart PostgreSQL and load the extension:
 
 ```sql
