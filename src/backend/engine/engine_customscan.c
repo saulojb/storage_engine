@@ -1672,6 +1672,30 @@ AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			AdjustColumnarParallelScanCost(parallelColumnarScanPath);
 
 			add_partial_path(rel, parallelColumnarScanPath);
+
+			/*
+			 * When the query has ORDER BY (root->query_pathkeys != NIL),
+			 * also add a pre-sorted partial path so that
+			 * generate_useful_gather_paths() can create a
+			 * Gather Merge(Sort(ColcompressScan)) path that satisfies the
+			 * required ordering.
+			 *
+			 * Without this, PG15 may not automatically add Sort inside
+			 * partial paths for columnar scans (useful_pathkeys_list can be
+			 * NIL when there are no matching indexes), causing the planner to
+			 * choose Gather(ColcompressScan) without any Sort node above it.
+			 * This silently drops ORDER BY, returning rows in an arbitrary
+			 * worker-completion order.
+			 */
+			if (root->query_pathkeys != NIL)
+			{
+				Path *sortedParallelPath = (Path *)
+					create_sort_path(root, rel,
+									 parallelColumnarScanPath,
+									 root->query_pathkeys,
+									 -1.0 /* no tuple limit */);
+				add_partial_path(rel, sortedParallelPath);
+			}
 		}
 	}
 
