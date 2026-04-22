@@ -420,10 +420,11 @@ RPM-based (dnf):
 sudo dnf install -y gcc make libcurl-devel lz4-devel libzstd-devel postgresql18-devel
 ```
 
-> If you build against PostgreSQL 16 or 17, replace the PostgreSQL dev package
-> with the matching version (`postgresql-server-dev-16` /
-> `postgresql-server-dev-17` on Debian/Ubuntu, or `postgresql16-devel` /
-> `postgresql17-devel` on RPM-based distributions).
+> If you build against a different PostgreSQL version, replace the dev package
+> with the matching version (e.g. `postgresql-server-dev-16` through
+> `postgresql-server-dev-19` on Debian/Ubuntu, or `postgresql16-devel` through
+> `postgresql19-devel` on RPM-based distributions). For PostgreSQL 19 devel
+> builds, pass `PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config` to `make`.
 
 ```bash
 sudo make -j$(nproc) install
@@ -456,28 +457,11 @@ shared_preload_libraries = 'pg_cron,citus,storage_engine'
 
 `citus` **must appear before** `storage_engine`. PostgreSQL registers planner hooks in load order; citus expects to be the outermost hook in the chain. Reversing the order causes PostgreSQL to refuse to start.
 
-> **PG15 note:** `citus.so` on PostgreSQL 15 registers the `"ColumnarScan"` extensible node type without a guard against double-registration. If the Citus PG15 package also auto-loads `citus_columnar.so` (e.g. as a dependency), a second `RegisterCustomScanMethods("ColumnarScan")` call occurs at startup and PostgreSQL aborts with:
-> ```
-> extensible node type "ColumnarScan" already exists
-> ```
-> This is a **Citus-side issue**, not caused by `storage_engine` (which only registers `ColcompressScan`, `RowcompressScan`, `StorageEngineIndexScan`, and `StorageEngineVectorAgg`). The combination `citus + storage_engine` on **PG16–18** is unaffected. On PG15, use `storage_engine` standalone or with `citus_columnar` (Hydra) — not with the full `citus.so`.
-
 Restart PostgreSQL and load the extension:
 
 ```sql
 CREATE EXTENSION storage_engine;
 ```
-
-### Docker
-
-```bash
-docker compose up
-psql postgres://postgres:password@127.0.0.1:5432
-```
-
-The `engine` schema and both AMs are created automatically on `CREATE EXTENSION`.
-
----
 
 ## Known Limitations
 
@@ -644,7 +628,8 @@ See [tests/README.md](tests/README.md) for full environment description and step
 | 15 | Supported |
 | 16 | Supported |
 | 17 | Supported |
-| 18 | Supported (current development target) |
+| 18 | Supported (current stable target) |
+| 19 | Supported (devel — tested against `19~~devel` snapshot) |
 
 ---
 
