@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include "pg_version_constants.h"
 #include "fmgr.h"
 
 #include <math.h>

@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include "pg_version_constants.h"
 
 #include "access/nbtree.h"
 #include "access/relscan.h"
