@@ -1,6 +1,4 @@
 
-#include "citus_version.h"
-
 #include "postgres.h"
 #include "engine/engine.h"
 

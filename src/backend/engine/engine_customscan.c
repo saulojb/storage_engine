@@ -13,7 +13,6 @@
  *-------------------------------------------------------------------------
  */
 
-#include "citus_version.h"
 #include "pg_version_compat.h"
 
 #include "postgres.h"

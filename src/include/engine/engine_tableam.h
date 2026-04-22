@@ -1,6 +1,5 @@
 #ifndef COLUMNAR_TABLEAM_H
 #define COLUMNAR_TABLEAM_H
-#include "citus_version.h"
 
 #include "postgres.h"
 #include "fmgr.h"

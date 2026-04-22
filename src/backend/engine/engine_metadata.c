@@ -24,7 +24,6 @@
 
 #include "safe_lib.h"
 
-#include "citus_version.h"
 #include "engine/engine.h"
 #include "engine/engine_metadata.h"
 #include "engine/engine_storage.h"

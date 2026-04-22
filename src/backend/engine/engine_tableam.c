@@ -1,5 +1,3 @@
-#include "citus_version.h"
-
 #include "postgres.h"
 #include "fmgr.h"
 

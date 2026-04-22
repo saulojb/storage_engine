@@ -13,7 +13,6 @@
  */
 #include "postgres.h"
 
-#include "citus_version.h"
 #include "pg_version_compat.h"
 
 #include "common/pg_lzcompress.h"
@@ -21,7 +20,7 @@
 
 #include "engine/engine_compression.h"
 
-#if HAVE_CITUS_LIBLZ4
+#if HAVE_LIBLZ4
 #include <lz4.h>
 #endif
 
@@ -68,7 +67,7 @@ CompressBuffer(StringInfo inputBuffer,
 {
 	switch (compressionType)
 	{
-#if HAVE_CITUS_LIBLZ4
+#if HAVE_LIBLZ4
 		case COMPRESSION_LZ4:
 		{
 			int maximumLength = LZ4_compressBound(inputBuffer->len);
@@ -175,7 +174,7 @@ DecompressBuffer(StringInfo buffer,
 			return buffer;
 		}
 
-#if HAVE_CITUS_LIBLZ4
+#if HAVE_LIBLZ4
 		case COMPRESSION_LZ4:
 		{
 			StringInfo decompressedBuffer = makeStringInfo();

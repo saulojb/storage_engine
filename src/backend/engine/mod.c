@@ -15,8 +15,6 @@
 
 #include "fmgr.h"
 
-#include "citus_version.h"
-
 #include "engine/engine.h"
 #include "engine/engine_tableam.h"
 #include "engine/rowcompress.h"

@@ -21,7 +21,6 @@
 #include "utils/guc.h"
 #include "utils/rel.h"
 
-#include "citus_version.h"
 #include "engine/engine.h"
 #include "engine/engine_tableam.h"
 
@@ -31,7 +30,7 @@
 
 #if HAVE_LIBZSTD
 #define DEFAULT_COMPRESSION_TYPE COMPRESSION_ZSTD
-#elif HAVE_CITUS_LIBLZ4
+#elif HAVE_LIBLZ4
 #define DEFAULT_COMPRESSION_TYPE COMPRESSION_LZ4
 #else
 #define DEFAULT_COMPRESSION_TYPE COMPRESSION_PG_LZ
@@ -55,7 +54,7 @@ static const struct config_enum_entry engine_compression_options[] =
 {
 	{ "none", COMPRESSION_NONE, false },
 	{ "pglz", COMPRESSION_PG_LZ, false },
-#if HAVE_CITUS_LIBLZ4
+#if HAVE_LIBLZ4
 	{ "lz4", COMPRESSION_LZ4, false },
 #endif
 #if HAVE_LIBZSTD
