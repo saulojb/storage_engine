@@ -316,7 +316,9 @@ engine_customscan_init()
 	PreviousGetRelationInfoHook = get_relation_info_hook;
 	get_relation_info_hook = ColumnarGetRelationInfoHook;
 
-	/* register customscan specific GUC's */
+	/* register customscan specific GUC's — skip if already defined */
+	if (GetConfigOption("storage_engine.enable_custom_scan", true, false) == NULL)
+	{
 	DefineCustomBoolVariable(
 		"storage_engine.enable_custom_scan",
 		"Enables the use of a custom scan to push projections and quals "
@@ -375,6 +377,7 @@ engine_customscan_init()
 		NULL,
 		NULL,
 		NULL);
+	} /* end GUC guard */
 
 	/*
 	 * Guard against double-registration when another extension (e.g. Citus

@@ -75,6 +75,14 @@ engine_init(void)
 static void
 engine_guc_init()
 {
+	/*
+	 * Guard against double-registration (e.g. shared_preload_libraries path
+	 * differs from the path resolved at CREATE EXTENSION / LOAD time, causing
+	 * PostgreSQL to call _PG_init() twice for the same physical .so file).
+	 */
+	if (GetConfigOption("storage_engine.compression", true, false) != NULL)
+		return;
+
 	DefineCustomEnumVariable("storage_engine.compression",
 							 "Compression type for columnar.",
 							 NULL,
