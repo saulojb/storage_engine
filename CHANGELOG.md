@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## 1.2.2
+
+* feat: **ZXC compression** (`compression='zxc'`) — adds support for the
+  [ZXC asymmetric codec](https://github.com/hellobertrand/zxc) (BSD-3-Clause).
+  Write-Once Read-Many design: encoder is slow; decoder is SIMD-maximized
+  (NEON on ARMv8+, AVX2/AVX-512 on x86_64). Decompression throughput vs LZ4:
+  Neoverse-V2 +24%, x86_64 AMD EPYC +18%, Apple M2 +46%.
+  Not yet in apt — build from source. Auto-detected by `Makefile.global`.
+
+* feat: **libdeflate compression** (`compression='deflate'`) — adds support for
+  [libdeflate](https://github.com/ebiggers/libdeflate), a zlib-compatible codec
+  with better throughput than the standard zlib. Available as `libdeflate-dev`
+  on Ubuntu/Debian. Auto-detected by `Makefile.global`.
+
+* build: **all compression libraries are now optional** — previously LZ4, ZSTD
+  and libdeflate were hardcoded in `citus_config.h`, causing link failures on
+  systems without those libraries. All four codecs (LZ4, ZSTD, Deflate, ZXC)
+  are now detected dynamically at build time via `Makefile.global` header
+  detection. The extension falls back to PostgreSQL's built-in `pglz` when no
+  external library is present. Default precedence when available:
+  `ZSTD > ZXC > LZ4 > Deflate > pglz`.
+
+* bench: **aarch64 benchmark area** (`tests/bench/aarch64/`) — new directory
+  with serial and parallel benchmark results on ARM Neoverse-N1 / Graviton2
+  (PostgreSQL 18.1, 1M rows). Includes results for all four compression codecs
+  (ZSTD, LZ4, Deflate, ZXC) with comparison charts.
+  Key finding: ZXC achieves fastest analytical read performance on aarch64 in
+  6/10 queries, beating even LZ4 despite slightly larger disk size (123 MB vs
+  118 MB), confirming its SIMD NEON advantage on ARM.
+
 ## 1.2.1
 
 * fix: **GUC visibility** — `storage_engine.enable_vectorization`,
