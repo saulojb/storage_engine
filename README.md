@@ -253,12 +253,16 @@ SELECT engine.colcompress_merge('events');
 
 Each chunk is compressed independently. Available algorithms:
 
-| Name | Description |
-|---|---|
-| `none` | No compression |
-| `lz4` | Fast compression/decompression, moderate ratio |
-| `zstd` | High ratio, configurable level 1–19 (default level: 3) |
-| `pglz` | PostgreSQL's built-in LZ variant |
+| Name | Description | Requires |
+|---|---|---|
+| `none` | No compression | — |
+| `pglz` | PostgreSQL's built-in LZ variant (always available) | — |
+| `lz4` | Fast compression/decompression, moderate ratio (~500 MB/s decomp) | `liblz4-dev` |
+| `zstd` | Best ratio + good speed; configurable level 1–19 (default: 3). **Recommended** | `libzstd-dev` |
+| `deflate` | zlib-compatible codec; good middle ground between LZ4 and ZSTD | `libdeflate-dev` |
+| `zxc` | Asymmetric: slow compress, extremely fast decompress via SIMD (NEON on ARM64, AVX2/AVX-512 on x86_64). Ideal for read-heavy analytics on ARM Graviton/Neoverse. [github.com/hellobertrand/zxc](https://github.com/hellobertrand/zxc) | build from source |
+
+All compression libraries are **optional** — the extension auto-detects them at build time and falls back to `pglz` if none are installed. Default precedence when multiple are present: `zstd > zxc > lz4 > deflate > pglz`.
 
 ```sql
 SELECT engine.alter_colcompress_table_set('events',
