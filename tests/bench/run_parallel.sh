@@ -15,6 +15,7 @@
 #   benchmark_parallel.png / .svg   — chart (requires chart_parallel.py)
 # ============================================================
 set -euo pipefail
+export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS="$SCRIPT_DIR/results_parallel.csv"

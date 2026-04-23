@@ -1,0 +1,7 @@
+-- storage_engine upgrade: 1.2.0 → 1.2.1
+-- No catalog changes. Bug-fix release:
+--   • GUC visibility: removed GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE from 4 GUCs
+--   • Fixed -Wmissing-variable-declarations (extern declarations in header)
+--   • Fixed table_beginscan() 5-arg signature for PostgreSQL 19
+--   • Fixed statement_timeout reset inside smart_update loop
+--   • smart_update: cap parallel workers to max_parallel_workers / 2
