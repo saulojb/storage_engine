@@ -1,0 +1,34 @@
+# colcompress compression comparison — aarch64 (ARM Neoverse-N1 / Graviton2)
+# PostgreSQL 18.1 · 1 000 000 rows · 3 runs · JIT off · no parallelism
+# colcompress disk size: zstd=66MB  lz4=118MB  deflate=83MB
+compression,query,median_ms
+zstd,"Q1 count(*)",73.418
+zstd,"Q2 SUM/AVG numeric+double",208.171
+zstd,"Q3 GROUP BY country (10)",245.521
+zstd,"Q4 GROUP BY event_type+p95",707.009
+zstd,"Q5 date range 1 month",34.919
+zstd,"Q6 JSONB @> GIN",282.989
+zstd,"Q7 JSONB key + GROUP BY",517.412
+zstd,"Q8 array @> GIN",229.583
+zstd,"Q9 LIKE text scan",154.857
+zstd,"Q10 heavy multi-agg",3466.663
+lz4,"Q1 count(*)",73.814
+lz4,"Q2 SUM/AVG numeric+double",177.601
+lz4,"Q3 GROUP BY country (10)",237.376
+lz4,"Q4 GROUP BY event_type+p95",684.026
+lz4,"Q5 date range 1 month",31.709
+lz4,"Q6 JSONB @> GIN",249.760
+lz4,"Q7 JSONB key + GROUP BY",483.682
+lz4,"Q8 array @> GIN",216.325
+lz4,"Q9 LIKE text scan",140.754
+lz4,"Q10 heavy multi-agg",3411.988
+deflate,"Q1 count(*)",80.302
+deflate,"Q2 SUM/AVG numeric+double",213.447
+deflate,"Q3 GROUP BY country (10)",249.788
+deflate,"Q4 GROUP BY event_type+p95",696.405
+deflate,"Q5 date range 1 month",34.958
+deflate,"Q6 JSONB @> GIN",281.963
+deflate,"Q7 JSONB key + GROUP BY",504.640
+deflate,"Q8 array @> GIN",237.840
+deflate,"Q9 LIKE text scan",152.100
+deflate,"Q10 heavy multi-agg",3503.336
