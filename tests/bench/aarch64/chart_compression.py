@@ -3,7 +3,7 @@
 Compression codec comparison chart — colcompress on aarch64
 Platform: ARM Neoverse-N1 / Graviton2 · PostgreSQL 18.1
 
-Shows ZSTD vs LZ4 vs Deflate side-by-side for each benchmark query.
+Shows ZSTD vs LZ4 vs Deflate vs ZXC side-by-side for each benchmark query.
 
 Usage:
     python3 chart_compression.py                       # serial (compression_serial.csv)
@@ -27,10 +27,10 @@ mode_label  = "JIT on · 4 parallel workers" if is_parallel else "JIT off · no 
 PNG = HERE / f"compression_comparison_{'parallel' if is_parallel else 'serial'}.png"
 SVG = HERE / f"compression_comparison_{'parallel' if is_parallel else 'serial'}.svg"
 
-CODEC_ORDER  = ["zstd", "lz4", "deflate"]
-CODEC_LABELS = {"zstd": "ZSTD", "lz4": "LZ4", "deflate": "Deflate"}
-CODEC_COLORS = {"zstd": "#2c5f8a", "lz4": "#e07b39", "deflate": "#2c7a4b"}
-DISK_SIZE    = {"zstd": "66 MB", "lz4": "118 MB", "deflate": "83 MB"}
+CODEC_ORDER  = ["zstd", "lz4", "deflate", "zxc"]
+CODEC_LABELS = {"zstd": "ZSTD", "lz4": "LZ4", "deflate": "Deflate", "zxc": "ZXC"}
+CODEC_COLORS = {"zstd": "#2c5f8a", "lz4": "#e07b39", "deflate": "#2c7a4b", "zxc": "#7b3f9e"}
+DISK_SIZE    = {"zstd": "66 MB", "lz4": "118 MB", "deflate": "83 MB", "zxc": "123 MB"}
 
 rows = {}
 with open(CSV) as f:
@@ -48,8 +48,8 @@ if n_q == 1:
     axes = [axes]
 fig.patch.set_facecolor("#fafafa")
 
-bar_w  = 0.22
-offset = np.array([-bar_w, 0, bar_w])
+bar_w  = 0.18
+offset = np.array([-1.5*bar_w, -0.5*bar_w, 0.5*bar_w, 1.5*bar_w])
 
 for ax, q in zip(axes, all_qs):
     vals = [rows[c].get(q, 0) for c in all_codecs]
@@ -58,7 +58,7 @@ for ax, q in zip(axes, all_qs):
 
     for i, (codec, val) in enumerate(zip(all_codecs, vals)):
         bar = ax.bar(xs + offset[i], val,
-                     width=bar_w - 0.02,
+                     width=bar_w - 0.01,
                      color=CODEC_COLORS[codec],
                      edgecolor="white", linewidth=0.8, zorder=3,
                      label=CODEC_LABELS[codec])
@@ -67,15 +67,15 @@ for ax, q in zip(axes, all_qs):
                 val + max_v * 0.02,
                 label, ha="center", va="bottom", fontsize=7, fontweight="bold")
 
-    # annotate LZ4 speedup vs ZSTD
-    if "zstd" in rows and "lz4" in rows:
-        z, l = rows["zstd"].get(q, 0), rows["lz4"].get(q, 0)
-        if z > 0 and l > 0 and l < z:
-            lx = all_codecs.index("lz4")
-            ax.annotate(f"×{z/l:.2f}",
-                        xy=(xs[0] + offset[lx], rows["lz4"][q]),
+    # annotate ZXC speedup vs LZ4
+    if "lz4" in rows and "zxc" in rows:
+        l, z = rows["lz4"].get(q, 0), rows["zxc"].get(q, 0)
+        if l > 0 and z > 0 and z < l:
+            zx = all_codecs.index("zxc")
+            ax.annotate(f"×{l/z:.2f}",
+                        xy=(xs[0] + offset[zx], rows["zxc"][q]),
                         xytext=(0, 8), textcoords="offset points",
-                        ha="center", fontsize=6.5, color="#e07b39", fontweight="bold")
+                        ha="center", fontsize=6.5, color="#7b3f9e", fontweight="bold")
 
     ax.set_title(q, fontsize=7.5, pad=4, fontweight="bold")
     ax.set_xticks([])
@@ -101,7 +101,7 @@ fig.suptitle(
     f"1M rows · Median of 3 runs · {mode_label}",
     fontsize=9.5, y=1.08)
 fig.text(0.5, -0.03,
-         "Lower is better  ·  Orange annotation = LZ4 speedup vs ZSTD",
+         "Lower is better  ·  Purple annotation = ZXC speedup vs LZ4",
          ha="center", fontsize=7.5, color="#555")
 
 plt.tight_layout(rect=[0, 0, 1, 1])

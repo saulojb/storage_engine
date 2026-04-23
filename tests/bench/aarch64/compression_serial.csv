@@ -1,6 +1,6 @@
 # colcompress compression comparison — aarch64 (ARM Neoverse-N1 / Graviton2)
 # PostgreSQL 18.1 · 1 000 000 rows · 3 runs · JIT off · no parallelism
-# colcompress disk size: zstd=66MB  lz4=118MB  deflate=83MB
+# colcompress disk size: zstd=66MB  lz4=118MB  deflate=83MB  zxc=123MB
 compression,query,median_ms
 zstd,"Q1 count(*)",73.418
 zstd,"Q2 SUM/AVG numeric+double",208.171
@@ -32,3 +32,13 @@ deflate,"Q7 JSONB key + GROUP BY",504.640
 deflate,"Q8 array @> GIN",237.840
 deflate,"Q9 LIKE text scan",152.100
 deflate,"Q10 heavy multi-agg",3503.336
+zxc,"Q1 count(*)",72.616
+zxc,"Q2 SUM/AVG numeric+double",185.546
+zxc,"Q3 GROUP BY country (10)",244.084
+zxc,"Q4 GROUP BY event_type+p95",680.466
+zxc,"Q5 date range 1 month",31.265
+zxc,"Q6 JSONB @> GIN",245.275
+zxc,"Q7 JSONB key + GROUP BY",457.007
+zxc,"Q8 array @> GIN",224.346
+zxc,"Q9 LIKE text scan",149.379
+zxc,"Q10 heavy multi-agg",3376.635
