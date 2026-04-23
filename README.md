@@ -411,14 +411,32 @@ Ubuntu/Debian:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential libcurl4-openssl-dev liblz4-dev libzstd-dev postgresql-server-dev-18
+sudo apt install -y build-essential postgresql-server-dev-18 \
+    liblz4-dev libzstd-dev          # recommended: fast compression
+# optional extras:
+# sudo apt install libdeflate-dev   # zlib-compatible, good middle ground
 ```
 
 RPM-based (dnf):
 
 ```bash
-sudo dnf install -y gcc make libcurl-devel lz4-devel libzstd-devel postgresql18-devel
+sudo dnf install -y gcc make postgresql18-devel \
+    lz4-devel libzstd-devel         # recommended: fast compression
+# optional extras:
+# sudo dnf install libdeflate-devel
 ```
+
+> **Compression libraries are all optional.** The extension always falls back to
+> PostgreSQL's built-in `pglz` when no external library is found. However:
+>
+> | Library | Package | Benefit |
+> |---------|---------|---------|
+> | **LZ4** | `liblz4-dev` | Very fast compression/decompression (~500 MB/s). Ideal for write-heavy workloads or when latency matters. |
+> | **ZSTD** ★ | `libzstd-dev` | Best compression ratio + good speed. **Strongly recommended** for `colcompress` — saves 40–60% disk vs LZ4 with comparable read performance. |
+> | **libdeflate** | `libdeflate-dev` | zlib-compatible codec. Good middle ground between LZ4 and ZSTD. |
+> | **ZXC** | [build from source](https://github.com/hellobertrand/zxc) | Asymmetric codec: very slow compression, extremely fast decompression via SIMD (NEON on ARM64, AVX2/AVX-512 on x86_64). Excellent on ARM Graviton/Neoverse for read-heavy analytical workloads. Not yet in apt. |
+>
+> Default compression precedence (first available wins): `ZSTD > ZXC > LZ4 > Deflate > pglz`
 
 > If you build against a different PostgreSQL version, replace the dev package
 > with the matching version (e.g. `postgresql-server-dev-16` through

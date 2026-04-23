@@ -21,14 +21,40 @@ include $(PGXS)
 override CPPFLAGS := -I'$(citus_abs_top_srcdir)/src/include' $(CPPFLAGS)
 override CFLAGS  += -Wno-declaration-after-statement
 
-# libdeflate optional support
+# ---------------------------------------------------------------------------
+# Optional compression libraries — all are detected at build time.
+# The extension always falls back to pglz (built into PostgreSQL) if none
+# are installed.  Recommended: at minimum lz4 + zstd for production use.
+# ---------------------------------------------------------------------------
+
+# LZ4 — fast compression, excellent decompression throughput (~500 MB/s)
+# Ubuntu/Debian: sudo apt install liblz4-dev
+# RHEL/Fedora:   sudo dnf install lz4-devel
+ifneq (,$(wildcard /usr/include/lz4.h))
+  override CPPFLAGS += -DHAVE_LIBLZ4=1
+  SHLIB_LINK += -llz4
+endif
+
+# ZSTD — best ratio + good speed; strongly recommended for colcompress
+# Ubuntu/Debian: sudo apt install libzstd-dev
+# RHEL/Fedora:   sudo dnf install libzstd-devel
+ifneq (,$(wildcard /usr/include/zstd.h))
+  override CPPFLAGS += -DHAVE_LIBZSTD=1
+  SHLIB_LINK += -lzstd
+endif
+
+# libdeflate — zlib-compatible, faster than zlib; good middle ground
+# Ubuntu/Debian: sudo apt install libdeflate-dev
+# RHEL/Fedora:   sudo dnf install libdeflate-devel
 ifneq (,$(wildcard /usr/include/libdeflate.h))
   override CPPFLAGS += -DHAVE_LIBDEFLATE=1
   SHLIB_LINK += -ldeflate
 endif
 
-# ZXC optional support — asymmetric codec, especially fast on ARM64/Graviton
-# See: https://github.com/hellobertrand/zxc
+# ZXC — asymmetric codec (slow compress, very fast decompress); ideal on ARM64
+# Not yet in apt — build from https://github.com/hellobertrand/zxc/releases
+#   cmake -B build -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
+#   sudo cmake --install build
 ifneq (,$(wildcard /usr/local/include/zxc.h))
   override CPPFLAGS += -DHAVE_LIBZXC=1
   SHLIB_LINK += -lzxc
