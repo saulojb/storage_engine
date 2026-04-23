@@ -140,7 +140,7 @@ engine_guc_init()
 							 &engine_enable_parallel_execution,
 							 true,
 							 PGC_USERSET,
-							 GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							 0,
 							 NULL, 
 							 NULL, 
 							 NULL);
@@ -164,7 +164,7 @@ engine_guc_init()
 							 &engine_enable_vectorization,
 							 true,
 							 PGC_USERSET,
-							 GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							 0,
 							 NULL, 
 							 NULL, 
 							 NULL);
@@ -175,7 +175,7 @@ engine_guc_init()
 							&engine_enable_dml,
 							true,
 							PGC_USERSET,
-							GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							0,
 							NULL, 
 							NULL, 
 							NULL);
@@ -210,7 +210,7 @@ engine_guc_init()
 							 &engine_index_scan,
 							 false,
 							 PGC_USERSET,
-							 GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							 0,
 							 NULL, 
 							 NULL, 
 							 NULL);

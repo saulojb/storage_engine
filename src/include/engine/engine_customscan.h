@@ -22,4 +22,8 @@ extern void engine_customscan_init(void);
 extern const CustomScanMethods * engine_customscan_methods(void);
 extern Bitmapset * ColumnarAttrNeeded(ScanState *ss, List *customList);
 
+extern const struct CustomPathMethods ColumnarScanPathMethods;
+extern const struct CustomScanMethods ColumnarScanScanMethods;
+extern const struct CustomExecMethods ColumnarScanExecuteMethods;
+
 #endif /* COLUMNAR_CUSTOMSCAN_H */
