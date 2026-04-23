@@ -28,6 +28,10 @@
 #include <zstd.h>
 #endif
 
+#if HAVE_LIBDEFLATE
+#include <libdeflate.h>
+#endif
+
 #if PG_VERSION_NUM >= PG_VERSION_16
 #include "varatt.h"
 #endif
@@ -114,6 +118,44 @@ CompressBuffer(StringInfo inputBuffer,
 								  (errdetail("%s", ZSTD_getErrorName(compressedSize)))));
 				return false;
 			}
+
+			outputBuffer->len = compressedSize;
+			return true;
+		}
+#endif
+
+#if HAVE_LIBDEFLATE
+		case COMPRESSION_DEFLATE:
+		{
+			struct libdeflate_compressor *compressor =
+				libdeflate_alloc_compressor(compressionLevel > 0 ? compressionLevel : 6);
+			if (!compressor)
+			{
+				elog(WARNING, "libdeflate_alloc_compressor failed");
+				return false;
+			}
+
+			size_t maximumLength = libdeflate_deflate_compress_bound(compressor,
+																	 inputBuffer->len);
+			resetStringInfo(outputBuffer);
+			enlargeStringInfo(outputBuffer, maximumLength);
+
+			size_t compressedSize = libdeflate_deflate_compress(compressor,
+																inputBuffer->data,
+																inputBuffer->len,
+																outputBuffer->data,
+																maximumLength);
+			libdeflate_free_compressor(compressor);
+
+			if (compressedSize == 0)
+			{
+				elog(DEBUG1, "libdeflate_deflate_compress returned 0 for input size=%d",
+					 inputBuffer->len);
+				return false;
+			}
+
+			elog(DEBUG1, "deflate compressed %d bytes to %zu bytes",
+				 inputBuffer->len, compressedSize);
 
 			outputBuffer->len = compressedSize;
 			return true;
@@ -224,6 +266,43 @@ DecompressBuffer(StringInfo buffer,
 
 			decompressedBuffer->len = decompressedSize;
 
+			return decompressedBuffer;
+		}
+#endif
+
+#if HAVE_LIBDEFLATE
+		case COMPRESSION_DEFLATE:
+		{
+			struct libdeflate_decompressor *decompressor =
+				libdeflate_alloc_decompressor();
+			if (!decompressor)
+				ereport(ERROR, (errmsg("libdeflate_alloc_decompressor failed")));
+
+			StringInfo decompressedBuffer = makeStringInfo();
+			enlargeStringInfo(decompressedBuffer, decompressedSize);
+
+			size_t actualSize = 0;
+			enum libdeflate_result result =
+				libdeflate_deflate_decompress(decompressor,
+											  buffer->data, buffer->len,
+											  decompressedBuffer->data, decompressedSize,
+											  &actualSize);
+			libdeflate_free_decompressor(decompressor);
+
+			if (result != LIBDEFLATE_SUCCESS)
+			{
+				ereport(ERROR, (errmsg("libdeflate decompression failed"),
+								errdetail("error code: %d", (int) result)));
+			}
+
+			if (actualSize != decompressedSize)
+			{
+				ereport(ERROR, (errmsg("unexpected decompressed size"),
+								errdetail("Expected %lu, received %zu",
+										  decompressedSize, actualSize)));
+			}
+
+			decompressedBuffer->len = decompressedSize;
 			return decompressedBuffer;
 		}
 #endif

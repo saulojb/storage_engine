@@ -20,3 +20,9 @@ include $(PGXS)
 
 override CPPFLAGS := -I'$(citus_abs_top_srcdir)/src/include' $(CPPFLAGS)
 override CFLAGS  += -Wno-declaration-after-statement
+
+# libdeflate optional support
+ifneq (,$(wildcard /usr/include/libdeflate.h))
+  override CPPFLAGS += -DHAVE_LIBDEFLATE=1
+  SHLIB_LINK += -ldeflate
+endif

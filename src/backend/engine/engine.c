@@ -32,6 +32,8 @@
 #define DEFAULT_COMPRESSION_TYPE COMPRESSION_ZSTD
 #elif HAVE_LIBLZ4
 #define DEFAULT_COMPRESSION_TYPE COMPRESSION_LZ4
+#elif HAVE_LIBDEFLATE
+#define DEFAULT_COMPRESSION_TYPE COMPRESSION_DEFLATE
 #else
 #define DEFAULT_COMPRESSION_TYPE COMPRESSION_PG_LZ
 #endif
@@ -59,6 +61,9 @@ static const struct config_enum_entry engine_compression_options[] =
 #endif
 #if HAVE_LIBZSTD
 	{ "zstd", COMPRESSION_ZSTD, false },
+#endif
+#if HAVE_LIBDEFLATE
+	{ "deflate", COMPRESSION_DEFLATE, false },
 #endif
 	{ NULL, 0, false }
 };
