@@ -51,7 +51,11 @@ static planner_hook_type PreviousPlannerHook = NULL;
 static Oid engine_tableam_oid = InvalidOid;
 
 static PlannedStmt * ColumnarPlannerHook(Query *parse,  const char *query_string,
-										 int cursorOptions, ParamListInfo boundParams);
+									 int cursorOptions, ParamListInfo boundParams
+#if PG_VERSION_NUM >= PG_VERSION_19
+									 , ExplainState *es
+#endif
+									 );
 static bool IsCreateTableAs(const char *query);
 static bool IsExplainQuery(const char *query);
 
@@ -322,7 +326,11 @@ static PlannedStmt *
 ColumnarPlannerHook(Query *parse,
 					const char *query_string,
 					int cursorOptions,
-					ParamListInfo boundParams)
+					ParamListInfo boundParams
+#if PG_VERSION_NUM >= PG_VERSION_19
+					, ExplainState *es
+#endif
+					)
 {
 	PlannedStmt	*stmt;
 #if PG_VERSION_NUM >= PG_VERSION_14
@@ -332,10 +340,17 @@ ColumnarPlannerHook(Query *parse,
 #endif
 
 	if (PreviousPlannerHook)
-		stmt = PreviousPlannerHook(parse, query_string, cursorOptions, boundParams);
-	else
-		stmt = standard_planner(parse, query_string, cursorOptions, boundParams);
-
+#if PG_VERSION_NUM >= PG_VERSION_19
+			stmt = PreviousPlannerHook(parse, query_string, cursorOptions, boundParams, es);
+#else
+			stmt = PreviousPlannerHook(parse, query_string, cursorOptions, boundParams);
+#endif
+		else
+#if PG_VERSION_NUM >= PG_VERSION_19
+			stmt = standard_planner(parse, query_string, cursorOptions, boundParams, es);
+#else
+			stmt = standard_planner(parse, query_string, cursorOptions, boundParams);
+#endif
 	/*
 	 * In the case of a CREATE TABLE AS query, we are not able to successfully
 	 * drop out of a parallel insert situation.  This checks for a CMD_SELECT

@@ -829,6 +829,11 @@ BEGIN
     --   done=false -> batch retried from scratch.  No data loss possible.
     -- ----------------------------------------------------------------
     LOOP
+        -- Re-apply after each COMMIT: PostgreSQL resets session GUCs that were
+        -- overridden by set_config when a new transaction starts inside a procedure.
+        PERFORM set_config('statement_timeout', '0', false);
+        PERFORM set_config('lock_timeout',      '0', false);
+
         EXECUTE format(
             'WITH cum AS ('
             '  SELECT stripe_idx, first_rn, row_count,'
@@ -925,5 +930,212 @@ COMMENT ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, intege
 IS 'Memory-safe, crash-safe bulk UPDATE for colcompress tables. Snapshots matching rows (minus skip_columns) to a WAL-protected heap. With skip_columns, blob columns are excluded from Phase 1 (tiny snapshot) and buffered per-batch in a TEMP TABLE ON COMMIT DROP during Phase 3, keeping peak memory proportional to batch_size. Phase 3 order: buffer blobs -> DELETE old rows -> INSERT (heap + temp) -> mark done=true -> COMMIT (temp auto-destroyed). A server crash rolls back the entire batch; re-running CALL resumes from the first undone stripe. No data loss possible. Use smaller batch_size with skip_columns for large-blob tables. Run REINDEX TABLE CONCURRENTLY after completion.';
 
 GRANT EXECUTE ON PROCEDURE engine.colcompress_bulk_update(regclass, text, text, integer, text[]) TO PUBLIC;
+
+-- ============================================================
+-- engine.smart_update — stripe-grouped full rewrite for colcompress tables
+-- ============================================================
+--
+-- Performs UPDATE via per-stripe full rewrite — the only correct approach
+-- for colcompress tables at any scale.
+--
+-- Why a direct UPDATE is NEVER appropriate for colcompress:
+--   • engine_tuple_update() marks the old row deleted (hole in the original
+--     stripe) and appends the new row as a new 1-row stripe.
+--   • Even a handful of rows causes fragmentation: holes + tiny stripes.
+--   • On a 100M-row table with 30% of rows changing, a direct UPDATE would
+--     create 30M orphan holes and 30M single-row stripes — catastrophic for
+--     compression ratio and scan performance.
+--   • There is no safe absolute threshold: 150k rows may be 0.0001% on a
+--     huge table (fine) or 100% on a small one (terrible).
+--
+-- Per-stripe rewrite algorithm (for each stripe with ≥ 1 matching row):
+--   a. READ all rows from the stripe into a TEMP TABLE (heap, bounded memory).
+--   b. UPDATE the temp table in-place: SET clause applied to matching rows
+--      (pure heap UPDATE, zero colcompress overhead).
+--   c. DELETE ALL rows from the stripe in colcompress
+--      (marks deleted-bits in row_mask — no decompression).
+--   d. INSERT all rows back (modified + unchanged) into colcompress.
+--      One new, fully-packed stripe written; fresh min/max metadata.
+--   e. COMMIT — ON COMMIT DROP destroys temp table atomically.
+--   Stripes with zero matching rows are skipped entirely (fast ctid check).
+--
+-- Properties:
+--   • No holes — every rewritten stripe is fully packed.
+--   • Fresh min/max metadata → optimal chunk pruning on subsequent scans.
+--   • Memory bounded to one stripe at a time regardless of table size.
+--   • Crash-safe: each stripe commit is atomic; re-run CALL to retry.
+--   • Correct at any scale: 1 row or 1 billion rows, 0.001% or 100%.
+--
+-- Arguments:
+--   table_name    regclass  — target colcompress table
+--   set_clause    text      — verbatim SET clause  (e.g. 'col = expr')
+--   where_clause  text      — optional WHERE filter (NULL = all rows)
+--   row_threshold bigint    — DEPRECATED, ignored; kept for API compatibility
+--
+-- Must be called with CALL:
+--   CALL engine.smart_update('myschema.mytable', 'col = expr', 'id > 0');
+--
+-- NOTE: After completion, ctid values of rewritten rows change.
+--   Run:  REINDEX TABLE CONCURRENTLY <table>;
+--
+CREATE OR REPLACE PROCEDURE engine.smart_update(
+    table_name    regclass,
+    set_clause    text,
+    where_clause  text    DEFAULT NULL,
+    row_threshold bigint  DEFAULT 150000)   -- deprecated, ignored
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    _nspname             text;
+    _relname             text;
+    _qualname            text;
+    _collist             text;
+    _storage_id          bigint;
+    _stripe_num          bigint;
+    _first_rn            bigint;
+    _last_rn             bigint;
+    _tid_min             tid;
+    _tid_max             tid;
+    _rows_in_stripe      bigint;
+    _n_ins               bigint;
+    _total_ins           bigint := 0;
+    _n_stripes_rewritten int    := 0;
+    _saved_timeout       text;
+    _saved_lock_timeout  text;
+BEGIN
+    -- ----------------------------------------------------------------
+    -- Resolve qualified name and validate table type
+    -- ----------------------------------------------------------------
+    SELECT n.nspname, c.relname
+      INTO _nspname, _relname
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid = table_name;
+
+    _qualname := quote_ident(_nspname) || '.' || quote_ident(_relname);
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_am a ON a.oid = c.relam
+        WHERE c.oid = table_name AND a.amname = 'colcompress'
+    ) THEN
+        RAISE EXCEPTION 'smart_update: % is not a colcompress table', _qualname;
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- Stripe-grouped full rewrite (always — see header comment)
+    -- ----------------------------------------------------------------
+    RAISE NOTICE 'smart_update: stripe-grouped rewrite starting on %', _qualname;
+
+    _saved_timeout      := current_setting('statement_timeout');
+    _saved_lock_timeout := current_setting('lock_timeout');
+    PERFORM set_config('statement_timeout', '0', false);
+    PERFORM set_config('lock_timeout',      '0', false);
+
+    -- Use at most half the available parallel workers so smart_update
+    -- does not crowd out production queries on servers with many CPUs.
+    -- Integer division floors naturally: 1/2=0 (serial), 2/2=1, 4/2=2, …
+    -- 0 disables parallel gather entirely, which is correct when
+    -- max_parallel_workers is 0 or 1.
+    PERFORM set_config(
+        'max_parallel_workers_per_gather',
+        (current_setting('max_parallel_workers')::int / 2)::text,
+        false
+    );
+
+    _storage_id := engine.colcompress_relation_storageid(table_name);
+
+    -- Build full column list for INSERT/SELECT
+    SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum)
+      INTO _collist
+      FROM pg_attribute
+     WHERE attrelid = table_name AND attnum > 0 AND NOT attisdropped;
+
+    -- Iterate over stripes in physical order
+    FOR _stripe_num, _first_rn, _last_rn IN
+        SELECT stripe_num,
+               first_row_number,
+               first_row_number + row_count - 1
+          FROM engine.stripe
+         WHERE storage_id = _storage_id
+         ORDER BY stripe_num
+    LOOP
+        -- Re-apply after each COMMIT: PostgreSQL resets session GUCs that were
+        -- overridden by set_config when a new transaction starts inside a procedure.
+        PERFORM set_config('statement_timeout', '0', false);
+        PERFORM set_config('lock_timeout',      '0', false);
+
+        _tid_min := engine.row_number_to_tid(_first_rn);
+        _tid_max := engine.row_number_to_tid(_last_rn);
+
+        -- Fast check: does this stripe contain any matching row?
+        EXECUTE format(
+            'SELECT count(*) FROM %s WHERE ctid BETWEEN $1 AND $2%s',
+            _qualname,
+            CASE WHEN where_clause IS NOT NULL
+                 THEN ' AND (' || where_clause || ')' ELSE '' END
+        ) USING _tid_min, _tid_max
+          INTO _rows_in_stripe;
+
+        CONTINUE WHEN _rows_in_stripe = 0;
+
+        -- a. Buffer the ENTIRE stripe into a temp heap table (bounded memory)
+        EXECUTE format(
+            'CREATE TEMP TABLE _se_stripe_tmp ON COMMIT DROP AS'
+            ' SELECT %s FROM %s WHERE ctid BETWEEN $1 AND $2',
+            _collist, _qualname
+        ) USING _tid_min, _tid_max;
+
+        -- b. Apply SET clause to matching rows in the temp table (cheap heap UPDATE)
+        EXECUTE format(
+            'UPDATE _se_stripe_tmp SET %s%s',
+            set_clause,
+            CASE WHEN where_clause IS NOT NULL
+                 THEN ' WHERE ' || where_clause ELSE '' END
+        );
+
+        -- c. DELETE ALL rows from this stripe in colcompress
+        --    (just marks deleted bits in row_mask — no decompression)
+        EXECUTE format(
+            'DELETE FROM %s WHERE ctid BETWEEN $1 AND $2',
+            _qualname
+        ) USING _tid_min, _tid_max;
+
+        -- d. INSERT all rows back (modified + unchanged) into colcompress.
+        --    This writes one new, fully-packed stripe with fresh min/max metadata.
+        EXECUTE format(
+            'INSERT INTO %s (%s) SELECT %s FROM _se_stripe_tmp',
+            _qualname, _collist, _collist
+        );
+        GET DIAGNOSTICS _n_ins = ROW_COUNT;
+
+        -- e. COMMIT — ON COMMIT DROP destroys _se_stripe_tmp atomically.
+        --    If the server is killed here, the entire stripe (DELETE+INSERT)
+        --    is rolled back and the original rows are restored.
+        COMMIT;
+
+        _total_ins          := _total_ins + _n_ins;
+        _n_stripes_rewritten := _n_stripes_rewritten + 1;
+
+        RAISE NOTICE 'smart_update: stripe % — % rows rewritten (% matching), running total: %',
+            _stripe_num, _n_ins, _rows_in_stripe, _total_ins;
+    END LOOP;
+
+    PERFORM set_config('statement_timeout', _saved_timeout,      false);
+    PERFORM set_config('lock_timeout',      _saved_lock_timeout, false);
+    COMMIT;
+
+    RAISE NOTICE
+        E'smart_update: complete — % rows rewritten across % stripe(s).\n'
+        'IMPORTANT: ctid values of rewritten rows changed. Run:\n'
+        '  REINDEX TABLE CONCURRENTLY %s;',
+        _total_ins, _n_stripes_rewritten, _qualname;
+END;
+$$;
+
+COMMENT ON PROCEDURE engine.smart_update(regclass, text, text, bigint)
+IS 'Stripe-grouped full rewrite for colcompress tables. Always rewrites at the stripe level regardless of how many rows are affected: reads the entire affected stripe into a bounded temp heap, applies SET in-place, deletes all stripe rows (deleted-bit only, no decompression), and reinserts all rows — producing a fully packed new stripe with fresh min/max metadata. One COMMIT per stripe; crash-safe (re-run CALL to retry any rolled-back stripe). The row_threshold parameter is deprecated and ignored. Run REINDEX TABLE CONCURRENTLY after completion.';
+
+GRANT EXECUTE ON PROCEDURE engine.smart_update(regclass, text, text, bigint) TO PUBLIC;
 
 
