@@ -21,6 +21,7 @@ typedef enum
 	COMPRESSION_LZ4 = 2,
 	COMPRESSION_ZSTD = 3,
 	COMPRESSION_DEFLATE = 4,
+	COMPRESSION_ZXC = 5,    /* ZXC asymmetric codec: https://github.com/hellobertrand/zxc */
 
 	COMPRESSION_COUNT
 } CompressionType;

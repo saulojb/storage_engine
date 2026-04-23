@@ -32,6 +32,10 @@
 #include <libdeflate.h>
 #endif
 
+#if HAVE_LIBZXC
+#include <zxc.h>
+#endif
+
 #if PG_VERSION_NUM >= PG_VERSION_16
 #include "varatt.h"
 #endif
@@ -156,6 +160,35 @@ CompressBuffer(StringInfo inputBuffer,
 
 			elog(DEBUG1, "deflate compressed %d bytes to %zu bytes",
 				 inputBuffer->len, compressedSize);
+
+			outputBuffer->len = compressedSize;
+			return true;
+		}
+#endif
+
+#if HAVE_LIBZXC
+		case COMPRESSION_ZXC:
+		{
+			zxc_compress_opts_t opts = {
+				.level = compressionLevel > 0 ? compressionLevel : ZXC_LEVEL_DEFAULT,
+			};
+
+			uint64_t maximumLength = zxc_compress_bound(inputBuffer->len);
+
+			resetStringInfo(outputBuffer);
+			enlargeStringInfo(outputBuffer, maximumLength);
+
+			int64_t compressedSize = zxc_compress(inputBuffer->data, inputBuffer->len,
+												  outputBuffer->data, maximumLength,
+												  &opts);
+			if (compressedSize <= 0)
+			{
+				elog(DEBUG1, "zxc_compress failed for input size=%d", inputBuffer->len);
+				return false;
+			}
+
+			elog(DEBUG1, "zxc compressed %d bytes to %lld bytes",
+				 inputBuffer->len, (long long) compressedSize);
 
 			outputBuffer->len = compressedSize;
 			return true;
@@ -300,6 +333,34 @@ DecompressBuffer(StringInfo buffer,
 				ereport(ERROR, (errmsg("unexpected decompressed size"),
 								errdetail("Expected %lu, received %zu",
 										  decompressedSize, actualSize)));
+			}
+
+			decompressedBuffer->len = decompressedSize;
+			return decompressedBuffer;
+		}
+#endif
+
+#if HAVE_LIBZXC
+		case COMPRESSION_ZXC:
+		{
+			StringInfo decompressedBuffer = makeStringInfo();
+			enlargeStringInfo(decompressedBuffer, decompressedSize);
+
+			zxc_decompress_opts_t opts = { 0 };
+			int64_t actualSize = zxc_decompress(buffer->data, buffer->len,
+												decompressedBuffer->data, decompressedSize,
+												&opts);
+			if (actualSize < 0)
+			{
+				ereport(ERROR, (errmsg("zxc decompression failed"),
+								errdetail("error code: %lld", (long long) actualSize)));
+			}
+
+			if ((uint64_t) actualSize != decompressedSize)
+			{
+				ereport(ERROR, (errmsg("unexpected decompressed size"),
+								errdetail("Expected %lu, received %lld",
+										  decompressedSize, (long long) actualSize)));
 			}
 
 			decompressedBuffer->len = decompressedSize;

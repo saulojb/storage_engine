@@ -26,3 +26,10 @@ ifneq (,$(wildcard /usr/include/libdeflate.h))
   override CPPFLAGS += -DHAVE_LIBDEFLATE=1
   SHLIB_LINK += -ldeflate
 endif
+
+# ZXC optional support — asymmetric codec, especially fast on ARM64/Graviton
+# See: https://github.com/hellobertrand/zxc
+ifneq (,$(wildcard /usr/local/include/zxc.h))
+  override CPPFLAGS += -DHAVE_LIBZXC=1
+  SHLIB_LINK += -lzxc
+endif
