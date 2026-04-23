@@ -1,5 +1,38 @@
 # CHANGELOG
 
+## 1.2.1
+
+* fix: **GUC visibility** — `storage_engine.enable_vectorization`,
+  `enable_parallel_execution`, `enable_dml`, and `enable_engine_index_scan`
+  were registered with `GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE`, hiding them
+  from `\dconfig` and psql tab-completion. Removed — all operational GUCs
+  are now discoverable. Note: GUCs only take effect when the extension is
+  listed in `shared_preload_libraries`.
+
+* fix: **`-Wmissing-variable-declarations`** — `ColumnarScanPathMethods`,
+  `ColumnarScanScanMethods`, and `ColumnarScanExecuteMethods` lacked
+  `extern` declarations in `engine_customscan.h`, causing warnings (fatal
+  with `-Werror`) under stricter compiler settings.
+
+* fix: **`table_beginscan` 5-argument compile error on PG16–18** — The PG19
+  API added a 5th `flags` argument to `table_beginscan`. The call site in
+  `RCScan_BeginCustomScan` is now guarded with
+  `#if PG_VERSION_NUM >= PG_VERSION_19`. This error affected builds from
+  the `v1.2.0` tag against PG16–18.
+
+* fix: **`statement_timeout` cancels `engine.smart_update` /
+  `engine.colcompress_bulk_update` mid-run** — `set_config('statement_timeout',
+  '0', false)` was applied once before the stripe loop, but PostgreSQL
+  resets session-level GUCs at each `COMMIT` inside a procedure. Both
+  procedures now re-apply the timeout overrides at the top of every loop
+  iteration.
+
+* feat: **`engine.smart_update` parallel worker cap** —
+  `max_parallel_workers_per_gather` is set to `max_parallel_workers / 2`
+  at procedure start, preventing the maintenance procedure from consuming
+  the full parallel worker pool. Integer division: 0→0 (serial), 1→0
+  (serial), 2→1, 4→2, 16→8.
+
 ## 1.2.0
 * feat: **`index_scan` per-table option for `rowcompress`** —
   `rowcompress` now supports `index_scan` as a per-table flag, providing

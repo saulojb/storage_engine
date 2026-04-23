@@ -533,6 +533,35 @@ CREATE INDEX ON events_col USING gin (tags);
 SELECT engine.alter_colcompress_table_set('events_col'::regclass, index_scan => false);
 ```
 
+### UPDATE behavior and fragmentation on colcompress
+
+Direct `UPDATE` on a `colcompress` table creates a deleted-bit hole in the original stripe and writes a new 1-row mini-stripe. Doing many individual UPDATEs will fragment the table significantly.
+
+**For partial updates (<~30% of rows):** use `engine.smart_update`, which rewrites affected stripes in bulk:
+
+```sql
+CALL engine.smart_update(
+  'schema.table'::regclass,
+  'col1 = expr1, col2 = expr2',   -- SET clause
+  'col3 = value'                   -- WHERE clause
+);
+```
+
+**For full or near-full rewrites (>50% of rows):** the fastest pattern is clone → truncate → reinsert:
+
+```sql
+CREATE TABLE tmp_heap AS SELECT * FROM my_colcompress_table;
+TRUNCATE my_colcompress_table;
+INSERT INTO my_colcompress_table SELECT * FROM tmp_heap;
+DROP TABLE tmp_heap;
+```
+
+This typically completes in seconds for millions of rows. After any rewrite that changes physical CTIDs, run:
+
+```sql
+REINDEX TABLE CONCURRENTLY my_colcompress_table;
+```
+
 ### No CLUSTER support
 
 `CLUSTER` (index-ordered physical rewrite) is not implemented for columnar tables. Use `engine.colcompress_merge()` with an `orderby` option to achieve equivalent physical ordering.
