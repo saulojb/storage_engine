@@ -829,6 +829,11 @@ BEGIN
     --   done=false -> batch retried from scratch.  No data loss possible.
     -- ----------------------------------------------------------------
     LOOP
+        -- Re-apply after each COMMIT: PostgreSQL resets session GUCs that were
+        -- overridden by set_config when a new transaction starts inside a procedure.
+        PERFORM set_config('statement_timeout', '0', false);
+        PERFORM set_config('lock_timeout',      '0', false);
+
         EXECUTE format(
             'WITH cum AS ('
             '  SELECT stripe_idx, first_rn, row_count,'
@@ -1027,6 +1032,17 @@ BEGIN
     PERFORM set_config('statement_timeout', '0', false);
     PERFORM set_config('lock_timeout',      '0', false);
 
+    -- Use at most half the available parallel workers so smart_update
+    -- does not crowd out production queries on servers with many CPUs.
+    -- Integer division floors naturally: 1/2=0 (serial), 2/2=1, 4/2=2, …
+    -- 0 disables parallel gather entirely, which is correct when
+    -- max_parallel_workers is 0 or 1.
+    PERFORM set_config(
+        'max_parallel_workers_per_gather',
+        (current_setting('max_parallel_workers')::int / 2)::text,
+        false
+    );
+
     _storage_id := engine.colcompress_relation_storageid(table_name);
 
     -- Build full column list for INSERT/SELECT
@@ -1044,6 +1060,11 @@ BEGIN
          WHERE storage_id = _storage_id
          ORDER BY stripe_num
     LOOP
+        -- Re-apply after each COMMIT: PostgreSQL resets session GUCs that were
+        -- overridden by set_config when a new transaction starts inside a procedure.
+        PERFORM set_config('statement_timeout', '0', false);
+        PERFORM set_config('lock_timeout',      '0', false);
+
         _tid_min := engine.row_number_to_tid(_first_rn);
         _tid_max := engine.row_number_to_tid(_last_rn);
 
