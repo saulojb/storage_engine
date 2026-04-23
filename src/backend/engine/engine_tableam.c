@@ -54,6 +54,9 @@
 #include "storage/read_stream.h"
 #endif
 #include "executor/spi.h"
+#if PG_VERSION_NUM >= PG_VERSION_19
+#include "utils/tuplesort.h"
+#endif
 #include "parser/parser.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
@@ -626,7 +629,11 @@ engine_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 
 
 static IndexFetchTableData *
-engine_index_fetch_begin(Relation rel)
+engine_index_fetch_begin(Relation rel
+#if PG_VERSION_NUM >= PG_VERSION_19
+							   , uint32 flags
+#endif
+							   )
 {
 #if PG_VERSION_NUM >= PG_VERSION_16
 	Oid relfilelocator = rel->rd_locator.relNumber;
@@ -1149,7 +1156,11 @@ engine_compute_xid_horizon_for_tuples(Relation rel,
 
 static void
 engine_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+					  uint32 options, BulkInsertState bistate)
+#else
 					  int options, BulkInsertState bistate)
+#endif
 {
 	previousCacheEnabledState = engine_enable_page_cache;
 	engine_enable_page_cache = false;
@@ -1184,7 +1195,12 @@ engine_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 
 static void
 engine_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
-								  CommandId cid, int options,
+								  CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+								  uint32 options,
+#else
+								  int options,
+#endif
 								  BulkInsertState bistate, uint32 specToken)
 {
 	previousCacheEnabledState = engine_enable_page_cache;
@@ -1246,7 +1262,13 @@ engine_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 
 static void
 engine_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
-					  CommandId cid, int options, BulkInsertState bistate)
+					  CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+					  uint32 options,
+#else
+					  int options,
+#endif
+					  BulkInsertState bistate)
 {
 	ColumnarWriteState *writeState = engine_init_write_state(relation,
 															   RelationGetDescr(relation),
@@ -1291,8 +1313,15 @@ engine_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 static TM_Result
 engine_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
+#if PG_VERSION_NUM >= PG_VERSION_19
+					  uint32 options,
+#endif
 					  Snapshot snapshot, Snapshot crosscheck, bool wait,
-					  TM_FailureData *tmfd, bool changingPart)
+					  TM_FailureData *tmfd
+#if PG_VERSION_NUM < PG_VERSION_19
+					  , bool changingPart
+#endif
+					  )
 {
 	uint64 rowNumber = tid_to_row_number(*tid);
 #if PG_VERSION_NUM >= PG_VERSION_16
@@ -1317,7 +1346,14 @@ engine_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 }
 
 
-#if PG_VERSION_NUM >= PG_VERSION_16
+#if PG_VERSION_NUM >= PG_VERSION_19
+static TM_Result
+engine_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
+					  CommandId cid, uint32 options,
+					  Snapshot snapshot, Snapshot crosscheck,
+					  bool wait, TM_FailureData *tmfd,
+					  LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
+#elif PG_VERSION_NUM >= PG_VERSION_16
 static TM_Result
 engine_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 					  CommandId cid, Snapshot snapshot, Snapshot crosscheck,
@@ -1403,7 +1439,12 @@ engine_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 
 
 static void
-engine_finish_bulk_insert(Relation relation, int options)
+engine_finish_bulk_insert(Relation relation,
+#if PG_VERSION_NUM >= PG_VERSION_19
+							   uint32 options)
+#else
+							   int options)
+#endif
 {
 	/*
 	 * Nothing to do here. We keep write states live until transaction end.
@@ -1512,6 +1553,9 @@ static void
 engine_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 								   Relation OldIndex, bool use_sort,
 								   TransactionId OldestXmin,
+#if PG_VERSION_NUM >= PG_VERSION_19
+								   Snapshot snapshot,
+#endif
 								   TransactionId *xid_cutoff,
 								   MultiXactId *multi_cutoff,
 								   double *num_tuples,
@@ -1556,7 +1600,9 @@ engine_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	List *scanQual = NIL;
 
 	/* use SnapshotAny when re-writing table as heapAM does */
+#if PG_VERSION_NUM < PG_VERSION_19
 	Snapshot snapshot = SnapshotAny;
+#endif
 
 	MemoryContext scanContext = CreateColumnarScanMemoryContext();
 	bool randomAccess = false;
@@ -1843,7 +1889,12 @@ ColumnarTableTupleCount(Relation relation)
  * engine_vacuum_rel implements VACUUM without FULL option.
  */
 static void
-engine_vacuum_rel(Relation rel, VacuumParams *params,
+engine_vacuum_rel(Relation rel,
+#if PG_VERSION_NUM >= PG_VERSION_19
+					const VacuumParams *params,
+#else
+					VacuumParams *params,
+#endif
 					BufferAccessStrategy bstrategy)
 {
 	/* Capture the cache state and disable it for a vacuum. */
@@ -1984,7 +2035,12 @@ engine_vacuum_rel(Relation rel, VacuumParams *params,
 #endif
 #endif
 
-#if PG_VERSION_NUM >= PG_VERSION_18
+#if PG_VERSION_NUM >= PG_VERSION_19
+	pgstat_report_vacuum(rel,
+							Max(new_live_tuples, 0),
+							0,
+							GetCurrentTimestamp());
+#elif PG_VERSION_NUM >= PG_VERSION_18
 	pgstat_report_vacuum(RelationGetRelid(rel),
 							rel->rd_rel->relisshared,
 							Max(new_live_tuples, 0),
@@ -2302,7 +2358,10 @@ engine_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 
 
 static bool
-engine_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
+engine_scan_analyze_next_tuple(TableScanDesc scan,
+#if PG_VERSION_NUM < PG_VERSION_19
+								 TransactionId OldestXmin,
+#endif
 								 double *liverows, double *deadrows,
 								 TupleTableSlot *slot)
 {
@@ -3503,7 +3562,11 @@ detoast_values(TupleDesc tupleDesc, Datum *orig_values, bool *isnull)
 	for (int i = 0; i < tupleDesc->natts; i++)
 	{
 		if (!isnull[i] && TupleDescAttr(tupleDesc, i)->attlen == -1 &&
+#if PG_VERSION_NUM >= PG_VERSION_19
+			VARATT_IS_EXTENDED(DatumGetPointer(values[i])))
+#else
 			VARATT_IS_EXTENDED(values[i]))
+#endif
 		{
 			/* make a copy */
 			if (values == orig_values)

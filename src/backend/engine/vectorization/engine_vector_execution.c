@@ -20,6 +20,7 @@
 #include "nodes/makefuncs.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_func.h"
+#include "access/htup_details.h"
 
 #include "utils/syscache.h"
 
@@ -120,7 +121,19 @@ GetVectorizedProcedureOid(Oid procedureOid, Oid *vectorizedProcedureOid)
 	for (i = 0; i < procedureForm->pronargs; i++)
 		argtypes[i] = procedureForm->proargtypes.values[i];
 	
-#if PG_VERSION_NUM >= PG_VERSION_14
+#if PG_VERSION_NUM >= PG_VERSION_19
+	{
+		int fgc_flags = 0;
+		fdResult = func_get_detail(funcNames, NIL, NIL,
+								procedureForm->pronargs, argtypes,
+								false, true, false,
+								&fgc_flags,
+								vectorizedProcedureOid,
+								&retype, &retset,
+								&nvargs, &vatype,
+								&true_oid_array, NULL);
+	}
+#elif PG_VERSION_NUM >= PG_VERSION_14
 	fdResult = func_get_detail(funcNames, NIL, NIL,
 								procedureForm->pronargs, argtypes,
 								false, true, false,

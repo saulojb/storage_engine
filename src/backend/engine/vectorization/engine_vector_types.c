@@ -48,7 +48,11 @@ CreateVectorTupleTableSlot(TupleDesc tupleDesc)
 	tts_ops = TTSOpsVirtual;
 	tts_ops.base_slot_size = sizeof(VectorTupleTableSlot);
 
-	slot = MakeTupleTableSlot(CreateTupleDescCopy(tupleDesc), &tts_ops);
+	slot = MakeTupleTableSlot(CreateTupleDescCopy(tupleDesc), &tts_ops
+#if PG_VERSION_NUM >= PG_VERSION_19
+									  , 0
+#endif
+									  );
 
 	TupleDesc slotTupleDesc  = slot->tts_tupleDescriptor;
 

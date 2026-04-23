@@ -199,7 +199,11 @@ ColumnarStorageInit(SMgrRelation srel, uint64 storageId)
 				COLUMNAR_METAPAGE_BLOCKNO, page, true);
 #endif
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+	PageSetChecksum(page, COLUMNAR_METAPAGE_BLOCKNO);
+#else
 	PageSetChecksumInplace(page, COLUMNAR_METAPAGE_BLOCKNO);
+#endif
 	smgrextend(srel, MAIN_FORKNUM, COLUMNAR_METAPAGE_BLOCKNO, page, true);
 
 	/* write empty page */
@@ -213,7 +217,11 @@ ColumnarStorageInit(SMgrRelation srel, uint64 storageId)
 				COLUMNAR_EMPTY_BLOCKNO, page, true);
 #endif
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+	PageSetChecksum(page, COLUMNAR_EMPTY_BLOCKNO);
+#else
 	PageSetChecksumInplace(page, COLUMNAR_EMPTY_BLOCKNO);
+#endif
 	smgrextend(srel, MAIN_FORKNUM, COLUMNAR_EMPTY_BLOCKNO, page, true);
 
 	/*

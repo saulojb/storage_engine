@@ -269,6 +269,9 @@
 #include "executor/execExpr.h"
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
+#if PG_VERSION_NUM >= PG_VERSION_19
+#include "executor/instrument.h"
+#endif
 #include "lib/hyperloglog.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -279,7 +282,9 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#if PG_VERSION_NUM < PG_VERSION_19
 #include "utils/dynahash.h"
+#endif
 #include "utils/expandeddatum.h"
 #include "utils/logtape.h"
 #include "utils/lsyscache.h"
@@ -291,6 +296,26 @@
 #include "engine/engine_version_compat.h"
 #include "engine/vectorization/engine_vector_execution.h"
 #include "engine/vectorization/nodes/engine_aggregator_node.h"
+
+#if PG_VERSION_NUM >= PG_VERSION_19
+/*
+ * my_log2 was removed from dynahash.h in PG19.
+ * Provide a local equivalent: ceil(log2(num)), returning at least 1.
+ */
+static inline int
+my_log2(long num)
+{
+	int bits = 0;
+	long val = num - 1;
+
+	while (val > 0)
+	{
+		bits++;
+		val >>= 1;
+	}
+	return (bits < 1) ? 1 : bits;
+}
+#endif /* PG_VERSION_NUM >= PG_VERSION_19 */
 
 /*
  * Control how many partitions are created when spilling HashAgg to
@@ -1803,8 +1828,13 @@ find_hash_columns(AggState *aggstate)
 							  &perhash->eqfuncoids,
 							  &perhash->hashfunctions);
 		perhash->hashslot =
+#if PG_VERSION_NUM >= PG_VERSION_19
+			ExecAllocTableSlot(&estate->es_tupleTable, hashDesc,
+							   &TTSOpsMinimalTuple, 0);
+#else
 			ExecAllocTableSlot(&estate->es_tupleTable, hashDesc,
 							   &TTSOpsMinimalTuple);
+#endif
 
 		list_free(hashTlist);
 		bms_free(colnos);

@@ -8,6 +8,9 @@
 #include "catalog/index.h"
 #include "executor/execdebug.h"
 #include "executor/nodeIndexscan.h"
+#if PG_VERSION_NUM >= PG_VERSION_19
+#include "executor/instrument.h"
+#endif
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
@@ -19,6 +22,7 @@
 #include "utils/array.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
+#include "utils/sortsupport.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -613,26 +617,30 @@ ColumnarIndexScan_ExecIndexScanInitializeDSM(IndexScanState *node,
 	index_parallelscan_initialize(node->ss.ss_currentRelation,
 								  node->iss_RelationDesc,
 								  estate->es_snapshot,
-#if PG_VERSION_NUM >= PG_VERSION_18
-								  false, false, 0, NULL,
+#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+                                                                  false, false, 0, NULL,
 #endif
-								  piscan);
+                                                                  piscan);
 
-	node->iss_ScanDesc =
-		index_beginscan_parallel(node->ss.ss_currentRelation,
-								 node->iss_RelationDesc,
+        node->iss_ScanDesc =
+                index_beginscan_parallel(node->ss.ss_currentRelation,
+                                                                 node->iss_RelationDesc,
 #if PG_VERSION_NUM >= PG_VERSION_18
-								 NULL,
+                                                                 NULL,
 #endif
-								 node->iss_NumScanKeys,
-								 node->iss_NumOrderByKeys,
-								 piscan);
+                                                                 node->iss_NumScanKeys,
+                                                                 node->iss_NumOrderByKeys,
+                                                                 piscan
+#if PG_VERSION_NUM >= PG_VERSION_19
+                                                                 , 0
+#endif
+                                                                 );
 
-	/*
-	 * If no run-time keys to calculate or they are ready, go ahead and pass
-	 * the scankeys to the index AM.
-	 */
-	if (node->iss_NumRuntimeKeys == 0 || node->iss_RuntimeKeysReady)
+        /*
+         * If no run-time keys to calculate or they are ready, go ahead and pass
+         * the scankeys to the index AM.
+         */
+        if (node->iss_NumRuntimeKeys == 0 || node->iss_RuntimeKeysReady)
 		index_rescan(node->iss_ScanDesc,
 					 node->iss_ScanKeys, node->iss_NumScanKeys,
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
@@ -659,7 +667,11 @@ ColumnarIndexScan_ExecIndexScanInitializeWorker(IndexScanState *node,
 #endif
 								 node->iss_NumScanKeys,
 								 node->iss_NumOrderByKeys,
-								 piscan);
+								 piscan
+#if PG_VERSION_NUM >= PG_VERSION_19
+								 , 0
+#endif
+								 );
 
 	/*
 	 * If no run-time keys to calculate or they are ready, go ahead and pass

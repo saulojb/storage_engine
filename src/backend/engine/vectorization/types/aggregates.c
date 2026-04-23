@@ -12,6 +12,14 @@
 #include "engine/vectorization/types/types.h"
 #include "engine/vectorization/types/numeric.h"
 
+/*
+ * PG19 renamed numeric_xxx_opt_error() → numeric_xxx_safe().
+ * Provide a compat shim so callers need not be ifdef'd individually.
+ */
+#if PG_VERSION_NUM >= PG_VERSION_19
+#define numeric_div_opt_error(a, b, err) numeric_div_safe((a), (b), NULL)
+#endif
+
 /* count */
 
 PG_FUNCTION_INFO_V1(se_vemptycount);
