@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 1.2.3
+
+* fix: **`CREATE EXTENSION` failure on fresh install** — `default_version` in
+  `storage_engine.control` was incorrectly bumped to `1.2.2` in the previous
+  release, causing `ERROR: extension "storage_engine" has no installation
+  script nor update path for version "1.2.2"`. The SQL extension version only
+  needs to change when catalog objects (tables, functions, views in the
+  `engine` schema) actually change. 1.2.2 was a C/build-only release —
+  `default_version` has been corrected back to `1.2.1`.
+  Reported by user after installing from PGXN.
+
 ## 1.2.2
 
 * feat: **ZXC compression** (`compression='zxc'`) — adds support for the
