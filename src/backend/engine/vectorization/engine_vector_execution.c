@@ -114,6 +114,9 @@ GetVectorizedProcedureOid(Oid procedureOid, Oid *vectorizedProcedureOid)
 	
 	ReleaseSysCache(procedureTuple);
 
+	/* Qualify with "engine" schema so vectorized aggregates are found
+	 * regardless of the session search_path. */
+	funcNames = lappend(funcNames, makeString("engine"));
 	funcNames = lappend(funcNames, makeString(vectorizedProcedureName));
 
 	argtypes = palloc(sizeof(Oid) * procedureForm->pronargs);

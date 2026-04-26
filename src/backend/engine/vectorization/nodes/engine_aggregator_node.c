@@ -291,6 +291,8 @@
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
+#include "commands/explain.h"
+#include "commands/explain_format.h"
 
 #include "engine/vectorization/engine_vector_types.h"
 #include "engine/engine_version_compat.h"
@@ -5397,7 +5399,7 @@ EndVectorAgg(CustomScanState *node)
 static void
 ExplainAggNode(CustomScanState *node, List *ancestors, ExplainState *es)
 {
-
+	ExplainPropertyText("Engine Vectorized Aggregate", "enabled", es);
 }
 
 

@@ -23,7 +23,7 @@
 /* count */
 
 PG_FUNCTION_INFO_V1(se_vemptycount);
-Datum vemptycount(PG_FUNCTION_ARGS)
+Datum se_vemptycount(PG_FUNCTION_ARGS)
 {
 	int64 arg = PG_GETARG_INT64(0);
 	PG_RETURN_INT64(arg);
@@ -106,47 +106,49 @@ se_vint2acc(PG_FUNCTION_ARGS)
 }
 
 PG_FUNCTION_INFO_V1(se_vint2larger);
-Datum vint2larger(PG_FUNCTION_ARGS)
+Datum se_vint2larger(PG_FUNCTION_ARGS)
 {
-	int16 maxValue = PG_GETARG_INT16(0);
+	int16 maxValue = PG_ARGISNULL(0) ? INT16_MIN : PG_GETARG_INT16(0);
+	bool anyValue = !PG_ARGISNULL(0);
 	VectorColumn *arg2 = (VectorColumn*) PG_GETARG_POINTER(1);
-	int16 result = maxValue;
 	int i = 0;
 
 	int16 *vectorValue = (int16*) arg2->value;
 
-	for (i = 0; i < arg2->dimension; i++) 
+	for (i = 0; i < arg2->dimension; i++)
 	{
 		if (arg2->isnull[i])
 			continue;
-
-		result = Max(result, vectorValue[i]);
+		maxValue = Max(maxValue, vectorValue[i]);
+		anyValue = true;
 	}
 
-	maxValue = Max(maxValue, result);
+	if (!anyValue)
+		PG_RETURN_NULL();
 
 	PG_RETURN_INT16(maxValue);
 }
 
 PG_FUNCTION_INFO_V1(se_vint2smaller);
-Datum vint2smaller(PG_FUNCTION_ARGS)
+Datum se_vint2smaller(PG_FUNCTION_ARGS)
 {
-	int16 minValue = PG_GETARG_INT32(0);
+	int16 minValue = PG_ARGISNULL(0) ? INT16_MAX : PG_GETARG_INT16(0);
+	bool anyValue = !PG_ARGISNULL(0);
 	VectorColumn *arg2 = (VectorColumn*) PG_GETARG_POINTER(1);
-	int16 result = minValue;
 	int i = 0;
 
 	int16 *vectorValue = (int16*) arg2->value;
 
-	for (i = 0; i < arg2->dimension; i++) 
+	for (i = 0; i < arg2->dimension; i++)
 	{
 		if (arg2->isnull[i])
 			continue;
-
-		result = Min(result, vectorValue[i]);
+		minValue = Min(minValue, vectorValue[i]);
+		anyValue = true;
 	}
 
-	minValue = Min(minValue, result);
+	if (!anyValue)
+		PG_RETURN_NULL();
 
 	PG_RETURN_INT16(minValue);
 }
@@ -208,47 +210,49 @@ se_vint4acc(PG_FUNCTION_ARGS)
 }
 
 PG_FUNCTION_INFO_V1(se_vint4larger);
-Datum vint4larger(PG_FUNCTION_ARGS)
+Datum se_vint4larger(PG_FUNCTION_ARGS)
 {
-	int32 maxValue = PG_GETARG_INT32(0);
+	int32 maxValue = PG_ARGISNULL(0) ? INT32_MIN : PG_GETARG_INT32(0);
+	bool anyValue = !PG_ARGISNULL(0);
 	VectorColumn *arg2 = (VectorColumn*) PG_GETARG_POINTER(1);
-	int32 result = maxValue;
 	int i = 0;
 
 	int32 *vectorValue = (int32*) arg2->value;
 
-	for (i = 0; i < arg2->dimension; i++) 
+	for (i = 0; i < arg2->dimension; i++)
 	{
 		if (arg2->isnull[i])
 			continue;
-
-		result = Max(result, vectorValue[i]);
+		maxValue = Max(maxValue, vectorValue[i]);
+		anyValue = true;
 	}
 
-	maxValue = Max(maxValue, result);
+	if (!anyValue)
+		PG_RETURN_NULL();
 
 	PG_RETURN_INT32(maxValue);
 }
 
 PG_FUNCTION_INFO_V1(se_vint4smaller);
-Datum vint4smaller(PG_FUNCTION_ARGS)
+Datum se_vint4smaller(PG_FUNCTION_ARGS)
 {
-	int32 minValue = PG_GETARG_INT32(0);
+	int32 minValue = PG_ARGISNULL(0) ? INT32_MAX : PG_GETARG_INT32(0);
+	bool anyValue = !PG_ARGISNULL(0);
 	VectorColumn *arg2 = (VectorColumn*) PG_GETARG_POINTER(1);
-	int32 result = minValue;
 	int i = 0;
 
 	int32 *vectorValue = (int32*) arg2->value;
 
-	for (i = 0; i < arg2->dimension; i++) 
+	for (i = 0; i < arg2->dimension; i++)
 	{
 		if (arg2->isnull[i])
 			continue;
-
-		result = Min(result, vectorValue[i]);
+		minValue = Min(minValue, vectorValue[i]);
+		anyValue = true;
 	}
 
-	minValue = Min(minValue, result);
+	if (!anyValue)
+		PG_RETURN_NULL();
 
 	PG_RETURN_INT32(minValue);
 }
@@ -371,47 +375,49 @@ se_vint8avg(PG_FUNCTION_ARGS)
 }
 
 PG_FUNCTION_INFO_V1(se_vint8larger);
-Datum vint8larger(PG_FUNCTION_ARGS)
+Datum se_vint8larger(PG_FUNCTION_ARGS)
 {
-	int64 maxValue = PG_GETARG_INT64(0);
+	int64 maxValue = PG_ARGISNULL(0) ? INT64_MIN : PG_GETARG_INT64(0);
+	bool anyValue = !PG_ARGISNULL(0);
 	VectorColumn *arg2 = (VectorColumn*) PG_GETARG_POINTER(1);
-	int64 result = 0;
 	int i = 0;
 
 	int64 *vectorValue = (int64*) arg2->value;
 
-	for (i = 0; i < arg2->dimension; i++) 
+	for (i = 0; i < arg2->dimension; i++)
 	{
 		if (arg2->isnull[i])
 			continue;
-
-		result = Max(maxValue, vectorValue[i]);
+		maxValue = Max(maxValue, vectorValue[i]);
+		anyValue = true;
 	}
 
-	maxValue = Max(maxValue, result);
+	if (!anyValue)
+		PG_RETURN_NULL();
 
 	PG_RETURN_INT64(maxValue);
 }
 
 PG_FUNCTION_INFO_V1(se_vint8smaller);
-Datum vint8smaller(PG_FUNCTION_ARGS)
+Datum se_vint8smaller(PG_FUNCTION_ARGS)
 {
-	int64 minValue = PG_GETARG_INT64(0);
+	int64 minValue = PG_ARGISNULL(0) ? INT64_MAX : PG_GETARG_INT64(0);
+	bool anyValue = !PG_ARGISNULL(0);
 	VectorColumn *arg2 = (VectorColumn*) PG_GETARG_POINTER(1);
-	int64 result = minValue;
 	int i = 0;
 
 	int64 *vectorValue = (int64*) arg2->value;
 
-	for (i = 0; i < arg2->dimension; i++) 
+	for (i = 0; i < arg2->dimension; i++)
 	{
 		if (arg2->isnull[i])
 			continue;
-
-		result = Min(result, vectorValue[i]);
+		minValue = Min(minValue, vectorValue[i]);
+		anyValue = true;
 	}
 
-	minValue = Min(minValue, result);
+	if (!anyValue)
+		PG_RETURN_NULL();
 
 	PG_RETURN_INT64(minValue);
 }
@@ -419,47 +425,49 @@ Datum vint8smaller(PG_FUNCTION_ARGS)
 // date
 
 PG_FUNCTION_INFO_V1(se_vdatelarger);
-Datum vdatelarger(PG_FUNCTION_ARGS)
+Datum se_vdatelarger(PG_FUNCTION_ARGS)
 {
-	int32 maxValue = PG_GETARG_INT32(0);
+	int32 maxValue = PG_ARGISNULL(0) ? INT32_MIN : PG_GETARG_INT32(0);
+	bool anyValue = !PG_ARGISNULL(0);
 	VectorColumn *arg2 = (VectorColumn*) PG_GETARG_POINTER(1);
-	int32 result = maxValue;
 	int i = 0;
 
 	DateADT *vectorValue = (DateADT*) arg2->value;
 
-	for (i = 0; i < arg2->dimension; i++) 
+	for (i = 0; i < arg2->dimension; i++)
 	{
 		if (arg2->isnull[i])
 			continue;
-
-		result = Max(result, vectorValue[i]);
+		maxValue = Max(maxValue, vectorValue[i]);
+		anyValue = true;
 	}
 
-	maxValue = Max(maxValue, result);
+	if (!anyValue)
+		PG_RETURN_NULL();
 
 	PG_RETURN_INT32(maxValue);
 }
 
 PG_FUNCTION_INFO_V1(se_vdatesmaller);
-Datum vdatesmaller(PG_FUNCTION_ARGS)
+Datum se_vdatesmaller(PG_FUNCTION_ARGS)
 {
-	int32 minValue = PG_GETARG_INT32(0);
+	int32 minValue = PG_ARGISNULL(0) ? INT32_MAX : PG_GETARG_INT32(0);
+	bool anyValue = !PG_ARGISNULL(0);
 	VectorColumn *arg2 = (VectorColumn*) PG_GETARG_POINTER(1);
-	int32 result = minValue;
 	int i = 0;
 
 	DateADT *vectorValue = (DateADT*) arg2->value;
 
-	for (i = 0; i < arg2->dimension; i++) 
+	for (i = 0; i < arg2->dimension; i++)
 	{
 		if (arg2->isnull[i])
 			continue;
-
-		result = Min(result, vectorValue[i]);
+		minValue = Min(minValue, vectorValue[i]);
+		anyValue = true;
 	}
 
-	minValue = Min(minValue, result);
+	if (!anyValue)
+		PG_RETURN_NULL();
 
 	PG_RETURN_INT32(minValue);
 }

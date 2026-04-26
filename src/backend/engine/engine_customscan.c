@@ -3038,6 +3038,12 @@ ColumnarScan_ExplainCustomScan(CustomScanState *node, List *ancestors,
 							vectorizedWhereClauses, es);
 	}
 
+	if (columnarScanState->vectorization.vectorizationEnabled &&
+		columnarScanState->vectorization.vectorizationAggregate)
+	{
+		ExplainPropertyText("Engine Vectorized Aggregate", "enabled", es);
+	}
+
 	if (engine_enable_page_cache)
 	{
 		ColumnarCacheStatistics *statistics = ColumnarGetCacheStatistics();

@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## 1.2.4
+
+* feat: **Vectorized aggregates fully operational** — `vmin`, `vmax`, `vsum`, `vavg`,
+  and `vcount` are now registered in the `engine` schema (18 C functions + 16 aggregate
+  definitions). `SELECT min(col), max(col), sum(col), count(*) FROM colcompress_table`
+  transparently uses `StorageEngineVectorAgg` when `storage_engine.enable_vectorization = on`,
+  yielding ~**1.4× speedup** over standard heap-style evaluation on 1M-row tables.
+* feat: **EXPLAIN ANALYZE shows VectorAgg node** — previously `IsExplainQuery` blocked
+  vectorization for both plain `EXPLAIN` and `EXPLAIN ANALYZE`; now only plain `EXPLAIN`
+  is blocked. `EXPLAIN ANALYZE` correctly shows `Custom Scan (StorageEngineVectorAgg)`
+  with `Engine Vectorized Aggregate: enabled` annotation.
+* feat: **Schema-qualified vectorized function lookup** — `GetVectorizedProcedureOid()`
+  now searches `engine.vXXX` (schema-qualified) instead of unqualified names, preventing
+  false positives with similarly-named functions in other schemas.
+* fix: **NULL-safe vmin/vmax** — vectorized min/max transition functions now return
+  `NULL` when scanning an empty result set (previously returned `INT_MIN`/`INT_MAX`).
+  Affects `vint2smaller/larger`, `vint4smaller/larger`, `vint8smaller/larger`,
+  `vdatesmaller/larger`.
+* fix: **C function name mismatches** — `PG_FUNCTION_INFO_V1` declarations now match
+  their `Datum` body names (`se_vXXX`) for all 9 affected functions in `aggregates.c`.
+* fix: **Missing closing brace in `se_vint8smaller`** — caused a compilation error
+  on GCC (`static declaration follows non-static declaration`) for date aggregate
+  functions when building for PostgreSQL 18.
+
 ## 1.2.3
 
 * fix: **`CREATE EXTENSION` failure on fresh install** — `default_version` in

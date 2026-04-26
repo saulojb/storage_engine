@@ -489,12 +489,20 @@ IsCreateTableAs(const char *query)
 /*
  * IsExplainQuery
  *
- * Returns true if the query string starts with EXPLAIN (case-insensitive),
- * with optional leading whitespace.
+ * Returns true if the query string is a plain EXPLAIN (without ANALYZE),
+ * case-insensitive, with optional leading whitespace.
+ *
+ * We skip plan-tree mutation only for plain EXPLAIN because citus calls
+ * ExecutorStart internally during plain EXPLAIN processing and does not
+ * expect the plan to be modified after its own planner hook has run.
+ * EXPLAIN ANALYZE actually executes the plan, so we allow mutation there
+ * so that the vectorized plan tree is visible and active.
  */
 static bool
 IsExplainQuery(const char *query)
 {
+	const char *p;
+
 	if (query == NULL)
 		return false;
 
@@ -502,7 +510,20 @@ IsExplainQuery(const char *query)
 	while (*query == ' ' || *query == '\t' || *query == '\n' || *query == '\r')
 		query++;
 
-	return pg_strncasecmp(query, "explain", 7) == 0;
+	/* Must start with EXPLAIN */
+	if (pg_strncasecmp(query, "explain", 7) != 0)
+		return false;
+
+	/* Advance past "explain" and skip whitespace */
+	p = query + 7;
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+
+	/* If the next keyword is ANALYZE, allow mutation (return false) */
+	if (pg_strncasecmp(p, "analyze", 7) == 0)
+		return false;
+
+	return true;
 }
 
 void engine_planner_init(void)
