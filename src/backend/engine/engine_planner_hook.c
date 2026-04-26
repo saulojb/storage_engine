@@ -234,7 +234,13 @@ PlanTreeMutator(Plan *node, void *context)
 
 			if (aggNode->plan.lefttree->type == T_CustomScan)
 			{
-				if (aggNode->aggstrategy == AGG_PLAIN)
+				/*
+				 * Only vectorize simple (non-split) aggregation.  Partial or
+				 * final split nodes (parallel query) require serialfn/combinefn
+				 * which our vectorized aggregates do not provide.
+				 */
+				if (aggNode->aggstrategy == AGG_PLAIN &&
+					aggNode->aggsplit == AGGSPLIT_SIMPLE)
 				{
 					vectorizedAggNode = engine_create_aggregator_node();
 

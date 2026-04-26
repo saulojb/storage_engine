@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 1.2.6
+
+* feat: **Vectorized aggregates for `float8`, `numeric`, and `money`** —
+  extends `StorageEngineVectorAgg` to cover three more numeric types:
+  - **`float8`**: `vsum`, `vavg`, `vmin`, `vmax` (`se_vfloat8pl`,
+    `se_vfloat8_accum`, `se_vfloat8larger`, `se_vfloat8smaller`)
+  - **`numeric`**: `vsum`, `vavg`, `vmin`, `vmax` (`se_vnumericavg_accum`,
+    `se_vnumericavg_final`, `se_vnumericsum_final`, `se_vnumericlarger`,
+    `se_vnumericsmaller`)
+  - **`money`**: `vsum`, `vmin`, `vmax` (`se_vcashpl`, `se_vcashsmaller`,
+    `se_vcashlarger`) — no `avg` because PostgreSQL has no `avg(money)`
+* fix: **Parallel aggregate correctness** — added `AGGSPLIT_SIMPLE` guard in
+  the planner hook so the vectorized path is only substituted for non-split
+  (non-partial) aggregates, preventing incorrect results in parallel queries.
+
 ## 1.2.5
 
 * fix: **Restore continuous upgrade chain** — added missing upgrade scripts
