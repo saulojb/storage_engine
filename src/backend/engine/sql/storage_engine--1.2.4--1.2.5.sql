@@ -1,0 +1,4 @@
+-- storage_engine upgrade: 1.2.4 → 1.2.5
+-- No catalog changes. Patch release:
+--   • Added missing upgrade scripts 1.2.1→1.2.2 and 1.2.2→1.2.3
+--     to restore continuous upgrade chain from any previous version

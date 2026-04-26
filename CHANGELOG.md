@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 1.2.5
+
+* fix: **Restore continuous upgrade chain** — added missing upgrade scripts
+  `1.2.1→1.2.2` and `1.2.2→1.2.3`, which caused `CREATE EXTENSION storage_engine`
+  (and `ALTER EXTENSION ... UPDATE`) to fail with "no installation script nor update
+  path for version" on systems that had installed any version from 1.2.1 onward.
+  No catalog changes; upgrade from 1.2.4 is a no-op.
+
 ## 1.2.4
 
 * feat: **Vectorized aggregates fully operational** — `vmin`, `vmax`, `vsum`, `vavg`,

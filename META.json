@@ -2,7 +2,7 @@
    "name": "storage_engine",
    "abstract": "Column-oriented (colcompress) and row-compressed (rowcompress) Table Access Methods for PostgreSQL with vectorized execution and parallel scan",
    "description": "storage_engine provides two high-performance Table Access Methods: colcompress (columnar, vectorized, MergeTree-style sort key, stripe-level and chunk-level min/max pruning, parallel DSM scan) and rowcompress (batch-compressed rows, parallel work-stealing scan). Both AMs use zstd by default and coexist safely with heap tables. All catalog objects live in the engine schema; C symbols use the se_ prefix.",
-   "version": "1.2.4",
+   "version": "1.2.5",
    "maintainer": [
       "Saulo José Benvenutti <saulojb@gmail.com>"
    ],
@@ -12,7 +12,7 @@
          "abstract": "colcompress and rowcompress Table Access Methods with vectorized execution",
          "file": "src/backend/engine/sql/storage_engine--1.0.sql",
          "docfile": "README.md",
-         "version": "1.2.4"
+         "version": "1.2.5"
       }
    },
    "prereqs": {

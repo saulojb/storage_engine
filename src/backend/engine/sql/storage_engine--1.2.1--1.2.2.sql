@@ -1,0 +1,5 @@
+-- storage_engine upgrade: 1.2.1 → 1.2.2
+-- No catalog changes. C/build-only release:
+--   • ZXC + Deflate codecs added
+--   • Optional compression build (pglz fallback)
+--   • aarch64 benchmark results

@@ -1,0 +1,3 @@
+-- storage_engine upgrade: 1.2.2 → 1.2.3
+-- No catalog changes. Bug-fix release:
+--   • Fixed default_version in control file (was incorrectly bumped to 1.2.2)
