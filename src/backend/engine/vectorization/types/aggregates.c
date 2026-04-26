@@ -56,17 +56,28 @@ PG_FUNCTION_INFO_V1(se_vint2sum);
 Datum
 se_vint2sum(PG_FUNCTION_ARGS)
 {
-	int64 sumX = PG_GETARG_INT64(0);
+	bool  state_isnull = PG_ARGISNULL(0);
+	int64 sumX = state_isnull ? 0 : PG_GETARG_INT64(0);
 	VectorColumn *arg1 = (VectorColumn*) PG_GETARG_POINTER(1);
-	int i;
+	bool  had_values = false;
+	int   i;
 
 	int16 *vectorValue = (int16*) arg1->value;
 
 	for (i = 0; i < arg1->dimension; i++)
 	{
 		if (!arg1->isnull[i])
+		{
 			sumX += (int64) vectorValue[i];
+			had_values = true;
+		}
 	}
+
+	/* Return NULL when state was NULL and no non-NULL values were found.
+	 * This matches the behaviour of PostgreSQL's sum(smallint) for empty sets.
+	 */
+	if (state_isnull && !had_values)
+		PG_RETURN_NULL();
 
 	PG_RETURN_INT64(sumX);
 }
@@ -160,17 +171,28 @@ PG_FUNCTION_INFO_V1(se_vint4sum);
 Datum
 se_vint4sum(PG_FUNCTION_ARGS)
 {
-	int64 sumX = PG_GETARG_INT64(0);
+	bool  state_isnull = PG_ARGISNULL(0);
+	int64 sumX = state_isnull ? 0 : PG_GETARG_INT64(0);
 	VectorColumn *arg1 = (VectorColumn*) PG_GETARG_POINTER(1);
-	int i;
+	bool  had_values = false;
+	int   i;
 
 	int32 *vectorValue = (int32*) arg1->value;
 
 	for (i = 0; i < arg1->dimension; i++)
 	{
 		if (!arg1->isnull[i])
+		{
 			sumX += (int64) vectorValue[i];
+			had_values = true;
+		}
 	}
+
+	/* Return NULL when state was NULL and no non-NULL values were found.
+	 * This matches the behaviour of PostgreSQL's sum(integer) for empty sets.
+	 */
+	if (state_isnull && !had_values)
+		PG_RETURN_NULL();
 
 	PG_RETURN_INT64(sumX);
 }

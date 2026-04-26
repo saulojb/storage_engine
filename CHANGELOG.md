@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 1.2.7
+
+* fix: `vsum(smallint)` and `vsum(integer)` now return `NULL` for empty input,
+  matching SQL standard `sum()` behaviour. Previously returned `0` due to
+  `initcond = '0'` on the aggregate definitions. The C transition functions
+  (`se_vint2sum`, `se_vint4sum`) also received a NULL-state guard.
+
 ## 1.2.6
 
 * feat: **Vectorized aggregates for `float8`, `numeric`, and `money`** —

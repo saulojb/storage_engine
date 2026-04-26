@@ -12,4 +12,17 @@ endif
 all install clean:
 	$(MAKE) -C src/backend/engine $@ PG_CONFIG='$(PG_CONFIG)'
 
-.PHONY: all install clean
+# Run the comprehensive test suite against the locally installed extension.
+# Usage:
+#   sudo make installcheck
+#   sudo make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+#   sudo make installcheck PG19=1   (also tests the secondary port 5433)
+PG_PORT    ?= $(shell $(PG_CONFIG) --pgport 2>/dev/null || echo 5432)
+PYTHON3    ?= python3
+SUITE      := tests/test_suite.py
+PG19_FLAG  := $(if $(PG19),--pg19,)
+
+installcheck:
+	$(PYTHON3) $(SUITE) --port $(PG_PORT) $(PG19_FLAG)
+
+.PHONY: all install clean installcheck

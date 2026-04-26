@@ -2366,7 +2366,8 @@ ExecAgg(PlanState *pstate)
 			case AGG_HASHED:
 				if (!node->table_filled)
 					agg_fill_hash_table(node);
-				/* FALLTHROUGH */
+				result = agg_retrieve_hash_table(node);
+				break;
 			case AGG_MIXED:
 				result = agg_retrieve_hash_table(node);
 				break;
