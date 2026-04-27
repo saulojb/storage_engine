@@ -24,6 +24,7 @@
 #include "access/xact.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_statistic.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #if PG_VERSION_NUM >= PG_VERSION_18
@@ -56,6 +57,12 @@
 
 #include "engine/engine.h"
 #include "engine/engine_customscan.h"
+
+/* ExplainPropertyUInteger was added in PG13; emulate on PG12 */
+#if PG_VERSION_NUM < PG_VERSION_13
+#define ExplainPropertyUInteger(name, unit, val, es) \
+	ExplainPropertyInteger(name, unit, (int64)(val), es)
+#endif
 #include "engine/engine_metadata.h"
 #include "engine/engine_tableam.h"
 #include "engine/engine_version_compat.h"
