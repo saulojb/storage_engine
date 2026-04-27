@@ -739,7 +739,7 @@ FindStripeMetadataFromListBinarySearch(IndexFetchColumnarData *scan, uint64 rowN
 
 		lc = list_nth_cell(scan->stripeMetadataList, mid);
 
-		StripeMetadata *stripeMetadata = lc->ptr_value;
+		StripeMetadata *stripeMetadata = (StripeMetadata *) lfirst(lc);
 
 		if (rowNumber >= stripeMetadata->firstRowNumber &&
 			rowNumber < stripeMetadata->firstRowNumber + stripeMetadata->rowCount)
