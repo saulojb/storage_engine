@@ -1938,7 +1938,7 @@ if (scan->batchRowCount == 0 || scan->currentRowIndex >= scan->batchRowCount)
 			if (scan->currentBatchCell == NULL)
 				return false;
 			meta = (RowCompressBatchMetadata *) lfirst(scan->currentBatchCell);
-			scan->currentBatchCell = lnext(scan->batchList, scan->currentBatchCell);
+			scan->currentBatchCell = lnext_compat(scan->batchList, scan->currentBatchCell);
 
 			if (!RCBatchCanBePruned(scan, meta, td))
 				break;
@@ -2826,7 +2826,7 @@ rowcompress_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
 
 	RowCompressBatchMetadata *meta =
 		(RowCompressBatchMetadata *) lfirst(rc->currentBatchCell);
-	rc->currentBatchCell = lnext(rc->batchList, rc->currentBatchCell);
+	rc->currentBatchCell = lnext_compat(rc->batchList, rc->currentBatchCell);
 
 	if (!RCLoadBatch(rc, meta))
 		return false;

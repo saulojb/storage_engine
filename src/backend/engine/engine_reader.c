@@ -1076,8 +1076,8 @@ AdvanceStripeRead(ColumnarReadState *readState)
 				readState->currentStripeMetadata =
 					(StripeMetadata *) lfirst(readState->currentStripeCursor);
 				readState->currentStripeCursor =
-					lnext(readState->filteredStripeList,
-						  readState->currentStripeCursor);
+					lnext_compat(readState->filteredStripeList,
+								 readState->currentStripeCursor);
 			}
 			else
 			{
