@@ -51,7 +51,11 @@
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
+#if PG_VERSION_NUM >= PG_VERSION_13
 #include "access/detoast.h"
+#else
+#include "access/tuptoaster.h"
+#endif
 #include "catalog/storage.h"
 #include "optimizer/plancat.h"
 #include "storage/procarray.h"
