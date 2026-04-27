@@ -26,6 +26,7 @@
 #include "postgres.h"
 #include "pg_version_constants.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
