@@ -9,7 +9,7 @@
  */
 
 #include "postgres.h"
-#if PG_VERSION_NUM >= PG_VERSION_19
+#if PG_VERSION_NUM >= PG_VERSION_16
 #include "varatt.h"
 #endif
 
