@@ -292,7 +292,9 @@
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= PG_VERSION_18
 #include "commands/explain_format.h"
+#endif
 
 #include "engine/vectorization/engine_vector_types.h"
 #include "engine/engine_version_compat.h"
