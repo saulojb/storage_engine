@@ -2214,11 +2214,13 @@ rowcompress_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 	return !deleted;
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_14
 static TransactionId
 rowcompress_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
 return InvalidTransactionId;
 }
+#endif
 
 #if PG_VERSION_NUM < PG_VERSION_14
 static TransactionId
