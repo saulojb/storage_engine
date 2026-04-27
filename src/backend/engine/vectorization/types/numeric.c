@@ -9,6 +9,8 @@
  */
 
 #include "postgres.h"
+
+#include "pg_version_compat.h"
 #if PG_VERSION_NUM >= PG_VERSION_16
 #include "varatt.h"
 #endif
