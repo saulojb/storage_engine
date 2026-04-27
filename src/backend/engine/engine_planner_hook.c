@@ -330,7 +330,9 @@ PlanTreeMutator(Plan *node, void *context)
 
 static PlannedStmt *
 ColumnarPlannerHook(Query *parse,
+#if PG_VERSION_NUM >= PG_VERSION_13
 					const char *query_string,
+#endif
 					int cursorOptions,
 					ParamListInfo boundParams
 #if PG_VERSION_NUM >= PG_VERSION_19
@@ -344,18 +346,26 @@ ColumnarPlannerHook(Query *parse,
 	List *savedSubplan;
 	MemoryContext saved_context;
 #endif
+#if PG_VERSION_NUM < PG_VERSION_13
+	/* query_string not passed by PG12 planner hook — not available */
+	const char *query_string = NULL;
+#endif
 
 	if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
 			stmt = PreviousPlannerHook(parse, query_string, cursorOptions, boundParams, es);
-#else
+#elif PG_VERSION_NUM >= PG_VERSION_13
 			stmt = PreviousPlannerHook(parse, query_string, cursorOptions, boundParams);
+#else
+			stmt = PreviousPlannerHook(parse, cursorOptions, boundParams);
 #endif
 		else
 #if PG_VERSION_NUM >= PG_VERSION_19
 			stmt = standard_planner(parse, query_string, cursorOptions, boundParams, es);
-#else
+#elif PG_VERSION_NUM >= PG_VERSION_13
 			stmt = standard_planner(parse, query_string, cursorOptions, boundParams);
+#else
+			stmt = standard_planner(parse, cursorOptions, boundParams);
 #endif
 	/*
 	 * In the case of a CREATE TABLE AS query, we are not able to successfully
