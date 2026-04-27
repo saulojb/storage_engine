@@ -1,0 +1,4 @@
+-- storage_engine--1.3.1--1.3.2.sql
+-- No catalog changes in this release (C-only fix).
+-- Stripe pruning for stable expressions (CURRENT_DATE - INTERVAL, etc.)
+-- is implemented entirely in engine_customscan.c.

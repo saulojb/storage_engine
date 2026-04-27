@@ -39,6 +39,7 @@
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
+#include "parser/parse_coerce.h"
 #include "optimizer/paths.h"
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
@@ -1335,6 +1336,101 @@ ExtractPushdownClause(PlannerInfo *root, RelOptInfo *rel, Node *node)
 						"(%.3f)", absVarCorrelation, varSide->varattno,
 						ColumnarQualPushdownCorrelationThreshold)));
 		return NULL;
+	}
+
+	/*
+	 * Fold stable non-Const expressions on the non-Var side to a Const at plan
+	 * time so predicate_refuted_by() can prune stripes for predicates like:
+	 *   WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+	 *
+	 * estimate_expression_value() folds both IMMUTABLE and STABLE functions.
+	 *
+	 * If the folded Const's type differs from varOpcInType (e.g., a "timestamp"
+	 * Const for a "timestamptz" column), the original operator is cross-type
+	 * and predicate_refuted_by() cannot reason about it.  In that case we
+	 * apply an implicit cast via coerce_to_target_type() so that both the
+	 * stripe constraint (built from min/max) and the WHERE clause use the
+	 * same opfamily input type, enabling correct pruning.
+	 */
+	if (!IsA(exprSide, Const))
+	{
+		bool	exprIsRhs = (exprSide == rhs);
+		Node   *folded    = estimate_expression_value(root, (Node *) exprSide);
+
+		if (IsA(folded, Const) && !((Const *) folded)->constisnull)
+		{
+			Const  *fConst   = castNode(Const, folded);
+			Expr   *usedExpr = (Expr *) fConst;
+			bool    rebuilt  = false;
+
+			/*
+			 * If the Const type differs from what the Var's btree opfamily
+			 * expects, the comparison is cross-type (e.g., timestamp Const vs
+			 * timestamptz Var).  Insert an implicit cast to varOpcInType so
+			 * predicate_refuted_by() works with a same-type comparison.
+			 */
+			if (fConst->consttype != varOpcInType)
+			{
+				Node *castExpr = coerce_to_target_type(NULL,
+													   (Node *) fConst,
+													   fConst->consttype,
+													   varOpcInType,
+													   -1,
+													   COERCION_IMPLICIT,
+													   COERCE_IMPLICIT_CAST,
+													   -1);
+				if (castExpr != NULL)
+				{
+					Node *castFolded = estimate_expression_value(root, castExpr);
+					if (IsA(castFolded, Const) &&
+						!((Const *) castFolded)->constisnull)
+					{
+						usedExpr = (Expr *) castFolded;
+
+						/* Rebuild with the same-type operator from varOpFamily */
+						int16 strategy = get_op_opfamily_strategy(opExpr->opno,
+																  varOpFamily);
+						if (strategy != 0)
+						{
+							Oid sameTypeOpno =
+								get_opfamily_member(varOpFamily,
+													varOpcInType,
+													varOpcInType,
+													strategy);
+							if (OidIsValid(sameTypeOpno))
+							{
+								OpExpr *sameOp = makeNode(OpExpr);
+								sameOp->opno         = sameTypeOpno;
+								sameOp->opfuncid     = get_opcode(sameTypeOpno);
+								sameOp->opresulttype = BOOLOID;
+								sameOp->opretset     = false;
+								sameOp->opcollid     = InvalidOid;
+								sameOp->inputcollid  = varSide->varcollid;
+								sameOp->location     = opExpr->location;
+								sameOp->args = exprIsRhs ?
+									list_make2(copyObject(varSide), usedExpr) :
+									list_make2(usedExpr, copyObject(varSide));
+								node     = (Node *) sameOp;
+								exprSide = usedExpr;
+								rebuilt  = true;
+							}
+						}
+					}
+				}
+			}
+
+			if (!rebuilt)
+			{
+				/* Same-type fold or fallback: substitute Const into the OpExpr */
+				exprSide = usedExpr;
+				opExpr   = copyObject(opExpr);
+				if (exprIsRhs)
+					lsecond(opExpr->args) = exprSide;
+				else
+					linitial(opExpr->args) = exprSide;
+				node = (Node *) opExpr;
+			}
+		}
 	}
 
 	/*

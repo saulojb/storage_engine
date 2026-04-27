@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## 1.3.2
+
+* fix: **Stripe pruning now works for stable expressions** — predicates like
+  `WHERE ts >= CURRENT_DATE - INTERVAL '7 days'` now trigger stripe-level
+  min/max pruning on sorted `colcompress` tables, the same as a literal
+  constant would.  Previously, any non-`Const` expression on the filter's
+  non-Var side was passed as-is to `predicate_refuted_by()`, which cannot
+  evaluate run-time expressions and therefore never pruned any stripe.
+
+  Fix: in `ExtractPushdownClause()`, after the volatile-function check, call
+  `estimate_expression_value()` to fold `STABLE`/`IMMUTABLE` sub-expressions
+  into a `Const` at plan time.  If the folded `Const` type differs from the
+  Var's opfamily input type (e.g., `timestamp` result for a `timestamptz`
+  column), an implicit cast is inserted via `coerce_to_target_type()` and the
+  operator is replaced with its same-type counterpart from the Var's btree
+  opfamily so `predicate_refuted_by()` can reason about it correctly.
+
+  Measured improvement on a 10M-row globally-sorted `colcompress` table:
+  - 754/1000 stripes pruned (75%) for a 7-day window
+  - Rows removed by filter per parallel worker: 943 328 → 203
+  - JOIN query execution: 757 ms → 715 ms
+
+---
+
 ## 1.3.1
 
 * fix: **PG12 `IndexBuildCallback` second argument** — changed from
