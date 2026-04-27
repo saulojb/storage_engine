@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## 1.2.8
+
+* feat: **`engine.uint8` — unsigned 64-bit integer type** — native fixed-size
+  8-byte type (`INTERNALLENGTH=8, PASSEDBYVALUE, ALIGNMENT=double`) with full
+  unsigned semantics for storing values in the `[0, 2^64−1]` range.
+  Motivated by ClickBench columns such as `WatchID` and `UserID` that overflow
+  to negatives when stored as `bigint`.
+  - **I/O & binary protocol**: `uint8in/out`, `uint8recv/send`
+  - **Comparison operators** `<`, `<=`, `=`, `<>`, `>=`, `>` with unsigned semantics
+  - **Btree operator class** (`engine.uint8_ops`) and **hash operator class**
+    (`engine.uint8_hash_ops`) for indexing, sorting, and hashing
+  - **Casts**: `uint8 ↔ bigint` (assignment), `uint8 ↔ numeric` (implicit to
+    numeric; assignment from numeric), `uint8 ↔ text` (assignment)
+    — `numeric → uint8` supports the full `[0, 2^64−1]` range via text path
+  - **Standard aggregates** `engine.min`, `engine.max`, `engine.sum` (returns
+    `numeric` to handle `sum > 2^63`)
+  - **Vectorized aggregates** `engine.vmin`, `engine.vmax`, `engine.vsum` —
+    dispatched automatically from `min/max/sum` on `engine.uint8` columns in
+    `colcompress` tables via `GetVectorizedProcedureOid`
+  - Sum accumulator uses `Int128AggState` (same as `bigint`) — overflow-safe
+    for practical column sums
+
 ## 1.2.7
 
 * fix: `vsum(smallint)` and `vsum(integer)` now return `NULL` for empty input,

@@ -112,11 +112,37 @@ Supported vectorized operations:
 | Category | Types |
 |---|---|
 | Comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`) | `int2`, `int4`, `int8`, `float4`, `float8`, `date`, `timestamp`, `timestamptz`, `char`, `bpchar`, `text`, `varchar`, `name`, `bool`, `oid` |
-| Aggregates (`count`, `sum`, `avg`, `max`, `min`) | `int2`, `int4`, `int8`, `float8`, `date`, `timestamptz` |
+| Aggregates (`count`, `sum`, `avg`, `max`, `min`) | `int2`, `int4`, `int8`, `float8`, `numeric`, `date`, `money`, `engine.uint8` |
 
 ```sql
 SET storage_engine.enable_vectorization = on;   -- default: on
 ```
+
+### engine.uint8 — Unsigned 64-bit Integer
+
+`storage_engine` ships a native **unsigned 64-bit integer** type (`engine.uint8`) designed for columns that carry values in the full `[0, 2⁶⁴−1]` range, such as ClickBench's `WatchID` and `UserID` columns. Storing these as `bigint` silently wraps around and produces negative values.
+
+```sql
+CREATE TABLE hits (
+    WatchID  engine.uint8,
+    UserID   engine.uint8,
+    ...
+) USING colcompress;
+
+-- All standard aggregates work with correct unsigned semantics:
+SET search_path TO engine, public;
+SELECT min(WatchID), max(WatchID), sum(WatchID) FROM hits;
+
+-- Or fully qualified:
+SELECT engine.min(WatchID), engine.max(WatchID), engine.sum(WatchID) FROM hits;
+```
+
+- **Storage**: 8 bytes, `passedbyvalue`, `double` alignment — identical layout to `bigint`, zero overhead.
+- **Operators**: `<`, `<=`, `=`, `<>`, `>=`, `>` with unsigned semantics (e.g., `18446744073709551615 > 1` is true).
+- **Btree + hash opclasses**: full support for `ORDER BY`, `GROUP BY`, `DISTINCT`, and index scans.
+- **Casts**: `uint8 ↔ bigint` (assignment), `uint8 ↔ numeric` (IMPLICIT to numeric, ASSIGNMENT from numeric), `uint8 ↔ text` (assignment).
+- **Aggregates** (`min`, `max`, `sum`) in the `engine` schema — `sum` returns `numeric` to accommodate values > `INT64_MAX`.
+- **Vectorized**: `engine.vmin`, `engine.vmax`, `engine.vsum` are automatically dispatched by the planner when querying `colcompress` tables.
 
 ### Parallel Scan
 

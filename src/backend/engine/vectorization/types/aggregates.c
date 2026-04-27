@@ -978,3 +978,139 @@ se_vcashpl(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT64(state);
 }
+
+/* =========================================================
+ * engine.uint8 (unsigned 64-bit integer) vectorized aggregates
+ *
+ * uint8 is stored as uint64 (8 bytes, passedbyvalue) — identical bit
+ * layout to int8 (bigint).  We cast via uint64 to get unsigned
+ * comparison / arithmetic semantics.
+ *
+ * We implement vmax, vmin, and vsum only (same as money).
+ * sum returns numeric to avoid overflow.
+ * ========================================================= */
+
+/*
+ * se_vuint8larger — vectorized transition for max(engine.uint8).
+ *
+ * State = uint64 stored as int64 datum (same bit pattern).
+ * NULL initial state → anyValue=false, returns NULL on empty set.
+ */
+PG_FUNCTION_INFO_V1(se_vuint8larger);
+Datum
+se_vuint8larger(PG_FUNCTION_ARGS)
+{
+	uint64		maxValue = PG_ARGISNULL(0) ? 0 : (uint64) PG_GETARG_INT64(0);
+	bool		anyValue = !PG_ARGISNULL(0);
+	VectorColumn *arg2 = (VectorColumn *) PG_GETARG_POINTER(1);
+	uint64	   *vectorValue = (uint64 *) arg2->value;
+	int			i;
+
+	for (i = 0; i < arg2->dimension; i++)
+	{
+		if (arg2->isnull[i])
+			continue;
+		if (!anyValue || vectorValue[i] > maxValue)
+			maxValue = vectorValue[i];
+		anyValue = true;
+	}
+
+	if (!anyValue)
+		PG_RETURN_NULL();
+
+	PG_RETURN_INT64((int64) maxValue);
+}
+
+/*
+ * se_vuint8smaller — vectorized transition for min(engine.uint8).
+ */
+PG_FUNCTION_INFO_V1(se_vuint8smaller);
+Datum
+se_vuint8smaller(PG_FUNCTION_ARGS)
+{
+	uint64		minValue = PG_ARGISNULL(0) ? PG_UINT64_MAX : (uint64) PG_GETARG_INT64(0);
+	bool		anyValue = !PG_ARGISNULL(0);
+	VectorColumn *arg2 = (VectorColumn *) PG_GETARG_POINTER(1);
+	uint64	   *vectorValue = (uint64 *) arg2->value;
+	int			i;
+
+	for (i = 0; i < arg2->dimension; i++)
+	{
+		if (arg2->isnull[i])
+			continue;
+		if (!anyValue || vectorValue[i] < minValue)
+			minValue = vectorValue[i];
+		anyValue = true;
+	}
+
+	if (!anyValue)
+		PG_RETURN_NULL();
+
+	PG_RETURN_INT64((int64) minValue);
+}
+
+/*
+ * se_vuint8_acc — vectorized transition for sum(engine.uint8).
+ *
+ * Accumulates into Int128AggState (same approach as bigint) so that
+ * the sum of many large uint64 values does not overflow.
+ */
+PG_FUNCTION_INFO_V1(se_vuint8_acc);
+Datum
+se_vuint8_acc(PG_FUNCTION_ARGS)
+{
+	Int128AggState *state;
+	VectorColumn   *arg1 = (VectorColumn *) PG_GETARG_POINTER(1);
+	MemoryContext	aggContext;
+	MemoryContext	oldContext;
+	int				i;
+
+	if (!AggCheckCallContext(fcinfo, &aggContext))
+		elog(ERROR, "aggregate function called in non-aggregate context");
+
+	state = PG_ARGISNULL(0) ? NULL : (Int128AggState *) PG_GETARG_POINTER(0);
+
+	oldContext = MemoryContextSwitchTo(aggContext);
+
+	if (state == NULL)
+	{
+		state = palloc0(sizeof(Int128AggState));
+		state->calcSumX2 = false;
+	}
+
+	uint64	   *vectorValue = (uint64 *) arg1->value;
+
+	for (i = 0; i < arg1->dimension; i++)
+	{
+		if (!arg1->isnull[i])
+		{
+			state->N++;
+			state->sumX += (int128) vectorValue[i];
+		}
+	}
+
+	MemoryContextSwitchTo(oldContext);
+
+	PG_RETURN_POINTER(state);
+}
+
+/*
+ * se_vuint8sum — final function for vsum(engine.uint8).
+ *
+ * Returns numeric to avoid overflow (same as bigint sum).
+ * Shared by both the vectorized aggregate (engine.vsum) and the
+ * non-vectorized aggregate (engine.sum via se_uint8_acc).
+ */
+PG_FUNCTION_INFO_V1(se_vuint8sum);
+Datum
+se_vuint8sum(PG_FUNCTION_ARGS)
+{
+	Int128AggState *state;
+
+	state = PG_ARGISNULL(0) ? NULL : (Int128AggState *) PG_GETARG_POINTER(0);
+
+	if (state == NULL || state->N == 0)
+		PG_RETURN_NULL();
+
+	PG_RETURN_NUMERIC(int128_to_numeric(state->sumX));
+}
