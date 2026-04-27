@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 1.3.0
+
+* fix: **PG14/PG15 compile error in `rowcompress_tableam.c`** — added explicit
+  `#include "access/genam.h"` so that `SysScanDesc`, `systable_beginscan`, and
+  `systable_getnext` are declared on PostgreSQL 14 and 15, where the header is
+  not transitively included via `catalog/indexing.h`. On PG16–19 the build was
+  unaffected. Reported by user after attempting a fresh build on PG14.22.
+
 ## 1.2.9
 
 * fix: **SIGSEGV on JOIN queries with `max_parallel_workers_per_gather > 0`**

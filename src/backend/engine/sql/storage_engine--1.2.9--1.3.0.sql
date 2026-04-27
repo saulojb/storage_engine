@@ -1,0 +1,10 @@
+-- storage_engine upgrade script: 1.2.9 → 1.3.0
+--
+-- v1.3.0 — fix rowcompress compile error on PG14/PG15 (access/genam.h)
+--
+-- No catalog changes in this release. The fix is purely in C source:
+-- rowcompress_tableam.c now explicitly includes access/genam.h so that
+-- SysScanDesc, systable_beginscan, and systable_getnext are declared on
+-- PostgreSQL 14 and 15 (where the header is not transitively included).
+--
+-- This file intentionally left empty.

@@ -140,7 +140,7 @@ class TestRunner:
 
         # Version
         ver = self.q1("SELECT extversion FROM pg_extension WHERE extname='storage_engine'")
-        self.check("extension version = 1.2.9", ver == "1.2.9", f"got {ver!r}")
+        self.check("extension version = 1.3.0", ver == "1.3.0", f"got {ver!r}")
 
         # Schema
         ns = self.q1("SELECT nspname FROM pg_namespace WHERE nspname='engine'")
@@ -696,14 +696,14 @@ class TestRunner:
             "SELECT max(version) FROM pg_available_extension_versions "
             "WHERE name = 'storage_engine'"
         )
-        self.check("latest available version = 1.2.9", ver == "1.2.9", f"got {ver!r}")
+        self.check("latest available version = 1.3.0", ver == "1.3.0", f"got {ver!r}")
 
-        # Complete upgrade path from 1.0 to 1.2.9 exists
+        # Complete upgrade path from 1.0 to 1.3.0 exists
         path = self.q1(
             "SELECT path FROM pg_extension_update_paths('storage_engine') "
-            "WHERE source = '1.0' AND target = '1.2.9'"
+            "WHERE source = '1.0' AND target = '1.3.0'"
         )
-        self.check("upgrade path 1.0 \u2192 1.2.9 exists", path != "", f"path={path!r}")
+        self.check("upgrade path 1.0 \u2192 1.3.0 exists", path != "", f"path={path!r}")
 
         # Each individual upgrade step
         steps = [
@@ -718,6 +718,7 @@ class TestRunner:
             ("1.2.6", "1.2.7"),
             ("1.2.7", "1.2.8"),
             ("1.2.8", "1.2.9"),
+            ("1.2.9", "1.3.0"),
         ]
         for src, tgt in steps:
             p = self.q1(
