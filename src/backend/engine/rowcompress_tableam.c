@@ -2964,13 +2964,20 @@ FormIndexDatum(indexInfo, slot, estate, indexValues, indexNulls);
 ItemPointerData tid = slot->tts_tid;
 bool tupleIsAlive   = true;
 
-callback(indexRelation, &tid, indexValues, indexNulls,
- tupleIsAlive, callback_state);
+#if PG_VERSION_NUM >= PG_VERSION_13
+		callback(indexRelation, &tid, indexValues, indexNulls,
+				 tupleIsAlive, callback_state);
+#else
+		HeapTuple scanTuple = ExecCopySlotHeapTuple(slot);
+		scanTuple->t_self = tid;
+		callback(indexRelation, scanTuple, indexValues, indexNulls,
+				 tupleIsAlive, callback_state);
+#endif
 
-reltuples++;
-}
+		reltuples++;
+	}
 
-table_endscan(scan);
+	table_endscan(scan);
 
 if (snapshotRegisteredByUs)
 UnregisterSnapshot(snapshot);
