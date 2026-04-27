@@ -1602,6 +1602,88 @@ AddColumnarScanPaths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 	AddColumnarScanPathsRec(root, rel, rte, paramRelids, candidateRelids,
 							depthLimit);
+
+	/*
+	 * Add parallel paths exactly once (not per parameterization).
+	 *
+	 * This block must live here, outside AddColumnarScanPathsRec, because
+	 * the recursive helper is called once per parameterization level and
+	 * would create the same (NULL-parameterized) parallel path multiple
+	 * times.  On the second creation, add_partial_path() detects a
+	 * cost-equal duplicate, calls pfree() on the new path, and then
+	 * create_sort_path() dereferences the freed pointer — causing a
+	 * SIGSEGV during planning of JOINs with ORDER BY.
+	 *
+	 * Additionally, create_sort_path() must be called BEFORE
+	 * add_partial_path() for the base parallel path, because
+	 * add_partial_path() may pfree() the path when it is dominated by an
+	 * existing partial path.
+	 */
+	if (engine_enable_parallel_execution &&
+		rel->consider_parallel && rel->lateral_relids == NULL)
+	{
+		int engine_min_parallel_process_running = engine_min_parallel_processes;
+
+		if (engine_min_parallel_processes > max_parallel_workers)
+		{
+			elog(DEBUG1, "storage_engine.min_parallel_proceses is set higher than max_parallel_workers.");
+			elog(DEBUG1, "Using max_parallel_workers instead for parallel columnar scan.");
+			engine_min_parallel_process_running =
+				Min(max_parallel_workers, engine_min_parallel_processes);
+		}
+
+		if (parallel_leader_participation)
+			engine_min_parallel_process_running--;
+
+		/*
+		 * We know how many workers are we going to run. Since workers are using single stripe
+		 * probably it doesn't have much sense to spawn more workers than stripes in table.
+		 */
+		engine_min_parallel_process_running = Min(engine_min_parallel_process_running,
+												parallel_leader_participation ?
+												ColumnarTableStripeCount(rte->relid) - 1 :
+												ColumnarTableStripeCount(rte->relid));
+
+		if (engine_min_parallel_process_running > 0)
+		{
+			/*
+			 * Passing NULL for JOIN quals in parallel execution.
+			 */
+			Path *parallelColumnarScanPath =
+				AddColumnarScanPath(root, rel, rte, NULL);
+
+			parallelColumnarScanPath->parallel_workers = engine_min_parallel_process_running;
+			parallelColumnarScanPath->parallel_aware = true;
+			AdjustColumnarParallelScanCost(parallelColumnarScanPath);
+
+			/*
+			 * When the query has ORDER BY (root->query_pathkeys != NIL),
+			 * also add a pre-sorted partial path so that
+			 * generate_useful_gather_paths() can create a
+			 * Gather Merge(Sort(ColcompressScan)) path that satisfies the
+			 * required ordering.
+			 *
+			 * IMPORTANT: create_sort_path() must be called before
+			 * add_partial_path() for parallelColumnarScanPath.  If called
+			 * after, add_partial_path() might pfree() the base path and
+			 * create_sort_path() would dereference freed memory.
+			 */
+			if (root->query_pathkeys != NIL)
+			{
+				Path *sortedParallelPath = (Path *)
+					create_sort_path(root, rel,
+									 parallelColumnarScanPath,
+									 root->query_pathkeys,
+									 -1.0 /* no tuple limit */);
+				add_partial_path(rel, parallelColumnarScanPath);
+				add_partial_path(rel, sortedParallelPath);
+			}
+			else
+			{
+				add_partial_path(rel, parallelColumnarScanPath);
+			}
+		}
+	}
 }
 
 
@@ -1649,74 +1731,6 @@ AddColumnarScanPathsRec(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	add_path(rel, columnarScanPath);
 	if (engine_enable_parallel_execution)
 		columnarScanPath->total_cost += columnarScanPath->rows * 0.1;
-
-	/* For columnar custom scan we should also do planning for parallel exeuction
-	 * if it is enabled with GUC.
-	 */
-	if (engine_enable_parallel_execution)
-	{
-		int engine_min_parallel_process_running = engine_min_parallel_processes;
-
-		if (engine_min_parallel_processes > max_parallel_workers)
-		{
-			elog(DEBUG1, "storage_engine.min_parallel_proceses is set higher than max_parallel_workers.");
-			elog(DEBUG1, "Using max_parallel_workers instead for parallel columnar scan.");
-			engine_min_parallel_process_running = 
-				Min(max_parallel_workers, engine_min_parallel_processes);
-		}
-
-		if (parallel_leader_participation)
-			engine_min_parallel_process_running--;
-
-		/*
-		 * We know how many workers are we going to run. Since workers are using single stripe
-		 * probably it doesn't have much sense to spawn more workers than stripes in table.
-		 */
-		engine_min_parallel_process_running = Min(engine_min_parallel_process_running,
-													parallel_leader_participation ?
-													ColumnarTableStripeCount(rte->relid) - 1 :
-													ColumnarTableStripeCount(rte->relid));
-
-		if (rel->consider_parallel && rel->lateral_relids == NULL && 
-			engine_min_parallel_process_running > 0)
-		{
-			/*
-			 * Passing NULL for JOIN quals in parallel execution.
-			 */
-			Path *parallelColumnarScanPath = 
-				AddColumnarScanPath(root, rel, rte, NULL);
-
-			parallelColumnarScanPath->parallel_workers = engine_min_parallel_process_running;
-			parallelColumnarScanPath->parallel_aware = true;
-			AdjustColumnarParallelScanCost(parallelColumnarScanPath);
-
-			add_partial_path(rel, parallelColumnarScanPath);
-
-			/*
-			 * When the query has ORDER BY (root->query_pathkeys != NIL),
-			 * also add a pre-sorted partial path so that
-			 * generate_useful_gather_paths() can create a
-			 * Gather Merge(Sort(ColcompressScan)) path that satisfies the
-			 * required ordering.
-			 *
-			 * Without this, PG15 may not automatically add Sort inside
-			 * partial paths for columnar scans (useful_pathkeys_list can be
-			 * NIL when there are no matching indexes), causing the planner to
-			 * choose Gather(ColcompressScan) without any Sort node above it.
-			 * This silently drops ORDER BY, returning rows in an arbitrary
-			 * worker-completion order.
-			 */
-			if (root->query_pathkeys != NIL)
-			{
-				Path *sortedParallelPath = (Path *)
-					create_sort_path(root, rel,
-									 parallelColumnarScanPath,
-									 root->query_pathkeys,
-									 -1.0 /* no tuple limit */);
-				add_partial_path(rel, sortedParallelPath);
-			}
-		}
-	}
 
 	/* recurse for all candidateRelids, unless we hit the depth limit */
 	Assert(depthLimit >= 0);

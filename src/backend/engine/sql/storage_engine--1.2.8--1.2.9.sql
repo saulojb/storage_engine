@@ -1,0 +1,16 @@
+-- storage_engine--1.2.8--1.2.9.sql
+-- Upgrade script: v1.2.8 → v1.2.9
+--
+-- This is a C-only release. No catalog changes.
+-- The fix is in engine_customscan.c:
+--   SIGSEGV (use-after-free) when running JOIN queries against colcompress
+--   tables with max_parallel_workers_per_gather > 0 (the default).
+--
+-- The parallel path block inside AddColumnarScanPathsRec was executed once
+-- per JOIN parameterization level (recursive call). On the second call,
+-- add_partial_path() freed the path (dominated by the first copy), and the
+-- immediately following create_sort_path() dereferenced the freed pointer.
+-- Fix: move parallel path creation to AddColumnarScanPaths (executes once)
+-- and call create_sort_path() before add_partial_path().
+
+-- (intentionally empty — no catalog changes in this release)

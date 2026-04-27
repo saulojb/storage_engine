@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## 1.2.9
+
+* fix: **SIGSEGV on JOIN queries with `max_parallel_workers_per_gather > 0`**
+  (the default) against `colcompress` tables — use-after-free in
+  `AddColumnarScanPathsRec`. The parallel path block was inside the recursive
+  parameterized-path function, which is called once per JOIN combination.
+  On the second call `add_partial_path()` freed the dominated path; the
+  immediately following `create_sort_path()` then dereferenced the freed
+  pointer → SIGSEGV during query planning.
+  Fix: moved parallel path creation to the parent `AddColumnarScanPaths`
+  (executes exactly once) and ensured `create_sort_path()` is called before
+  `add_partial_path()`. Crash reproduced and verified fixed; no catalog
+  changes required.
+
 ## 1.2.8
 
 * feat: **`engine.uint8` — unsigned 64-bit integer type** — native fixed-size
