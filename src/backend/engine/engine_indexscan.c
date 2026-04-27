@@ -790,9 +790,15 @@ show_expression(Node *node, const char *qlabel,
 	char	   *exprstr;
 
 	/* Set up deparsing context */
+#if PG_VERSION_NUM >= PG_VERSION_13
 	context = set_deparse_context_plan(es->deparse_cxt,
 									   planstate->plan,
 									   ancestors);
+#else
+	context = set_deparse_context_planstate(es->deparse_cxt,
+											(Node *) planstate,
+											ancestors);
+#endif
 
 	/* Deparse the expression */
 	exprstr = deparse_expression(node, context, useprefix, false);

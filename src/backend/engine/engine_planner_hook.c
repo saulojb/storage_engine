@@ -49,7 +49,10 @@
 
 static planner_hook_type PreviousPlannerHook = NULL;
 
-static PlannedStmt * ColumnarPlannerHook(Query *parse,  const char *query_string,
+static PlannedStmt * ColumnarPlannerHook(Query *parse,
+#if PG_VERSION_NUM >= PG_VERSION_13
+									 const char *query_string,
+#endif
 									 int cursorOptions, ParamListInfo boundParams
 #if PG_VERSION_NUM >= PG_VERSION_19
 									 , ExplainState *es
