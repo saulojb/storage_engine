@@ -48,7 +48,6 @@
 #include "engine/utils/listutils.h"
 
 static planner_hook_type PreviousPlannerHook = NULL;
-static Oid engine_tableam_oid = InvalidOid;
 
 static PlannedStmt * ColumnarPlannerHook(Query *parse,  const char *query_string,
 									 int cursorOptions, ParamListInfo boundParams
@@ -57,6 +56,9 @@ static PlannedStmt * ColumnarPlannerHook(Query *parse,  const char *query_string
 #endif
 									 );
 static bool IsCreateTableAs(const char *query);
+
+#if PG_VERSION_NUM >= PG_VERSION_14
+static Oid engine_tableam_oid = InvalidOid;
 static bool IsExplainQuery(const char *query);
 
 typedef struct PlanTreeMutatorContext
@@ -174,8 +176,6 @@ ExpressionMutator(Node *node, void *context)
 
 	return expression_tree_mutator(node, ExpressionMutator, (void *) context);
 }
-
-#if PG_VERSION_NUM >= PG_VERSION_14
 
 static Plan *
 PlanTreeMutator(Plan *node, void *context)
@@ -492,6 +492,7 @@ IsCreateTableAs(const char *query)
 	return true;
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_14
 /*
  * IsExplainQuery
  *
@@ -531,6 +532,7 @@ IsExplainQuery(const char *query)
 
 	return true;
 }
+#endif /* PG_VERSION_NUM >= PG_VERSION_14 */
 
 void engine_planner_init(void)
 {
