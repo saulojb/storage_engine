@@ -605,7 +605,7 @@ engine_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 	 * The snapshot is serialised by table_parallelscan_initialize() right
 	 * after our AM-specific data, at the offset we report below.
 	 */
-#if PG_VERSION_NUM >= PG_VERSION_16
+#if PG_VERSION_NUM >= PG_VERSION_18
 	pcscan->base.phs_locator = rel->rd_locator;
 #else
 	pcscan->base.phs_relid = RelationGetRelid(rel);
@@ -3759,7 +3759,11 @@ se_alter_engine_table_set(PG_FUNCTION_ARGS)
 			StringInfoData chkbuf;
 			initStringInfo(&chkbuf);
 			appendStringInfo(&chkbuf, "SELECT 1 ORDER BY %s", options.orderby);
+#if PG_VERSION_NUM >= PG_VERSION_14
 			raw_parser(chkbuf.data, RAW_PARSE_DEFAULT);
+#else
+			raw_parser(chkbuf.data);
+#endif
 			pfree(chkbuf.data);
 		}
 
