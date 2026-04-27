@@ -184,11 +184,11 @@
 #define fcSetArgNull(fc, n) fcSetArgExt(fc, n, (Datum) 0, true)
 
 /*
- * MemoryContextMemAllocated() was added in PG14.
- * On PG12/PG13 return 0 so threshold checks always evaluate to false
+ * MemoryContextMemAllocated() was added in PG13.
+ * On PG12 return 0 so threshold checks always evaluate to false
  * (no early stripe flush, no hash-agg spill — safe fallback).
  */
-#if PG_VERSION_NUM < PG_VERSION_14
+#if PG_VERSION_NUM < PG_VERSION_13
 #define MemoryContextMemAllocated(ctx, recurse) ((Size) 0)
 #endif
 
