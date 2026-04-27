@@ -1,0 +1,16 @@
+-- storage_engine upgrade script: 1.3.0 → 1.3.1
+--
+-- v1.3.1 — PG12–PG19 full build compatibility (C-only fixes, no catalog changes)
+--
+-- Three compile-time fixes that together cover PostgreSQL 12 through 19:
+--
+--   1. PG12 IndexBuildCallback second arg is HeapTuple (not ItemPointer)
+--      Guarded with #if PG_VERSION_NUM < PG_VERSION_13
+--
+--   2. MemoryContextMemAllocated availability corrected to PG >= 13
+--      (was incorrectly guarded as PG >= 14)
+--
+--   3. commands/explain_format.h exists only from PG18 onward
+--      Guarded with #if PG_VERSION_NUM >= PG_VERSION_18 in engine_aggregator_node.c
+--
+-- This file intentionally left empty.

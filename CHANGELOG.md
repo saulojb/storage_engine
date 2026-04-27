@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## 1.3.1
+
+* fix: **PG12 `IndexBuildCallback` second argument** — changed from
+  `ItemPointer` to `HeapTuple` to match the PG12 API. On PG13+ the
+  signature uses `ItemPointer`; guarded with `#if PG_VERSION_NUM < PG_VERSION_13`.
+
+* fix: **`MemoryContextMemAllocated` availability guard** — the function
+  exists from PG13 onward (not PG14 as previously guarded). Corrected the
+  `#if PG_VERSION_NUM < PG_VERSION_13` guard in `pg_version_compat.h`.
+
+* fix: **`commands/explain_format.h` include on PG < 18** — the header was
+  split from `commands/explain.h` in PG18. Guarded the include in
+  `engine_aggregator_node.c` with `#if PG_VERSION_NUM >= PG_VERSION_18`.
+
+  Together these three fixes restore full build compatibility for
+  PostgreSQL 12 through 19 (all versions now compile without errors or
+  warnings).
+
 ## 1.3.0
 
 * fix: **PG14/PG15 compile error in `rowcompress_tableam.c`** — added explicit
