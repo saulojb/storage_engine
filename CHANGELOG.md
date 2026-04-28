@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## 1.3.3
+
+* fix: **`CREATE EXTENSION storage_engine` fails with "could not find function
+  se_vfloat8pl"** — with `default_version = '1.3.2'` and no direct install
+  script, PostgreSQL chained all upgrade scripts (1.0 → … → 1.3.2) on every
+  fresh `CREATE EXTENSION`.  At the 1.2.5→1.2.6 step the `float8`, `numeric`,
+  and `money` vectorized-aggregate C functions were registered, but users who
+  had an older compiled `.so` (pre-float8) saw the error above.
+
+  Fix: added `storage_engine--1.3.3.sql` (and the backport
+  `storage_engine--1.3.2.sql`), a self-contained direct installation script
+  generated from the full upgrade chain.  PostgreSQL now uses this single
+  script for all fresh installs of v1.3.3, completely bypassing the chain.
+  Existing users upgrading with `ALTER EXTENSION storage_engine UPDATE` are
+  unaffected; the upgrade chain is still available for that path.
+
+  No catalog changes.
+
+---
+
 ## 1.3.2
 
 * fix: **Stripe pruning now works for stable expressions** — predicates like

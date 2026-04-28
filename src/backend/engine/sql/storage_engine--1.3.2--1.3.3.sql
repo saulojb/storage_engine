@@ -1,0 +1,16 @@
+-- storage_engine--1.3.2--1.3.3.sql
+-- Upgrade script: v1.3.2 → v1.3.3
+--
+-- v1.3.3 — fix: CREATE EXTENSION fails with "could not find function se_vfloat8pl"
+--          when users have an older .so installed but newer SQL scripts.
+--
+-- Root cause: with default_version = '1.3.2' and no direct storage_engine--1.3.2.sql
+-- install script, PostgreSQL chained all upgrade scripts (1.0 → ... → 1.3.2).
+-- At the 1.2.5→1.2.6 step the float8/numeric/money C functions were referenced
+-- before they existed in older compiled libraries, causing a hard error.
+--
+-- Fix: added storage_engine--1.3.3.sql (direct install script for v1.3.3) so
+-- that fresh installations are served by a single self-contained script instead
+-- of the full upgrade chain.  No catalog changes in this release.
+
+-- (intentionally empty — no catalog changes)
