@@ -1,5 +1,42 @@
 # CHANGELOG
 
+## 1.3.4
+
+* feature: **`PROCEDURE engine.colcompress_repack(table_name regclass, min_fill_ratio float8 DEFAULT 0.9)`** — online stripe defragmentation for `colcompress` tables.
+
+  `colcompress` uses an append-only storage model: `UPDATE` operations mark
+  old rows as deleted (via `deleted_mask` bitmask) and append a new stripe.
+  Over time, tables with frequent updates accumulate partially-dead stripes,
+  wasting disk space and increasing scan cost.
+
+  `colcompress_repack` iterates over each stripe in order and, for any stripe
+  whose live-row ratio falls below `min_fill_ratio`, reads the live rows into
+  a temporary table, deletes the old stripe range, and reinserts the rows.
+  Each stripe is repacked inside its own transaction (`COMMIT` after each
+  stripe), so the operation is crash-safe and does not hold a lock on the
+  table between stripes.  Only a brief `ShareUpdateExclusiveLock` is acquired
+  per stripe cycle.
+
+  Usage:
+  ```sql
+  -- default: repack stripes with < 90% live rows
+  CALL engine.colcompress_repack('my_table');
+
+  -- custom fill ratio
+  CALL engine.colcompress_repack('my_table', 0.7);
+  ```
+
+* removed: **`FUNCTION engine.colcompress_repack(regclass)`** alias —
+  previously an alias for `engine.colcompress_merge`.  Removed because it
+  caused an "is not unique" ambiguity error when calling the new 2-argument
+  PROCEDURE with a single argument.  Users who need full table rewrite with
+  `ORDER BY` should call `engine.colcompress_merge()` directly.
+
+  Upgrade scripts contain `DROP FUNCTION IF EXISTS engine.colcompress_repack(regclass)`
+  to cleanly remove the alias on existing installations.
+
+---
+
 ## 1.3.3
 
 * fix: **`CREATE EXTENSION storage_engine` fails with "could not find function
