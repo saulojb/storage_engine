@@ -1,0 +1,21 @@
+                                                                      QUERY PLAN                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (StorageEngineVectorAgg)  (cost=107862.73..107862.74 rows=1 width=24) (actual time=47.164..47.165 rows=1.00 loops=1)
+   Output: (engine.vmin(user_id)), (engine.vmax(user_id)), (engine.vcount(*))
+   Engine Vectorized Aggregate: enabled
+   Buffers: shared hit=372 read=219
+   ->  Custom Scan (ColcompressScan) on public.events_col  (cost=0.00..100362.73 rows=1000000 width=8) (actual time=6.273..46.146 rows=100.00 loops=1)
+         Output: user_id
+         Engine Projected Columns: user_id
+         Engine Vectorized Aggregate: enabled
+         Buffers: shared hit=372 read=219
+ Planning:
+   Buffers: shared hit=282 read=20
+ Planning Time: 2.261 ms
+ JIT:
+   Functions: 3
+   Options: Inlining false, Optimization false, Expressions true, Deforming true
+   Timing: Generation 0.139 ms (Deform 0.000 ms), Inlining 0.000 ms, Optimization 0.119 ms, Emission 2.472 ms, Total 2.731 ms
+ Execution Time: 60.865 ms
+(17 linhas)
+

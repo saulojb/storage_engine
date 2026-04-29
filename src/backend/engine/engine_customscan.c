@@ -2512,6 +2512,17 @@ ColumnarScan_BeginCustomScan(CustomScanState *cscanstate, EState *estate, int ef
 			columnarScanState->vectorization.resultVectorSlot =
 				CreateVectorTupleTableSlot(node->ps.ps_ResultTupleDesc);
 		}
+
+		/*
+		 * When returning vector batches for VectorGroupAgg aggregation,
+		 * always use the scanVectorSlot (indexed by table attnum) so that
+		 * the consumer can access columns by their table attribute number.
+		 * On PG 16, ps_ProjInfo is non-NULL even when no projection is needed,
+		 * which would cause resultVectorSlot (projection-order indexed) to be
+		 * returned instead. Forcing ps_ProjInfo = NULL ensures the fast path
+		 * that returns scanVectorSlot directly.
+		 */
+		node->ps.ps_ProjInfo = NULL;
 	}
 
 	if (columnarScanState->vectorization.vectorizationEnabled)

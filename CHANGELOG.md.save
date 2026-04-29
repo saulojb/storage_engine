@@ -1,175 +1,5 @@
 # CHANGELOG
 
-## 1.4.0
-
-* feature: **VectorGroupAgg — vectorized GROUP BY aggregation for `colcompress` tables**
-
-  `colcompress` tables can now execute `GROUP BY` queries entirely in vectorized
-  mode without materializing individual rows.  The planner hook replaces
-  `HashAggregate → ColcompressScan` and `GroupAggregate → Sort → ColcompressScan`
-  with a single `Custom Scan (StorageEngineVectorGroupAgg)` node that:
-
-  - Pulls `VectorColumn` batches directly from `ColcompressScan`
-  - Accumulates per-group results in an `HTAB` using native C integer/float
-    accumulators — no PostgreSQL function call overhead per row
-  - Emits one result tuple per group after a single full scan
-
-  **Supported aggregates:** `count(*)`, `sum`, `min`, `max` over `int4`,
-  `int8`, and `float8` columns; up to 8 aggregate targets per query.
-
-  **Supported GROUP BY key types:** `int4`, `int8`, `float8`.
-
-  **Supported PostgreSQL versions:** 16, 17, 18, 19.
-
-  On PG 16, the planner generates `HashAggregate → Sort` for `GROUP BY … ORDER BY`.
-  The hook strips the outer Sort node and enables sorted output internally
-  (`sort_output=true`), eliminating the need for an external sort node.
-  On PG 17–19, the planner generates `GroupAggregate (AGG_SORTED)` with an
-  inner Sort; the hook strips the inner Sort and uses internal sorted emission.
-
-  `sum(bigint)` returns `numeric` (OID 1700) as required by the SQL standard.
-  The accumulator stores a native `int64` and converts to `numeric` via
-  `DirectFunctionCall1(int8_numeric, …)` only at tuple emission time.
-
-  `EXPLAIN ANALYZE` shows the node correctly:
-  ```
-  Custom Scan (StorageEngineVectorGroupAgg)  (actual time=2.8..2.8 rows=5 loops=1)
-    Engine Vectorized Group Aggregate: enabled
-    Engine Groups Found: 5
-    ->  Custom Scan (ColcompressScan) on t_reg  ...
-  ```
-
-* fix: **VectorGroupAgg — `EXPLAIN ANALYZE` crash on PG 16 (SIGSEGV in Sort ExplainNode)**
-
-  When the PG 16 planner placed a Sort above HashAggregate (for ORDER BY),
-  the mutation hook replaced HashAggregate with VecGroupAgg but left the
-  outer Sort in place.  `EXPLAIN ANALYZE` then called PG 16's `ExplainNode`
-  on this Sort → VecGroupAgg plan, which accessed the Sort's targetlist with
-  an out-of-range `varno` and crashed.
-
-  Fixed by adding a `case T_Sort` handler in `PlanTreeMutator`: when the
-  Sort's child becomes VecGroupAgg (single key, key position matches Sort key),
-  the Sort is absorbed — VecGroupAgg takes over ORDER BY via internal sorted
-  emission (`sort_output=true`).
-
-* fix: **VectorGroupAgg — `EndVecGroupAgg` double `hash_seq_term` after scan exhaustion**
-
-  When `hash_seq_search` returns `NULL` (scan exhausted, `hash_seq_term` called
-  internally), `EndVecGroupAgg` would call `hash_seq_search` again on the
-  already-terminated status, triggering `unregister_seq_scan: scan not found`
-  inside PG's hash table code.  The resulting `elog(ERROR)` inside cleanup
-  code corrupted the exception stack and produced `____longjmp_chk` SIGSEGV.
-
-  Fixed by setting `state->seq_started = false` in `ExecVecGroupAgg`
-  immediately when `hash_seq_search` returns `NULL`.
-
-* fix: **VectorGroupAgg — `sum(bigint)` SIGSEGV when plan has downstream Sort**
-
-  `fill_and_store_slot` stored `int64` accumulators as raw `Int64GetDatum`
-  even for `sum(bigint)` whose SQL return type is `numeric` (varlena,
-  `typlen = -1`).  Any downstream node that copied the tuple (Sort,
-  Materialize) would call `VARSIZE_ANY` on the raw int64, treating it as a
-  varlena pointer and dereferencing a garbage address.
-
-  Fixed by tracking `result_typeoid` in `VecGroupAggTarget` and converting
-  via `DirectFunctionCall1(int8_numeric, …)` when `result_typeoid == NUMERICOID`.
-
----
-
-## 1.3.5
-
-* fix: **vectorized aggregates now work when `max_parallel_workers_per_gather > 0`**
-
-  On PostgreSQL 14+ the planner hook now uses a two-pass strategy for queries
-  with aggregates when `storage_engine.vectorization = on`:
-
-  - **Pass 1** — plan with the original `max_parallel_workers_per_gather`
-    setting (parallel plan, stored as fallback).
-  - **Pass 2** — temporarily set `max_parallel_workers_per_gather = 0`,
-    re-plan to get a serial `T_Agg` node with `AGGSPLIT_SIMPLE`, attempt
-    `PlanTreeMutator` to inject `StorageEngineVectorAgg`.  On success, return
-    the vectorized serial plan.  On failure (mixed/unsupported aggregates),
-    `PG_CATCH` discards the serial plan and returns the Pass 1 parallel plan.
-
-  Previously, any `max_parallel_workers_per_gather > 0` caused the planner to
-  produce `AGGSPLIT_INITIAL_SERIAL`/`AGGSPLIT_FINAL_DESERIAL` split nodes
-  instead of `AGGSPLIT_SIMPLE`, which the vectorization hook could not match —
-  making `storage_engine.vectorization = on` a silent no-op for most server
-  configurations.
-
-  Non-aggregate queries (pure scans, index lookups) are unaffected and
-  continue to use the Pass 1 parallel plan with zero extra planning overhead.
-
-* fix: **server crash (SIGSEGV) on vectorized aggregate with WHERE clause**
-
-  The two-pass planner called `standard_planner()` twice with the same `Query *`
-  object. The first call modified the Query tree in-place; the second call
-  (Pass 2, serial re-plan) operated on the already-consumed object, causing a
-  segfault for any query with a WHERE clause or non-trivial qual pushdown.
-
-  Fixed by calling `copyObject(parse)` before Pass 1 and using the fresh copy
-  exclusively for the Pass 2 serial re-plan. Pass 1 continues to use the
-  original `parse` pointer as before.
-
----
-
-## 1.3.4
-
-* feature: **`PROCEDURE engine.colcompress_repack(table_name regclass, min_fill_ratio float8 DEFAULT 0.9)`** — online stripe defragmentation for `colcompress` tables.
-
-  `colcompress` uses an append-only storage model: `UPDATE` operations mark
-  old rows as deleted (via `deleted_mask` bitmask) and append a new stripe.
-  Over time, tables with frequent updates accumulate partially-dead stripes,
-  wasting disk space and increasing scan cost.
-
-  `colcompress_repack` iterates over each stripe in order and, for any stripe
-  whose live-row ratio falls below `min_fill_ratio`, reads the live rows into
-  a temporary table, deletes the old stripe range, and reinserts the rows.
-  Each stripe is repacked inside its own transaction (`COMMIT` after each
-  stripe), so the operation is crash-safe and does not hold a lock on the
-  table between stripes.  Only a brief `ShareUpdateExclusiveLock` is acquired
-  per stripe cycle.
-
-  Usage:
-  ```sql
-  -- default: repack stripes with < 90% live rows
-  CALL engine.colcompress_repack('my_table');
-
-  -- custom fill ratio
-  CALL engine.colcompress_repack('my_table', 0.7);
-  ```
-
-* removed: **`FUNCTION engine.colcompress_repack(regclass)`** alias —
-  previously an alias for `engine.colcompress_merge`.  Removed because it
-  caused an "is not unique" ambiguity error when calling the new 2-argument
-  PROCEDURE with a single argument.  Users who need full table rewrite with
-  `ORDER BY` should call `engine.colcompress_merge()` directly.
-
-  Upgrade scripts contain `DROP FUNCTION IF EXISTS engine.colcompress_repack(regclass)`
-  to cleanly remove the alias on existing installations.
-
----
-
-## 1.3.3
-
-* fix: **`CREATE EXTENSION storage_engine` fails with "could not find function
-  se_vfloat8pl"** — with `default_version = '1.3.2'` and no direct install
-  script, PostgreSQL chained all upgrade scripts (1.0 → … → 1.3.2) on every
-  fresh `CREATE EXTENSION`.  At the 1.2.5→1.2.6 step the `float8`, `numeric`,
-  and `money` vectorized-aggregate C functions were registered, but users who
-  had an older compiled `.so` (pre-float8) saw the error above.
-
-  Fix: added `storage_engine--1.3.3.sql` (and the backport
-  `storage_engine--1.3.2.sql`), a self-contained direct installation script
-  generated from the full upgrade chain.  PostgreSQL now uses this single
-  script for all fresh installs of v1.3.3, completely bypassing the chain.
-  Existing users upgrading with `ALTER EXTENSION storage_engine UPDATE` are
-  unaffected; the upgrade chain is still available for that path.
-
-  No catalog changes.
-
----
-
 ## 1.3.2
 
 * fix: **Stripe pruning now works for stable expressions** — predicates like
@@ -698,4 +528,52 @@ Additional features added beyond the upstream:
 * parallel columnar scan wired through DSM
 * GUCs under the `storage_engine.*` namespace
 * support for PostgreSQL 16, 17, and 18
+ = {**os.environ, 'GIT_PAGER': 'cat', 'PAGER': 'cat', 'TERM': 'dumb'} base = 
+['/usr/bin/git', '--no-pager', '-C', '/home/saulo/Projetos/storage_engine/dist'] 
+files = ['CHANGELOG.md', 'META.json', 'VERSION',
+         'src/backend/engine/storage_engine.control', 
+         'src/backend/engine/engine_customscan.c', 
+         'src/backend/engine/sql/storage_engine--1.3.1--1.3.2.sql']
+r = subprocess.run(base + ['add'] + files, capture_output=True, text=True, 
+env=env) print('ADD:', r.returncode, r.stderr) r = subprocess.run(base + 
+['status', '--short'], capture_output=True, text=True, env=env) print('STATUS:') 
+print(r.stdout) "
+ reset; echo done
+ tput rmcup; echo test
+ python3 /tmp/fix_meta.py
+ git status --short 2>&1 | head -5 && git log --oneline -3 2>&1
+ PAGER=cat GIT_PAGER=cat python3 /tmp/commit_meta.py 2>&1 | cat
+ python3 /tmp/check_meta_status.py 2>&1 | cat
+ python3 /tmp/bench_join_pruning.py 2>&1 | cat
+ python3 /tmp/bench_join2.py > /tmp/bench_join2_out.txt 2>&1; echo "EXIT:$?"; cat /tmp/bench_join2_out.txt
+ python3 -c "
+import subprocess, time, statistics, os
+
+def q(sql, runs=3):
+    t=[]
+    for _ in range(runs):
+        t0=time.perf_counter()
+        subprocess.run(['psql','-d','issue_killerwzb','-Atc',sql],capture_output=True)
+        t.append((time.perf_counter()-t0)*1000)
+    return statistics.median(t)
+
+base='SET enable_sort=off; SET max_parallel_workers_per_gather=8; SET storage_engine.enable_vectorization=on; '
+j_sql='SELECT u.region, COUNT(*), AVG(e.value) FROM events_col e JOIN users_col u ON e.user_id=u.user_id WHERE e.ts >= CURRENT_DATE - INTERVAL chr(39)7 days chr(39) GROUP BY u.region'
+print('start')
+" 2>&1 | head -5
+ git -C /home/saulo/Projetos/storage_engine/dist log --oneline -5 && echo "---" && git -C /home/saulo/Projetos/storage_engine/dist status --short
+ python3 -c "
+import subprocess, os
+env = {**os.environ, 'GIT_PAGER': 'cat', 'PAGER': 'cat', 'TERM': 'dumb', 'NO_COLOR': '1'}
+base = ['/usr/bin/git', '--no-pager', '-C', '/home/saulo/Projetos/storage_engine/dist']
+
+r = subprocess.run(base + ['log', '--oneline', '-5'], capture_output=True, text=True, env=env)
+print('LOG:', r.stdout)
+
+r = subprocess.run(base + ['status', '--short'], capture_output=True, text=True, env=env)
+print('STATUS:', r.stdout or '(clean)')
+
+r = subprocess.run(base + ['tag', '-l', 'v1.3.2'], capture_output=True, text=True, env=env)
+print('TAG v1.3.2:', r.stdout.strip())
+" 2>&1 | cat
 
