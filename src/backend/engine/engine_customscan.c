@@ -2573,8 +2573,10 @@ ColumnarScan_BeginCustomScan(CustomScanState *cscanstate, EState *estate, int ef
 
 	if (columnarScanState->vectorization.vectorizationEnabled)
 	{
+		TupleDesc relationTupleDesc =
+			RelationGetDescr(cscanstate->ss.ss_currentRelation);
 		TupleDesc packedVectorDesc = CreateAttrNeededTupleDesc(
-			cscanstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
+			relationTupleDesc,
 			columnarScanState->vectorization.attrNeededList);
 
 		if (columnarScanState->vectorization.scanVectorSlot == NULL)
@@ -2594,11 +2596,8 @@ ColumnarScan_BeginCustomScan(CustomScanState *cscanstate, EState *estate, int ef
 			 * projected columns and filter-only columns get misaligned or omitted.
 			 */
 			columnarScanState->vectorization.aggregateTupleSlot =
-				MakeSingleTupleTableSlot(CreateTupleDescCopy(packedVectorDesc), &TTSOpsVirtual
-#if PG_VERSION_NUM >= PG_VERSION_19
-													   , 0
-#endif
-													   );
+				MakeSingleTupleTableSlot(CreateTupleDescCopy(packedVectorDesc),
+												   &TTSOpsVirtual);
 			columnarScanState->vectorization.resultVectorSlot =
 				CreateVectorTupleTableSlot(packedVectorDesc);
 			node->ps.ps_ProjInfo = NULL;
@@ -2639,8 +2638,8 @@ ColumnarScan_BeginCustomScan(CustomScanState *cscanstate, EState *estate, int ef
 Bitmapset *
 ColumnarAttrNeeded(ScanState *ss, List *customList)
 {
-	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
-	int natts = slot->tts_tupleDescriptor->natts;
+	TupleDesc relationTupleDesc = RelationGetDescr(ss->ss_currentRelation);
+	int natts = relationTupleDesc->natts;
 	Bitmapset *attr_needed = NULL;
 	Plan *plan = ss->ps.plan;
 	int flags = PVC_RECURSE_AGGREGATES |
@@ -2657,7 +2656,7 @@ ColumnarAttrNeeded(ScanState *ss, List *customList)
 
 		Var *var = (Var *) targetEntry->expr;
 		AttrNumber resolvedAttno = ResolveTargetEntryAttno(
-			slot->tts_tupleDescriptor, targetEntry, var);
+			relationTupleDesc, targetEntry, var);
 
 		if (resolvedAttno == 0)
 			continue;

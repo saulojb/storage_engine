@@ -18,10 +18,13 @@ set -euo pipefail
 export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULTS="$SCRIPT_DIR/results_parallel.csv"
+RESULTS="${RESULTS:-$SCRIPT_DIR/results_parallel_nocitus.csv}"
 RUNS=${1:-3}
-AM_DB="bench_am"
+AM_DB="${AM_DB:-bench_am}"
 PG_USER="$(whoami)"
+PGPORT="${PGPORT:-5432}"
+PG_VERSION_LABEL="${PG_VERSION_LABEL:-18}"
+MAX_PARALLEL_WORKERS_PER_GATHER="${MAX_PARALLEL_WORKERS_PER_GATHER:-4}"
 
 declare -a Q_LABELS=(
   "Q1 count(*)"
@@ -53,21 +56,20 @@ declare -A AM_TARGETS=(
   ["heap"]="$AM_DB:events_heap"
   ["colcompress"]="$AM_DB:events_col"
   ["rowcompress"]="$AM_DB:events_row"
-  ["citus_columnar"]="$AM_DB:events_cit"
 )
-declare -a AM_ORDER=("heap" "colcompress" "rowcompress" "citus_columnar")
+declare -a AM_ORDER=("heap" "colcompress" "rowcompress")
 
 psql_ms() {
     local db="$1" tbl="$2" q_tmpl="$3"
     local q="${q_tmpl//__TBL__/$tbl}"
     local tmpf
     tmpf=$(mktemp /tmp/bench_XXXXXX.sql)
-    printf '\\timing on\nSET jit=on;\nSET max_parallel_workers_per_gather=4;\n%s;\n' "$q" > "$tmpf"
+    printf '\\timing on\nSET jit=on;\nSET max_parallel_workers_per_gather=%s;\n%s;\n' "$MAX_PARALLEL_WORKERS_PER_GATHER" "$q" > "$tmpf"
 
     local -a times=()
     for ((i=0; i<RUNS; i++)); do
         local t
-        t=$(psql -U "$PG_USER" -d "$db" --no-psqlrc -P pager=off -f "$tmpf" 2>&1 \
+        t=$(psql -U "$PG_USER" -p "$PGPORT" -d "$db" --no-psqlrc -P pager=off -f "$tmpf" 2>&1 \
             | grep -oP '(?:Time|Tempo):\s*\K[0-9]+[.,][0-9]+' | tail -1 | tr ',' '.')
         times+=("${t:-9999}")
     done
@@ -78,8 +80,8 @@ psql_ms() {
 echo "AM,query,median_ms" > "$RESULTS"
 
 echo "============================================================"
-echo " Benchmark — PostgreSQL 18  •  1 000 000 rows"
-echo " Runs per query: $RUNS   JIT: on   Parallelism: 4 workers"
+echo " Benchmark — PostgreSQL $PG_VERSION_LABEL  •  1 000 000 rows"
+echo " Runs per query: $RUNS   JIT: on   Parallelism: $MAX_PARALLEL_WORKERS_PER_GATHER workers"
 echo "============================================================"
 
 for am in "${AM_ORDER[@]}"; do

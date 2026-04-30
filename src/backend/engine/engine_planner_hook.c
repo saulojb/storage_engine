@@ -532,6 +532,8 @@ PlanTreeMutator(Plan *node, void *context)
 
 					vectorizedAggNode->scan.plan.lefttree = node->lefttree;
 					vectorizedAggNode->scan.plan.righttree = node->righttree;
+					newAgg->plan.lefttree = node->lefttree;
+					newAgg->plan.righttree = node->righttree;
 
 					return (Plan *) vectorizedAggNode;
 				}

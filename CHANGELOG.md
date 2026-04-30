@@ -74,6 +74,58 @@
   Fixed by tracking `result_typeoid` in `VecGroupAggTarget` and converting
   via `DirectFunctionCall1(int8_numeric, …)` when `result_typeoid == NUMERICOID`.
 
+* fix: **cross-version vectorized aggregate correctness on PostgreSQL 16, 17, 18 and 19**
+
+  The `StorageEngineVectorAgg` wrapper and its inner `Agg` node could diverge
+  after plan mutation: the wrapper received the mutated `ColcompressScan`
+  child, but `newAgg->plan.lefttree/righttree` could still point at the
+  original child plan.  Since execution initializes the inner `Agg`, some
+  multi-column vectorized aggregates on PG 17 and PG 19 ran with mismatched
+  flags and returned wrong results.
+
+  Fixed by synchronizing the mutated child plan into both the wrapper node and
+  the inner `Agg` plan.
+
+* fix: **packed-slot qual evaluation and varattno mapping in vectorized scans**
+
+  Vectorized `colcompress` scans were evaluating scalar quals against a packed
+  slot layout while filter Vars still referenced the original table attnos.
+  This could misread non-leading attributes and crash on varlena quals such as
+  `LIKE` and array operators.
+
+  Fixed by preserving full-width slot layout for qual evaluation, rebuilding
+  packed aggregate slots only after the batch passes the filter, and resolving
+  packed descriptors against the relation tuple descriptor instead of the
+  projected scan slot.
+
+* fix: **PostgreSQL API compatibility for PG16/17 bitmap scans and PG19 slot creation**
+
+  PG 16/17 still expose exact-page TIDBitmap offsets via
+  `TBMIterateResult->ntuples` and embedded `offsets[]`, while PG 18+ use
+  `tbm_extract_page_tuple()`.  PG 19 also required keeping the local
+  `MakeSingleTupleTableSlot()` call site as a two-argument invocation.
+
+  Version-specific guards now keep `colcompress` and `rowcompress` builds and
+  runtime behavior aligned across PG 16, 17, 18 and 19.
+
+* validation: **full correctness matrix is green on PG16–PG19**
+
+  After clean per-version rebuilds, installs and cluster restarts,
+  `python3 tests/test_suite.py` completed with `ALL 152 TESTS PASSED` on
+  PostgreSQL 16, 17, 18 and 19.
+
+* benchmark: **no-citus benchmark matrix rerun on PG16–PG19**
+
+  Serial and parallel benchmark matrices were rerun without `citus` using the
+  same workload on PostgreSQL 16, 17, 18 and 19.  `colcompress` remained the
+  best engine for most analytical queries, especially in parallel mode.
+
+  Against the historical PG 18 no-citus baseline, the new PG 18 parallel
+  results stayed close overall and improved `colcompress` on key grouped/GIN
+  paths such as `Q7 JSONB key + GROUP BY` (`103.477 ms -> 72.506 ms`), while
+  the serial PG 18 run regressed more broadly and should be treated as a known
+  planner/per-version benchmark shift rather than a correctness issue.
+
 ---
 
 ## 1.3.5

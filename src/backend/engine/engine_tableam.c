@@ -3048,10 +3048,17 @@ engine_scan_bitmap_next_tuple(TableScanDesc sscan,
 			else
 			{
 				/* Exact block: extract the specific tuple offsets */
+			#if PG_VERSION_NUM >= PG_VERSION_18
 				scan->cs_bm_noffsets = tbm_extract_page_tuple(
 					&scan->cs_tbmres,
 					scan->cs_bm_offsets,
 					VALID_ITEMPOINTER_OFFSETS);
+			#else
+				scan->cs_bm_noffsets = scan->cs_tbmres.ntuples;
+				memcpy(scan->cs_bm_offsets,
+					   scan->cs_tbmres.offsets,
+					   sizeof(OffsetNumber) * scan->cs_bm_noffsets);
+			#endif
 				scan->cs_bm_offidx = 0;
 				(*exact_pages)++;
 			}

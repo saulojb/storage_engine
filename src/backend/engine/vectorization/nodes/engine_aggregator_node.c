@@ -4120,7 +4120,7 @@ VExecInitAgg(Agg *node, EState *estate, int eflags)
 		for (i = 0; i < numGroupingSets; i++)
 		{
 			pergroups[i] = (AggStatePerGroup) palloc0(sizeof(AggStatePerGroupData)
-													  * numaggs);
+													  * numtrans);
 		}
 
 		aggstate->pergroups = pergroups;
@@ -5201,7 +5201,7 @@ ExecReScanAgg(AggState *node)
 		for (setno = 0; setno < numGroupingSets; setno++)
 		{
 			MemSet(node->pergroups[setno], 0,
-				   sizeof(AggStatePerGroupData) * node->numaggs);
+				   sizeof(AggStatePerGroupData) * node->numtrans);
 		}
 
 		/* reset to phase 1 */

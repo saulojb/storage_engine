@@ -3249,10 +3249,17 @@ rowcompress_scan_bitmap_next_tuple(TableScanDesc sscan,
 			}
 			else
 			{
+			#if PG_VERSION_NUM >= PG_VERSION_18
 				scan->bmNoffsets = tbm_extract_page_tuple(
 					&scan->tbmres,
 					scan->bmOffsets,
 					VALID_ITEMPOINTER_OFFSETS);
+			#else
+				scan->bmNoffsets = scan->tbmres.ntuples;
+				memcpy(scan->bmOffsets,
+					   scan->tbmres.offsets,
+					   sizeof(OffsetNumber) * scan->bmNoffsets);
+			#endif
 				scan->bmOffidx = 0;
 				(*exact_pages)++;
 			}
