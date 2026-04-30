@@ -38,15 +38,14 @@ se_vanycount(PG_FUNCTION_ARGS)
 	int64 result = arg;
 	VectorColumn *arg1 = (VectorColumn *) PG_GETARG_POINTER(1);
 	int i;
-
-	for (i = 0; i <  arg1->dimension; i++) 
+	if (arg1 == NULL)
+		PG_RETURN_INT64(result);
+	for (i = 0; i < arg1->dimension; i++)
 	{
 		if (arg1->isnull[i])
 			continue;
-
 		result++;
 	}
-
 	PG_RETURN_INT64(result);
 }
 

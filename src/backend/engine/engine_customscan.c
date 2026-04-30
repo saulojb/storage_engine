@@ -30,6 +30,7 @@
 #if PG_VERSION_NUM >= PG_VERSION_18
 #include "commands/explain_format.h"
 #endif
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
@@ -97,7 +98,9 @@ typedef struct ColumnarScanState
 	{
 		bool vectorizationEnabled;
 		bool vectorizationAggregate;
+		bool vectorizationAggStarOnly;
 		TupleTableSlot *scanVectorSlot;
+		TupleTableSlot *aggregateTupleSlot;
 		TupleTableSlot *resultVectorSlot;
 		uint32 vectorPendingRowNumber;
 		uint32 vectorRowIndex;
@@ -214,6 +217,61 @@ static List * set_deparse_context_planstate(List *dpcontext, Node *node,
 
 /* other helpers */
 static List * ColumnarVarNeeded(ColumnarScanState *columnarScanState);
+static TupleDesc CreateAttrNeededTupleDesc(TupleDesc scanTupleDesc, List *attrNeededList);
+static AttrNumber ResolveTargetEntryAttno(TupleDesc tupleDesc, TargetEntry *targetEntry,
+	Var *var);
+static TupleDesc
+CreateAttrNeededTupleDesc(TupleDesc scanTupleDesc, List *attrNeededList)
+{
+	TupleDesc packedTupleDesc = CreateTemplateTupleDesc(list_length(attrNeededList));
+	ListCell *lc;
+	AttrNumber dstAttno = 1;
+
+	foreach(lc, attrNeededList)
+	{
+		int sourceAttrIdx = lfirst_int(lc);
+
+		TupleDescCopyEntry(packedTupleDesc, dstAttno,
+						   scanTupleDesc, sourceAttrIdx + 1);
+		dstAttno++;
+	}
+
+	return BlessTupleDesc(packedTupleDesc);
+}
+
+static AttrNumber
+ResolveTargetEntryAttno(TupleDesc tupleDesc, TargetEntry *targetEntry, Var *var)
+{
+	if (var->varattno > 0 && var->varattno <= tupleDesc->natts)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupleDesc, var->varattno - 1);
+
+		if (!attr->attisdropped && attr->atttypid == var->vartype)
+		{
+			if (targetEntry->resname == NULL ||
+				strcmp(NameStr(attr->attname), targetEntry->resname) == 0)
+				return var->varattno;
+		}
+	}
+
+	if (targetEntry->resname != NULL)
+	{
+		int attno;
+
+		for (attno = 1; attno <= tupleDesc->natts; attno++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupleDesc, attno - 1);
+
+			if (attr->attisdropped)
+				continue;
+
+			if (strcmp(NameStr(attr->attname), targetEntry->resname) == 0)
+				return attno;
+		}
+	}
+
+	return var->varattno;
+}
 
 /* RowcompressScan forward declarations */
 static void RCAddScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte);
@@ -2487,6 +2545,11 @@ ColumnarScan_BeginCustomScan(CustomScanState *cscanstate, EState *estate, int ef
 			columnarScanState->vectorization.vectorizationAggregate =
 				privateCustomData->constvalue;
 		}
+		else if (privateCustomData->consttype == CUSTOM_SCAN_VECTORIZED_AGG_STAR_ONLY)
+		{
+			columnarScanState->vectorization.vectorizationAggStarOnly =
+				privateCustomData->constvalue;
+		}
 	}
 
 	/*
@@ -2498,39 +2561,6 @@ ColumnarScan_BeginCustomScan(CustomScanState *cscanstate, EState *estate, int ef
 		(columnarScanState->vectorization.vectorizedQualList != NULL ||
 		 columnarScanState->vectorization.vectorizationAggregate);
 
-	if (columnarScanState->vectorization.vectorizationAggregate)
-	{
-		ScanState *node = (ScanState *) &columnarScanState->custom_scanstate.ss;
-
-		if (node->ps.ps_ProjInfo)
-		{
-			columnarScanState->vectorization.resultVectorSlot =
-				CreateVectorTupleTableSlot(node->ps.ps_ProjInfo->pi_state.resultslot->tts_tupleDescriptor);
-		}
-		else
-		{
-			columnarScanState->vectorization.resultVectorSlot =
-				CreateVectorTupleTableSlot(node->ps.ps_ResultTupleDesc);
-		}
-
-		/*
-		 * When returning vector batches for VectorGroupAgg aggregation,
-		 * always use the scanVectorSlot (indexed by table attnum) so that
-		 * the consumer can access columns by their table attribute number.
-		 * On PG 16, ps_ProjInfo is non-NULL even when no projection is needed,
-		 * which would cause resultVectorSlot (projection-order indexed) to be
-		 * returned instead. Forcing ps_ProjInfo = NULL ensures the fast path
-		 * that returns scanVectorSlot directly.
-		 */
-		node->ps.ps_ProjInfo = NULL;
-	}
-
-	if (columnarScanState->vectorization.vectorizationEnabled)
-	{
-		columnarScanState->vectorization.scanVectorSlot =
-			CreateVectorTupleTableSlot(cscanstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor);
-	}
-
 	columnarScanState->attrNeeded = 
 		ColumnarAttrNeeded(&cscanstate->ss, columnarScanState->vectorization.vectorizedQualList);
 
@@ -2539,6 +2569,40 @@ ColumnarScan_BeginCustomScan(CustomScanState *cscanstate, EState *estate, int ef
 	{
 		columnarScanState->vectorization.attrNeededList = 
 			lappend_int(columnarScanState->vectorization.attrNeededList, bmsMember);
+	}
+
+	if (columnarScanState->vectorization.vectorizationEnabled)
+	{
+		TupleDesc packedVectorDesc = CreateAttrNeededTupleDesc(
+			cscanstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
+			columnarScanState->vectorization.attrNeededList);
+
+		if (columnarScanState->vectorization.scanVectorSlot == NULL)
+		{
+			columnarScanState->vectorization.scanVectorSlot =
+				CreateVectorTupleTableSlot(packedVectorDesc);
+		}
+
+		if (columnarScanState->vectorization.vectorizationAggregate)
+		{
+			ScanState *node = (ScanState *) &columnarScanState->custom_scanstate.ss;
+
+			/*
+			 * The aggregate path copies scalar rows from the scan vector slot into a
+			 * fresh batch via ExtractTupleFromVectorSlot + WriteTupleToVectorSlot.
+			 * Both ends of that copy must use the same packed descriptor, otherwise
+			 * projected columns and filter-only columns get misaligned or omitted.
+			 */
+			columnarScanState->vectorization.aggregateTupleSlot =
+				MakeSingleTupleTableSlot(CreateTupleDescCopy(packedVectorDesc), &TTSOpsVirtual
+#if PG_VERSION_NUM >= PG_VERSION_19
+													   , 0
+#endif
+													   );
+			columnarScanState->vectorization.resultVectorSlot =
+				CreateVectorTupleTableSlot(packedVectorDesc);
+			node->ps.ps_ProjInfo = NULL;
+		}
 	}
 
 	/*
@@ -2581,13 +2645,45 @@ ColumnarAttrNeeded(ScanState *ss, List *customList)
 	Plan *plan = ss->ps.plan;
 	int flags = PVC_RECURSE_AGGREGATES |
 				PVC_RECURSE_WINDOWFUNCS | PVC_RECURSE_PLACEHOLDERS;
-	List *vars = list_concat(pull_var_clause((Node *) plan->targetlist, flags),
-							 pull_var_clause((Node *) plan->qual, flags));
+	List *vars = pull_var_clause((Node *) plan->qual, flags);
+	ListCell *lc;
+
+	foreach(lc, plan->targetlist)
+	{
+		TargetEntry *targetEntry = (TargetEntry *) lfirst(lc);
+
+		if (targetEntry->resjunk || !IsA(targetEntry->expr, Var))
+			continue;
+
+		Var *var = (Var *) targetEntry->expr;
+		AttrNumber resolvedAttno = ResolveTargetEntryAttno(
+			slot->tts_tupleDescriptor, targetEntry, var);
+
+		if (resolvedAttno == 0)
+			continue;
+
+		if (resolvedAttno == SelfItemPointerAttributeNumber ||
+			resolvedAttno == TableOidAttributeNumber)
+			continue;
+
+		if (resolvedAttno < SelfItemPointerAttributeNumber)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("MIN / MAX TransactionID or CommandID not supported for ColcompressScan")));
+		}
+
+		if (resolvedAttno == 0)
+		{
+			attr_needed = bms_add_range(attr_needed, 0, natts - 1);
+			break;
+		}
+
+		attr_needed = bms_add_member(attr_needed, resolvedAttno - 1);
+	}
 
 	if (customList != NULL)
 		vars = list_concat(vars, pull_var_clause((Node *)customList, flags));
-
-	ListCell *lc;
 
 	foreach(lc, vars)
 	{
@@ -2783,6 +2879,7 @@ CustomExecScan(ColumnarScanState *columnarScanState,
 	for (;;)
 	{
 		TupleTableSlot *slot = NULL;
+		uint32 matchedVectorRowIndex = 0;
 
 		if (columnarScanState->vectorization.vectorizationEnabled && 
 			columnarScanState->vectorization.vectorPendingRowNumber == 0 &&
@@ -2858,15 +2955,6 @@ CustomExecScan(ColumnarScanState *columnarScanState,
 
 				memcpy(vectorSlot->keep, resultQual, COLUMNAR_VECTOR_COLUMN_SIZE);
 			}
-			/*
-			 * No qual, no vectorized qual, no projection but we need to return vector
-			 * for vectorized aggregate
-			 */
-			else if (!qual && !projInfo && columnarScanState->vectorization.vectorizationAggregate)
-			{
-				columnarScanState->vectorization.vectorPendingRowNumber = 0;
-				return slot;
-			}
 		}
 
 		uint64 rowNumber = 0;
@@ -2879,6 +2967,10 @@ CustomExecScan(ColumnarScanState *columnarScanState,
 		{
 			VectorTupleTableSlot *vectorSlot = 
 				(VectorTupleTableSlot *) columnarScanState->vectorization.scanVectorSlot;
+			bool aggStarOnlyFastPath =
+				columnarScanState->vectorization.vectorizationAggregate &&
+				columnarScanState->vectorization.vectorizationAggStarOnly &&
+				qual == NULL;
 
 			bool rowFound = false;
 
@@ -2887,16 +2979,35 @@ CustomExecScan(ColumnarScanState *columnarScanState,
 			{
 				if (vectorSlot->keep[columnarScanState->vectorization.vectorRowIndex])
 				{
-					slot = columnarScanState->custom_scanstate.ss.ss_ScanTupleSlot;
-					ExecClearTuple(slot);
-					ExtractTupleFromVectorSlot(slot,
+					matchedVectorRowIndex =
+						columnarScanState->vectorization.vectorRowIndex;
+					rowNumber = vectorSlot->rowNumber[columnarScanState->vectorization.vectorRowIndex];
+
+					if (aggStarOnlyFastPath)
+					{
+						resultVectorTupleSlotIdx++;
+					}
+					else if (columnarScanState->vectorization.vectorizationAggregate)
+					{
+						if (qual != NULL)
+							slot = columnarScanState->custom_scanstate.ss.ss_ScanTupleSlot;
+						else
+							slot = columnarScanState->vectorization.aggregateTupleSlot;
+					}
+					else
+						slot = columnarScanState->custom_scanstate.ss.ss_ScanTupleSlot;
+
+					if (!aggStarOnlyFastPath)
+					{
+						ExecClearTuple(slot);
+						ExtractTupleFromVectorSlot(slot,
 											   vectorSlot,
 											   columnarScanState->vectorization.vectorRowIndex,
 											   columnarScanState->vectorization.attrNeededList);
-					
-					rowNumber = vectorSlot->rowNumber[columnarScanState->vectorization.vectorRowIndex];
-					if (!columnarScanState->vectorization.vectorizationAggregate)
-						slot->tts_tid = row_number_to_tid(rowNumber);
+
+						if (!columnarScanState->vectorization.vectorizationAggregate)
+							slot->tts_tid = row_number_to_tid(rowNumber);
+					}
 					rowFound = true;
 				}
 				columnarScanState->vectorization.vectorPendingRowNumber--;
@@ -2904,6 +3015,9 @@ CustomExecScan(ColumnarScanState *columnarScanState,
 			}
 
 			if (rowFound == false)
+				continue;
+
+			if (aggStarOnlyFastPath)
 				continue;
 		}
 
@@ -2935,6 +3049,22 @@ CustomExecScan(ColumnarScanState *columnarScanState,
 
 			if (columnarScanState->vectorization.vectorizationAggregate)
 			{
+					if (columnarScanState->vectorization.vectorizationAggStarOnly)
+					{
+						resultVectorTupleSlotIdx++;
+						continue;
+					}
+
+				if (qual != NULL)
+				{
+					slot = columnarScanState->vectorization.aggregateTupleSlot;
+					ExecClearTuple(slot);
+					ExtractTupleFromVectorSlot(slot,
+									  (VectorTupleTableSlot *) columnarScanState->vectorization.scanVectorSlot,
+									  matchedVectorRowIndex,
+									  columnarScanState->vectorization.attrNeededList);
+				}
+
 				WriteTupleToVectorSlot(slot,
 									  (VectorTupleTableSlot *) columnarScanState->vectorization.resultVectorSlot,
 									  resultVectorTupleSlotIdx);
@@ -3000,15 +3130,18 @@ ColumnarScanNext(ColumnarScanState *columnarScanState)
 	}
 
 	/* 
-	* Cleanup vector tuple table slot when reading next chunk
+	* Cleanup vector tuple table slot when reading next chunk.
+	 * The vectorSlot's tts_values[] are indexed by output position (0-based),
+	 * NOT by table attno.  Use tts_nvalid to iterate over all projected
+	 * columns without going out of bounds.
 	 */
 	if (vectorizationEnabled)
 	{
 		VectorTupleTableSlot *vectorSlot = (VectorTupleTableSlot *) slot;
-		int attrIndex = -1;
-		foreach_int(attrIndex, columnarScanState->vectorization.attrNeededList)
+		int i;
+		for (i = 0; i < slot->tts_nvalid; i++)
 		{
-			VectorColumn *column = (VectorColumn *) vectorSlot->tts.tts_values[attrIndex];
+			VectorColumn *column = (VectorColumn *) vectorSlot->tts.tts_values[i];
 			memset(column->isnull, true, COLUMNAR_VECTOR_COLUMN_SIZE);
 			column->dimension = 0;
 		}

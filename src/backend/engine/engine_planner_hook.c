@@ -23,6 +23,7 @@
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -30,7 +31,9 @@
 #include "optimizer/plancat.h"
 #include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
+#include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "parser/parser.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_func.h"
 #include "parser/parsetree.h"
@@ -61,16 +64,57 @@ static PlannedStmt * ColumnarPlannerHook(Query *parse,
 #endif
 									 );
 static bool IsCreateTableAs(const char *query);
+static bool PlanUsesParallelExecution(Plan *plan);
 
 #if PG_VERSION_NUM >= PG_VERSION_14
 static Oid engine_tableam_oid = InvalidOid;
-static bool IsExplainQuery(const char *query);
+static bool QueryStringHasPlainExplain(const char *query);
 static bool QueryHasVectorizableAggregate(Query *parse);
 
 typedef struct PlanTreeMutatorContext
 {
 	bool vectorizedAggregation;
+	bool vectorizedAggStarOnly;
 } PlanTreeMutatorContext;
+
+typedef struct
+{
+	bool foundAggref;
+	bool allAggrefsAreStar;
+} AggrefStarContext;
+
+static bool
+AggrefStarWalker(Node *node, void *context)
+{
+	AggrefStarContext *ctx = (AggrefStarContext *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Aggref))
+	{
+		Aggref *aggref = (Aggref *) node;
+
+		ctx->foundAggref = true;
+		if (!aggref->aggstar)
+			ctx->allAggrefsAreStar = false;
+	}
+
+	return expression_tree_walker(node, AggrefStarWalker, context);
+}
+
+static bool
+PlanAllAggrefsAreStar(Plan *plan)
+{
+	AggrefStarContext ctx;
+
+	ctx.foundAggref = false;
+	ctx.allAggrefsAreStar = true;
+	(void) AggrefStarWalker((Node *) plan->targetlist, &ctx);
+	(void) AggrefStarWalker((Node *) plan->qual, &ctx);
+
+	return ctx.foundAggref && ctx.allAggrefsAreStar;
+}
 
 #define FLATCOPY(newnode, node, nodetype)  \
 	( (newnode) = (nodetype *) palloc(sizeof(nodetype)), \
@@ -199,6 +243,112 @@ ScanOutputPosToVarAttno(Plan *child_plan, AttrNumber scan_pos)
 }
 
 /*
+ * Map a table varattno to its 0-based slot output position.
+ *
+ * ColumnarReadNextVector writes column data into tts_values[output_idx]
+ * where output_idx is the rank of varattno in the sorted (ascending) list of
+ * projected table attnos.  This helper computes that rank by collecting all
+ * unique varattno values from scan_plan->targetlist, sorting them, and
+ * returning the position of table_attno.
+ *
+ * Returns -1 if table_attno is not projected.
+ */
+static int
+VarAttnoToSlotIdx(Plan *scan_plan, AttrNumber table_attno)
+{
+	int			n = 0;
+	int			i;
+	AttrNumber	attnos[MaxTupleAttributeNumber];
+	ListCell   *lc;
+
+	/* Collect unique positive varnos from the scan targetlist */
+	foreach(lc, scan_plan->targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+		AttrNumber	a;
+		int			j;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+		a = ((Var *) te->expr)->varattno;
+		if (a <= 0)
+			continue;
+		/* dedup */
+		for (j = 0; j < n; j++)
+			if (attnos[j] == a)
+				break;
+		if (j == n)
+			attnos[n++] = a;
+	}
+
+	/* Sort ascending (insertion sort; n is tiny) */
+	for (i = 1; i < n; i++)
+	{
+		AttrNumber	key = attnos[i];
+		int			j = i - 1;
+
+		while (j >= 0 && attnos[j] > key)
+		{
+			attnos[j + 1] = attnos[j];
+			j--;
+		}
+		attnos[j + 1] = key;
+	}
+
+	/* Return rank of table_attno */
+	for (i = 0; i < n; i++)
+		if (attnos[i] == table_attno)
+			return i;
+
+	return -1;
+}
+
+/*
+ * Context for VecAggVarAttnoMutator.
+ */
+typedef struct
+{
+	Plan *scan_plan;
+} VecAggVarCtx;
+
+/*
+ * expression_tree_mutator callback: rewrite Var.varattno from table attno to
+ * VectorTupleTableSlot output position (output_pos + 1).
+ *
+ * ColumnarReadNextVector fills tts_values[output_pos] where output_pos is the
+ * rank of varattno in the sorted projected-attno list (NOT varattno-1).
+ * The standard EEOP_OUTERVAR evaluator reads tts_values[varattno-1], so we
+ * must remap varattno → output_pos+1 at plan time so both agree.
+ */
+static Node *
+VecAggVarAttnoMutator(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, Var))
+	{
+		Var *var = (Var *) node;
+
+		if (var->varno == OUTER_VAR && var->varattno > 0)
+		{
+			VecAggVarCtx *ctx = (VecAggVarCtx *) context;
+			int slot_idx = VarAttnoToSlotIdx(ctx->scan_plan, var->varattno);
+
+			if (slot_idx >= 0)
+			{
+				Var *newvar = copyObject(var);
+				newvar->varattno = (AttrNumber)(slot_idx + 1);
+				return (Node *) newvar;
+			}
+		}
+		return (Node *) var;
+	}
+
+	return expression_tree_mutator(node, VecAggVarAttnoMutator, context);
+}
+
+/*
  * Map a Postgres type OID to VECGAGG_TYPE_* code.
  * Returns -1 if unsupported.
  */
@@ -296,13 +446,20 @@ PlanTreeMutator(Plan *node, void *context)
 				PlanTreeMutatorContext *planTreeContext = (PlanTreeMutatorContext *) context;
 
 				Const * vectorizedAggregateExecution = makeNode(Const);
+				Const * vectorizedAggStarOnly = makeNode(Const);
 
 				vectorizedAggregateExecution->constbyval = true;
 				vectorizedAggregateExecution->consttype = CUSTOM_SCAN_VECTORIZED_AGGREGATE;
 				vectorizedAggregateExecution->constvalue =  planTreeContext->vectorizedAggregation;
 				vectorizedAggregateExecution->constlen = sizeof(bool);
 
+				vectorizedAggStarOnly->constbyval = true;
+				vectorizedAggStarOnly->consttype = CUSTOM_SCAN_VECTORIZED_AGG_STAR_ONLY;
+				vectorizedAggStarOnly->constvalue = planTreeContext->vectorizedAggStarOnly;
+				vectorizedAggStarOnly->constlen = sizeof(bool);
+
 				customScan->custom_private = lappend(customScan->custom_private, vectorizedAggregateExecution);
+				customScan->custom_private = lappend(customScan->custom_private, vectorizedAggStarOnly);
 			}
 			else
 			{
@@ -365,10 +522,13 @@ PlanTreeMutator(Plan *node, void *context)
 
 
 					PlanTreeMutatorContext *planTreeContext = (PlanTreeMutatorContext *) context;
+					bool oldVectorizedAggStarOnly = planTreeContext->vectorizedAggStarOnly;
 					planTreeContext->vectorizedAggregation = true;
+					planTreeContext->vectorizedAggStarOnly = PlanAllAggrefsAreStar((Plan *) newAgg);
 
 					PlanTreeMutator(node->lefttree, context);
 					PlanTreeMutator(node->righttree, context);
+					planTreeContext->vectorizedAggStarOnly = oldVectorizedAggStarOnly;
 
 					vectorizedAggNode->scan.plan.lefttree = node->lefttree;
 					vectorizedAggNode->scan.plan.righttree = node->righttree;
@@ -427,6 +587,19 @@ PlanTreeMutator(Plan *node, void *context)
 				if (key_varattno == 0)
 					goto groupagg_fallback;
 
+				/*
+				 * Compute the 0-based slot output position for the GROUP BY key.
+				 * ColumnarReadNextVector stores columns at the rank of their
+				 * varattno in the sorted projected-attno list, NOT at varattno-1.
+				 */
+				{
+					int key_slot_idx = VarAttnoToSlotIdx(scan_plan, key_varattno);
+					if (key_slot_idx < 0)
+						goto groupagg_fallback;
+					/* Reuse key_varattno variable to carry the slot index forward */
+					key_varattno = (AttrNumber) key_slot_idx;
+				}
+
 				key_scan_te = get_tle_by_resno(scan_plan->targetlist, scan_key_pos);
 				if (key_scan_te == NULL || !IsA(key_scan_te->expr, Var))
 					goto groupagg_fallback;
@@ -480,9 +653,29 @@ PlanTreeMutator(Plan *node, void *context)
 						break;
 					}
 
+					/*
+					 * For non-count(*) aggregates, map table varattno to the
+					 * 0-based slot output position (sorted projected attno rank).
+					 * Use -1 as the sentinel for count(*) (no slot needed).
+					 */
+					{
+						int col_slot_idx;
+						if (kind == VECGAGG_COUNT_STAR)
+							col_slot_idx = -1;
+						else
+						{
+							col_slot_idx = VarAttnoToSlotIdx(scan_plan, col_varattno);
+							if (col_slot_idx < 0)
+							{
+								supported = false;
+								break;
+							}
+						}
+						targets[num_targets].col_attnum = col_slot_idx;
+					}
+
 					targets[num_targets].agg_kind       = kind;
 					targets[num_targets].col_type       = TypeOidToVecGaggType(col_typeoid);
-					targets[num_targets].col_attnum     = (int) col_varattno;
 					targets[num_targets].result_attnum  = result_att;
 					targets[num_targets].result_typeoid = aggref->aggtype;
 						num_targets++;
@@ -509,10 +702,13 @@ PlanTreeMutator(Plan *node, void *context)
 					 */
 					PlanTreeMutatorContext *planTreeContext =
 						(PlanTreeMutatorContext *) context;
+					bool oldVectorizedAggStarOnly = planTreeContext->vectorizedAggStarOnly;
 					planTreeContext->vectorizedAggregation = true;
+					planTreeContext->vectorizedAggStarOnly = false;
 
 					/* This recurse marks the ColcompressScan child */
 					PlanTreeMutator(scan_plan, context);
+					planTreeContext->vectorizedAggStarOnly = oldVectorizedAggStarOnly;
 
 					/* Set up node cost/row estimates from original agg */
 					Plan *vgaNodePlan = (Plan *) vgaNode;
@@ -704,15 +900,20 @@ ColumnarPlannerHook(Query *parse,
 	}
 
 	/*
-	 * Skip plan tree mutation for EXPLAIN queries.  When citus is loaded
-	 * alongside storage_engine, citus calls ExecutorStart internally during
-	 * EXPLAIN processing.  Mutating the plan tree in that context causes a
-	 * segfault because citus does not expect the plan to be modified after
-	 * its own planner hook has run.  Plain EXPLAIN (without ANALYZE) does
-	 * not execute the plan, so vectorization is irrelevant anyway.
+	 * With citus loaded, mutating plain EXPLAIN plans can segfault because
+	 * citus calls ExecutorStart during EXPLAIN processing and does not expect
+	 * the plan tree to change after its own planner hook.  In the common case
+	 * without citus, keep vectorized plans visible for EXPLAIN and
+	 * EXPLAIN ANALYZE so diagnostics match execution.
 	 */
-	if (IsExplainQuery(query_string))
+	{
+		bool citus_loaded = OidIsValid(get_extension_oid("citus", true));
+		bool query_has_plain_explain = QueryStringHasPlainExplain(query_string);
+		bool debug_has_plain_explain = QueryStringHasPlainExplain(debug_query_string);
+
+		if (citus_loaded && (query_has_plain_explain || debug_has_plain_explain))
 		return stmt;
+	}
 
 	if (!(engine_enable_vectorization			/* Vectorization should be enabled */
 			|| engine_index_scan)				/* or Engine Index Scan */
@@ -738,8 +939,8 @@ ColumnarPlannerHook(Query *parse,
 	 *                         stored in stmt.  This is the fallback.
 	 *   Pass 2 (below, only when hasAggs=true): re-plan with parallelism=0
 	 *                         → serial plan → attempt PlanTreeMutator.
-	 *         Success → return vectorized serial plan (faster than parallel
-	 *                   for pure min/max/sum/count via chunk metadata).
+	 *         Success → compare the serial vectorized plan cost against the
+	 *                   original Pass 1 plan and keep whichever is cheaper.
 	 *         Failure → PG_CATCH discards serial plan, returns stmt from
 	 *                   Pass 1 (the original parallel plan).
 	 *
@@ -798,8 +999,22 @@ ColumnarPlannerHook(Query *parse,
 				stmt_serial->subplans = subplans;
 			}
 
-			/* Vectorization succeeded — use the serial vectorized plan */
-			return stmt_serial;
+			/*
+			 * Vectorization succeeded.  If Pass 1 did not produce a parallel
+			 * plan, keep the serial vectorized plan to preserve the existing
+			 * fast path and EXPLAIN visibility.
+			 *
+			 * If Pass 1 really is parallel, only replace it when the serial
+			 * vectorized plan is estimated cheaper.  On ties we preserve the
+			 * original parallel plan.
+			 */
+			if (!PlanUsesParallelExecution(stmt->planTree))
+				return stmt_serial;
+
+			if (stmt_serial->planTree->total_cost < stmt->planTree->total_cost)
+				return stmt_serial;
+
+			return stmt;
 		}
 		PG_CATCH();
 		{
@@ -924,6 +1139,34 @@ IsCreateTableAs(const char *query)
 }
 
 #if PG_VERSION_NUM >= PG_VERSION_14
+static bool
+PlanUsesParallelExecution(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+
+	if (IsA(plan, Gather) || IsA(plan, GatherMerge) || plan->parallel_aware)
+		return true;
+
+	if (PlanUsesParallelExecution(plan->lefttree) ||
+		PlanUsesParallelExecution(plan->righttree))
+		return true;
+
+	if (IsA(plan, CustomScan))
+	{
+		CustomScan *cscan = (CustomScan *) plan;
+		ListCell *lc;
+
+		foreach(lc, cscan->custom_plans)
+		{
+			if (PlanUsesParallelExecution((Plan *) lfirst(lc)))
+				return true;
+		}
+	}
+
+	return false;
+}
+
 /*
  * QueryHasVectorizableAggregate
  *
@@ -954,43 +1197,59 @@ QueryHasVectorizableAggregate(Query *parse)
 #endif /* PG_VERSION_NUM >= PG_VERSION_14 */
 
 /*
- * IsExplainQuery
+ * QueryStringHasPlainExplain
  *
- * Returns true if the query string is a plain EXPLAIN (without ANALYZE),
- * case-insensitive, with optional leading whitespace.
+ * Returns true if the original command string contains a plain EXPLAIN
+ * statement, i.e. EXPLAIN without ANALYZE=true.
  *
- * We skip plan-tree mutation only for plain EXPLAIN because citus calls
- * ExecutorStart internally during plain EXPLAIN processing and does not
- * expect the plan to be modified after its own planner hook has run.
- * EXPLAIN ANALYZE actually executes the plan, so we allow mutation there
- * so that the vectorized plan tree is visible and active.
+ * The planner hook is invoked for the explained SELECT, not the outer
+ * ExplainStmt utility wrapper, so inspecting only the current Query node is
+ * insufficient for multi-statement commands such as `SET ...; EXPLAIN ...`.
+	* Parse the full command string and inspect the raw ExplainStmt options.
  */
 static bool
-IsExplainQuery(const char *query)
+QueryStringHasPlainExplain(const char *query)
 {
-	const char *p;
+	List       *raw_parsetree_list;
+	ListCell   *lc;
 
 	if (query == NULL)
 		return false;
 
-	/* Skip leading whitespace */
-	while (*query == ' ' || *query == '\t' || *query == '\n' || *query == '\r')
-		query++;
+	/* raw_parser is already used elsewhere in the extension for syntax checks */
+#if PG_VERSION_NUM >= PG_VERSION_14
+	raw_parsetree_list = raw_parser(query, RAW_PARSE_DEFAULT);
+#else
+	raw_parsetree_list = raw_parser(query);
+#endif
 
-	/* Must start with EXPLAIN */
-	if (pg_strncasecmp(query, "explain", 7) != 0)
-		return false;
+	foreach(lc, raw_parsetree_list)
+	{
+		RawStmt *rawStmt = lfirst_node(RawStmt, lc);
 
-	/* Advance past "explain" and skip whitespace */
-	p = query + 7;
-	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-		p++;
+		if (rawStmt != NULL && rawStmt->stmt != NULL && IsA(rawStmt->stmt, ExplainStmt))
+		{
+			ExplainStmt *explainStmt = castNode(ExplainStmt, rawStmt->stmt);
+			ListCell *optionCell;
+			bool analyze = false;
 
-	/* If the next keyword is ANALYZE, allow mutation (return false) */
-	if (pg_strncasecmp(p, "analyze", 7) == 0)
-		return false;
+			foreach(optionCell, explainStmt->options)
+			{
+				DefElem *option = lfirst_node(DefElem, optionCell);
 
-	return true;
+				if (option != NULL && strcmp(option->defname, "analyze") == 0)
+				{
+					analyze = defGetBoolean(option);
+					break;
+				}
+			}
+
+			if (!analyze)
+				return true;
+		}
+	}
+
+	return false;
 }
 
 void engine_planner_init(void)

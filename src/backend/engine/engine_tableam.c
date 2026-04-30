@@ -424,8 +424,12 @@ engine_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot 
 	if (scan->cs_readState == NULL)
 	{
 		bool randomAccess = false;
+		TupleDesc readTupleDesc = scan->returnVectorizedTuple ?
+			RelationGetDescr(scan->cs_base.rs_rd) :
+			slot->tts_tupleDescriptor;
+
 		scan->cs_readState =
-			init_engine_read_state(scan->cs_base.rs_rd, slot->tts_tupleDescriptor,
+			init_engine_read_state(scan->cs_base.rs_rd, readTupleDesc,
 									 scan->attr_needed, scan->scanQual,
 									 scan->scanContext, scan->cs_base.rs_snapshot,
 									 randomAccess,

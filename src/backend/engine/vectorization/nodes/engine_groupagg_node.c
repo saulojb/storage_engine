@@ -303,9 +303,10 @@ vecgroup_entry_cmp(const void *a, const void *b)
  * Process one VectorTupleTableSlot batch: update per-group accumulators.
  * The slot has one VectorColumn per projected attribute.
  *
- * Attribute layout in the slot matches the ColcompressScan projection:
- *   col_attnum-1 → group key VectorColumn
- *   targets[i].col_attnum-1 → aggregate value VectorColumn
+ * Attribute layout in the slot matches ColumnarReadNextVector output:
+ *   key_attnum   → 0-based slot output position of the GROUP BY key
+ *   col_attnum   → 0-based slot output position of the aggregate column
+ *                  (-1 for count(*) which needs no column access)
  */
 static void
 process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
@@ -314,8 +315,8 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 	uint32	dim = vslot->dimension;
 	uint32	i;
 
-	/* Key column: 0-based index in slot->tts_values */
-	int		key_idx = state->key_attnum - 1;
+	/* key_attnum is the 0-based slot output position (slot index) */
+	int		key_idx = state->key_attnum;
 	VectorColumn *key_col;
 
 	key_col = (VectorColumn *) slot->tts_values[key_idx];
@@ -352,9 +353,9 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 			Datum	val = (Datum) 0;
 			bool	val_null = true;
 
-			if (tgt->agg_kind != VECGAGG_COUNT_STAR && tgt->col_attnum > 0)
+			if (tgt->agg_kind != VECGAGG_COUNT_STAR && tgt->col_attnum >= 0)
 			{
-				int val_idx = tgt->col_attnum - 1;
+				int val_idx = tgt->col_attnum;
 				VectorColumn *val_col = (VectorColumn *) slot->tts_values[val_idx];
 				if (val_col)
 				{

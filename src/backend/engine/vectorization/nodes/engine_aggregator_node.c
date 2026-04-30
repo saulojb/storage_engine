@@ -551,6 +551,55 @@ static void build_pertrans_for_aggref(AggStatePerTrans pertrans,
 #endif
 static AggState * VExecInitAgg(Agg *node, EState *estate, int eflags);
 
+static int
+VectorAggVarAttnoToSlotIdx(Plan *scan_plan, AttrNumber table_attno)
+{
+	int			n = 0;
+	int			i;
+	AttrNumber	attnos[MaxTupleAttributeNumber];
+	ListCell   *lc;
+
+	foreach(lc, scan_plan->targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+		AttrNumber	a;
+		int			j;
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+
+		a = ((Var *) te->expr)->varattno;
+		if (a <= 0)
+			continue;
+
+		for (j = 0; j < n; j++)
+			if (attnos[j] == a)
+				break;
+
+		if (j == n)
+			attnos[n++] = a;
+	}
+
+	for (i = 1; i < n; i++)
+	{
+		AttrNumber	key = attnos[i];
+		int			j = i - 1;
+
+		while (j >= 0 && attnos[j] > key)
+		{
+			attnos[j + 1] = attnos[j];
+			j--;
+		}
+		attnos[j + 1] = key;
+	}
+
+	for (i = 0; i < n; i++)
+		if (attnos[i] == table_attno)
+			return i;
+
+	return -1;
+}
+
 /*
  * Select the current grouping set; affects current_set and
  * curaggcontext.
@@ -826,6 +875,14 @@ advance_transition_function(AggState *aggstate,
 	FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
 	MemoryContext oldContext;
 	Datum		newVal;
+	const char *transfn_name = NULL;
+	bool vectorized_transfn = false;
+
+	if (OidIsValid(pertrans->transfn_oid))
+	{
+		transfn_name = get_func_name(pertrans->transfn_oid);
+		vectorized_transfn = (transfn_name != NULL && transfn_name[0] == 'v');
+	}
 
 	if (pertrans->transfn.fn_strict)
 	{
@@ -841,7 +898,7 @@ advance_transition_function(AggState *aggstate,
 			if (fcinfo->args[i].isnull)
 				return;
 		}
-		if (pergroupstate->noTransValue)
+		if (pergroupstate->noTransValue && !vectorized_transfn)
 		{
 			/*
 			 * transValue has not been initialized. This is the first non-NULL
@@ -2571,8 +2628,25 @@ agg_retrieve_direct(VectorAggState *vectoraggstate)
 					/*
 					 * Make a copy of the first input tuple; we will use this
 					 * for comparisons (in group mode) and for projection.
+					 *
+					 * VectorTupleTableSlot: ExecCopySlotHeapTuple crashes for
+					 * tables with varlena columns (VectorColumn.dimension=0 is
+					 * read as varlena header → VARSIZE_ANY_EXHDR = -4 →
+					 * memcpy(~4GB) → SIGSEGV).  Form an all-NULL dummy tuple
+					 * instead — firstSlot is only used as ecxt_outertuple for
+					 * plain-aggregate finalization where no raw Var refs exist.
 					 */
-					aggstate->grp_firstTuple = ExecCopySlotHeapTuple(outerslot);
+					{
+						TupleDesc tdesc = outerslot->tts_tupleDescriptor;
+						int		  natts = tdesc->natts;
+						Datum	 *dvalues = (Datum *) palloc0(natts * sizeof(Datum));
+						bool	 *dnulls  = (bool *)  palloc(natts * sizeof(bool));
+
+						memset(dnulls, true, natts * sizeof(bool));
+						aggstate->grp_firstTuple = heap_form_tuple(tdesc, dvalues, dnulls);
+						pfree(dvalues);
+						pfree(dnulls);
+					}
 				}
 				else
 				{
@@ -2626,11 +2700,6 @@ agg_retrieve_direct(VectorAggState *vectoraggstate)
 
 			if (aggstate->grp_firstTuple != NULL)
 			{
-				/*
-				 * Store the copied first input tuple in the tuple table slot
-				 * reserved for it.  The tuple will be deleted when it is
-				 * cleared from the slot.
-				 */
 				ExecForceStoreHeapTuple(aggstate->grp_firstTuple,
 										firstSlot, true);
 				aggstate->grp_firstTuple = NULL;	/* don't keep two pointers */
@@ -2638,26 +2707,13 @@ agg_retrieve_direct(VectorAggState *vectoraggstate)
 				/* set up for first advance_aggregates call */
 				tmpcontext->ecxt_outertuple = outerslot;
 
-				/*
-				 * Process each outer-plan tuple, and then fetch the next one,
-				 * until we exhaust the outer plan or cross a group boundary.
-				 */
 				for (;;)
 				{
-					/*
-					 * During phase 1 only of a mixed agg, we need to update
-					 * hashtables as well in advance_aggregates.
-					 */
 					if (aggstate->aggstrategy == AGG_MIXED &&
 						aggstate->current_phase == 1)
 					{
 						lookup_hash_entries(aggstate);
 					}
-
-					/* Advance the aggregates (or combine functions) */
-					advance_aggregates(aggstate);
-
-					int	transno;
 
 					currentSet = aggstate->projected_set;
 
@@ -2665,18 +2721,93 @@ agg_retrieve_direct(VectorAggState *vectoraggstate)
 
 					select_current_set(aggstate, currentSet, false);
 
-					for (transno = 0; transno < aggstate->numtrans; transno++)
+					/*
+					 * Vectorized aggregate inner loop.
+					 *
+					 * We bypass ExecEvalExprSwitchContext entirely.
+					 * The EEOP expression evaluator crashes on
+					 * VectorTupleTableSlots because its opcode dispatch
+					 * does not understand batch-column Datums.
+					 *
+					 * Instead we call the vectorized transition functions
+					 * directly via advance_transition_function(), feeding
+					 * them the VectorColumn* they expect.
+					 *
+					 * count(*) is handled without any function call: we
+					 * just add the batch dimension to the running count.
+					 */
 					{
-						AggStatePerTrans pertrans = &aggstate->pertrans[transno];
-						AggStatePerGroup pergroupstate;
-
-						pergroupstate = &pergroups[currentSet][transno];
-
-						// Should handle COUNT(*)
-						if (pertrans->aggref->aggstar)
+						int	transno;
+						for (transno = 0; transno < aggstate->numtrans; transno++)
 						{
-							int slotDim = ((VectorTupleTableSlot *)outerslot)->dimension;
-							pergroupstate->transValue += slotDim;
+							AggStatePerTrans  pertrans      = &aggstate->pertrans[transno];
+							AggStatePerGroup  pergroupstate = &pergroups[currentSet][transno];
+
+							if (pertrans->aggref->aggstar)
+							{
+								/* count(*) — add entire batch size */
+								int slotDim = ((VectorTupleTableSlot *) outerslot)->dimension;
+								pergroupstate->transValue += slotDim;
+							}
+							else if (pertrans->aggref->args != NIL)
+							{
+								/*
+								 * All other vectorized aggregates: set arg[1]
+								 * to the VectorColumn* for the input column,
+								 * then call advance_transition_function which
+								 * handles state initialisation, NULL checks,
+								 * and memory context management.
+								 *
+								 * VecAggVarAttnoMutator already remapped
+								 * varattno → output_pos+1, so
+								 * varattno-1 is the correct 0-based slot index.
+								 */
+								TargetEntry	   *arg_te;
+								Var			   *inputVar;
+								int				colIdx;
+								VectorColumn   *vc;
+								FunctionCallInfo fcinfo;
+
+								Assert(pertrans->numTransInputs == 1);
+								arg_te   = (TargetEntry *) linitial(pertrans->aggref->args);
+								inputVar = (Var *) arg_te->expr;
+								colIdx   = inputVar->varattno - 1; /* 0-based */
+
+								if (colIdx < 0 || colIdx >= outerslot->tts_nvalid)
+								{
+									int mappedColIdx;
+									Plan *outer_plan = outerPlanState(aggstate)->plan;
+
+									mappedColIdx = VectorAggVarAttnoToSlotIdx(outer_plan,
+																	 inputVar->varattno);
+									if (mappedColIdx >= 0)
+										colIdx = mappedColIdx;
+								}
+
+								Assert(colIdx >= 0 && colIdx < outerslot->tts_nvalid);
+								vc = (VectorColumn *) outerslot->tts_values[colIdx];
+
+								if (vc->dimension == 0)
+								{
+									int mappedColIdx;
+									Plan *outer_plan = outerPlanState(aggstate)->plan;
+
+									mappedColIdx = VectorAggVarAttnoToSlotIdx(outer_plan,
+																	 inputVar->varattno);
+									if (mappedColIdx >= 0)
+									{
+										colIdx = mappedColIdx;
+										vc = (VectorColumn *) outerslot->tts_values[colIdx];
+									}
+								}
+
+								fcinfo = pertrans->transfn_fcinfo;
+								fcinfo->args[1].value  = PointerGetDatum(vc);
+								fcinfo->args[1].isnull = false;
+
+								advance_transition_function(aggstate, pertrans,
+															pergroupstate);
+							}
 						}
 					}
 
@@ -2825,10 +2956,10 @@ agg_refill_hash_table(AggState *aggstate)
 	HashAggSpill spill;
 #if PG_VERSION_NUM < PG_VERSION_15
 	HashTapeInfo *tapeinfo = aggstate->hash_tapeinfo;
-#else
+	#else
 	LogicalTapeSet *tapeset = aggstate->hash_tapeset;
-#endif
-	bool		spill_initialized = false;
+	#endif
+	bool			spill_initialized = false;
 
 	if (aggstate->hash_batches == NIL)
 		return false;
@@ -5388,7 +5519,8 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 static TupleTableSlot *
 ExecVectorAgg(CustomScanState *node)
 {
-	return ExecAgg((PlanState *)node);
+	VectorAggState *vas = (VectorAggState *) node;
+	return ExecAgg((PlanState *)vas);
 }
 
 

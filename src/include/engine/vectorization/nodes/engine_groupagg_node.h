@@ -45,7 +45,7 @@ typedef struct VecGroupAggTarget
 {
 	int		agg_kind;		/* VECGAGG_COUNT_STAR / SUM / MIN / MAX */
 	int		col_type;		/* VECGAGG_TYPE_INT4/INT8/FLOAT8 */
-	int		col_attnum;		/* 1-based attnum in scan tuple (0 = unused) */
+	int		col_attnum;		/* 0-based slot output position (-1 = unused, e.g. count(*)) */
 	int		result_attnum;	/* 0-based position in result tuple */
 	Oid		result_typeoid;	/* SQL return type OID (e.g. NUMERICOID for sum(int8)) */
 } VecGroupAggTarget;
@@ -73,7 +73,7 @@ typedef struct VecGroupAggState
 	CustomScanState		css;
 
 	/* Scan info */
-	int					key_attnum;		/* 1-based attnum of GROUP BY column */
+	int					key_attnum;		/* 0-based slot output position of GROUP BY column */
 	int					key_col_type;	/* VECGAGG_TYPE_* */
 	Oid					key_typeoid;
 

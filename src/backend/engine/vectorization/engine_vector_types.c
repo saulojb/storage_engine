@@ -98,15 +98,40 @@ ExtractTupleFromVectorSlot(TupleTableSlot *out, VectorTupleTableSlot *vectorSlot
 						   int32 index, List *attrNeededList)
 {
 	int attno;
+	int output_pos = 0;
+	bool packedOutput =
+		out->tts_tupleDescriptor->natts == list_length(attrNeededList);
+
+	if (!packedOutput)
+	{
+		int i;
+
+		for (i = 0; i < out->tts_tupleDescriptor->natts; i++)
+		{
+			out->tts_values[i] = (Datum) 0;
+			out->tts_isnull[i] = true;
+		}
+	}
+
+	/*
+	 * attrNeededList holds 0-based table attnos sorted in ascending order
+	 * (built by ColumnarAttrNeeded via bms_next_member).  The vectorSlot's
+	 * tts_values[] are indexed by output position (0-based) — the i-th
+	 * entry corresponds to the i-th member of attrNeededList.  Packed slots
+	 * use the same output-position layout, while full-width executor slots
+	 * must receive values at their original table attnos so ExecQual can
+	 * resolve Vars with the relation's varattno numbering.
+	 */
 	foreach_int(attno, attrNeededList)
 	{
-		if (!TupleDescAttr(out->tts_tupleDescriptor, attno)->attisdropped)
-		{
-			VectorColumn *column = (VectorColumn *) vectorSlot->tts.tts_values[attno];
-			int8 *rawColumRawData = (int8*) column->value + column->columnTypeLen * index;
-			out->tts_values[attno] = fetch_att(rawColumRawData, column->columnIsVal, column->columnTypeLen);
-			out->tts_isnull[attno] = column->isnull[index];
-		}
+		int out_idx;
+		VectorColumn *column = (VectorColumn *) vectorSlot->tts.tts_values[output_pos];
+		int8 *rawColumRawData = (int8*) column->value + column->columnTypeLen * index;
+
+		out_idx = packedOutput ? output_pos : attno;
+		out->tts_values[out_idx] = fetch_att(rawColumRawData, column->columnIsVal, column->columnTypeLen);
+		out->tts_isnull[out_idx] = column->isnull[index];
+		output_pos++;
 	}
 
 	ExecStoreVirtualTuple(out);
