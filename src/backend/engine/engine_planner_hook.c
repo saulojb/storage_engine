@@ -70,6 +70,8 @@ static bool PlanUsesParallelExecution(Plan *plan);
 static Oid engine_tableam_oid = InvalidOid;
 static bool QueryStringHasPlainExplain(const char *query);
 static bool QueryHasVectorizableAggregate(Query *parse);
+static void MutatePlannedStmt(PlannedStmt *stmt);
+static void CollectProjectedAttnos(Plan *scan_plan, AttrNumber *attnos, int *count);
 
 typedef struct PlanTreeMutatorContext
 {
@@ -219,8 +221,6 @@ ExpressionMutator(Node *node, void *context)
 			elog(ERROR, "Vectorized aggregate not found.");
 		}
 
-		newAggRefNode->aggfnoid = vectorizedProcedureOid;
-
 		return (Node *) newAggRefNode;
 	}
 
@@ -259,27 +259,8 @@ VarAttnoToSlotIdx(Plan *scan_plan, AttrNumber table_attno)
 	int			n = 0;
 	int			i;
 	AttrNumber	attnos[MaxTupleAttributeNumber];
-	ListCell   *lc;
 
-	/* Collect unique positive varnos from the scan targetlist */
-	foreach(lc, scan_plan->targetlist)
-	{
-		TargetEntry *te = (TargetEntry *) lfirst(lc);
-		AttrNumber	a;
-		int			j;
-
-		if (te->resjunk || !IsA(te->expr, Var))
-			continue;
-		a = ((Var *) te->expr)->varattno;
-		if (a <= 0)
-			continue;
-		/* dedup */
-		for (j = 0; j < n; j++)
-			if (attnos[j] == a)
-				break;
-		if (j == n)
-			attnos[n++] = a;
-	}
+	CollectProjectedAttnos(scan_plan, attnos, &n);
 
 	/* Sort ascending (insertion sort; n is tiny) */
 	for (i = 1; i < n; i++)
@@ -311,6 +292,69 @@ typedef struct
 	Plan *scan_plan;
 } VecAggVarCtx;
 
+typedef struct
+{
+	AttrNumber *attnos;
+	int		   *count;
+} AttnoCollectorCtx;
+
+static bool
+CollectVarAttnosWalker(Node *node, void *context)
+{
+	AttnoCollectorCtx *ctx = (AttnoCollectorCtx *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Var *var = (Var *) node;
+		int j;
+
+		if (var->varattno <= 0)
+			return false;
+
+		for (j = 0; j < *ctx->count; j++)
+			if (ctx->attnos[j] == var->varattno)
+				return false;
+
+		ctx->attnos[(*ctx->count)++] = var->varattno;
+		return false;
+	}
+
+	return expression_tree_walker(node, CollectVarAttnosWalker, context);
+}
+
+static void
+CollectProjectedAttnos(Plan *scan_plan, AttrNumber *attnos, int *count)
+{
+	ListCell *lc;
+	AttnoCollectorCtx ctx;
+
+	ctx.attnos = attnos;
+	ctx.count = count;
+
+	foreach(lc, scan_plan->targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+
+		(void) CollectVarAttnosWalker((Node *) te->expr, &ctx);
+	}
+
+	(void) CollectVarAttnosWalker((Node *) scan_plan->qual, &ctx);
+
+	if (IsA(scan_plan, CustomScan))
+	{
+		CustomScan *customScan = (CustomScan *) scan_plan;
+
+		(void) CollectVarAttnosWalker((Node *) customScan->custom_exprs, &ctx);
+		(void) CollectVarAttnosWalker((Node *) customScan->custom_private, &ctx);
+	}
+}
+
 /*
  * expression_tree_mutator callback: rewrite Var.varattno from table attno to
  * VectorTupleTableSlot output position (output_pos + 1).
@@ -318,7 +362,7 @@ typedef struct
  * ColumnarReadNextVector fills tts_values[output_pos] where output_pos is the
  * rank of varattno in the sorted projected-attno list (NOT varattno-1).
  * The standard EEOP_OUTERVAR evaluator reads tts_values[varattno-1], so we
- * must remap varattno → output_pos+1 at plan time so both agree.
+ * must remap varattno -> output_pos+1 at plan time so both agree.
  */
 static Node *
 VecAggVarAttnoMutator(Node *node, void *context)
@@ -338,10 +382,11 @@ VecAggVarAttnoMutator(Node *node, void *context)
 			if (slot_idx >= 0)
 			{
 				Var *newvar = copyObject(var);
-				newvar->varattno = (AttrNumber)(slot_idx + 1);
+				newvar->varattno = (AttrNumber) (slot_idx + 1);
 				return (Node *) newvar;
 			}
 		}
+
 		return (Node *) var;
 	}
 
@@ -491,19 +536,36 @@ PlanTreeMutator(Plan *node, void *context)
 			if (aggNode->plan.lefttree->type == T_CustomScan)
 			{
 				/*
-				 * Only vectorize simple (non-split) aggregation.  Partial or
-				 * final split nodes (parallel query) require serialfn/combinefn
-				 * which our vectorized aggregates do not provide.
+				 * Vectorize stages that still consume raw tuples from the
+				 * ColcompressScan.  We keep the original aggregate OID so the
+				 * executor preserves the standard combine/serialize/deserial
+				 * metadata for parallel partial aggregation.
 				 */
 				if (aggNode->aggstrategy == AGG_PLAIN &&
-					aggNode->aggsplit == AGGSPLIT_SIMPLE)
+					(aggNode->aggsplit == AGGSPLIT_SIMPLE ||
+					 aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL))
 				{
 					vectorizedAggNode = engine_create_aggregator_node();
 
 					FLATCOPY(newAgg, aggNode, Agg);
+					{
+						VecAggVarCtx varCtx;
 
-					newAgg->plan.targetlist = 
-						(List *) expression_tree_mutator((Node *) newAgg->plan.targetlist, ExpressionMutator, NULL);
+						varCtx.scan_plan = aggNode->plan.lefttree;
+
+						newAgg->plan.targetlist =
+							(List *) expression_tree_mutator((Node *) newAgg->plan.targetlist,
+														 ExpressionMutator,
+														 NULL);
+						newAgg->plan.targetlist =
+							(List *) expression_tree_mutator((Node *) newAgg->plan.targetlist,
+														 VecAggVarAttnoMutator,
+														 &varCtx);
+						newAgg->plan.qual =
+							(List *) expression_tree_mutator((Node *) newAgg->plan.qual,
+														 VecAggVarAttnoMutator,
+														 &varCtx);
+					}
 
 
 					vectorizedAggNode->custom_plans = 
@@ -832,6 +894,34 @@ groupagg_fallback:
 
 	return node;
 }
+
+static void
+MutatePlannedStmt(PlannedStmt *stmt)
+{
+	List		*subplans = NIL;
+	ListCell	*cell;
+	PlanTreeMutatorContext plainTreeContext;
+
+	plainTreeContext.vectorizedAggregation = false;
+	plainTreeContext.vectorizedAggStarOnly = false;
+
+	stmt->planTree = (Plan *) PlanTreeMutator(stmt->planTree,
+										 (void *) &plainTreeContext);
+
+	foreach(cell, stmt->subplans)
+	{
+		PlanTreeMutatorContext subPlainTreeContext;
+		Plan *subplan;
+
+		subPlainTreeContext.vectorizedAggregation = false;
+		subPlainTreeContext.vectorizedAggStarOnly = false;
+		subplan = (Plan *) PlanTreeMutator(lfirst(cell),
+										  (void *) &subPlainTreeContext);
+		subplans = lappend(subplans, subplan);
+	}
+
+	stmt->subplans = subplans;
+}
 #endif
 
 static PlannedStmt *
@@ -848,9 +938,13 @@ ColumnarPlannerHook(Query *parse,
 {
 	PlannedStmt	*stmt;
 #if PG_VERSION_NUM >= PG_VERSION_14
+	bool pass1Vectorized = false;
 	Plan *savedPlanTree;
 	List *savedSubplan;
 	MemoryContext saved_context;
+	Plan *savedParallelPlanTree;
+	List *savedParallelSubplan;
+	MemoryContext saved_parallel_context;
 	int saved_max_parallel_workers_per_gather = max_parallel_workers_per_gather;
 	Query *parse_for_pass2 = NULL;
 #endif
@@ -953,6 +1047,31 @@ ColumnarPlannerHook(Query *parse,
 	{
 		PlannedStmt *stmt_serial;
 
+		savedParallelPlanTree = stmt->planTree;
+		savedParallelSubplan = stmt->subplans;
+		saved_parallel_context = CurrentMemoryContext;
+
+		PG_TRY();
+		{
+			MutatePlannedStmt(stmt);
+			pass1Vectorized = true;
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(saved_parallel_context);
+			edata = CopyErrorData();
+			FlushErrorState();
+			ereport(DEBUG1,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("Parallel plan can't be vectorized. Falling back to original parallel execution."),
+					 errdetail("%s", edata->message)));
+			stmt->planTree = savedParallelPlanTree;
+			stmt->subplans = savedParallelSubplan;
+		}
+		PG_END_TRY();
+
 		max_parallel_workers_per_gather = 0;
 
 		PG_TRY();
@@ -981,35 +1100,29 @@ ColumnarPlannerHook(Query *parse,
 			saved_context = CurrentMemoryContext;
 
 			{
-				List		*subplans = NULL;
-				ListCell	*cell;
-				PlanTreeMutatorContext plainTreeContext;
-				plainTreeContext.vectorizedAggregation = 0;
-
-				stmt_serial->planTree = (Plan *) PlanTreeMutator(stmt_serial->planTree,
-																 (void *) &plainTreeContext);
-
-				foreach(cell, stmt_serial->subplans)
-				{
-					PlanTreeMutatorContext subPlainTreeContext;
-					subPlainTreeContext.vectorizedAggregation = 0;
-					Plan *subplan = (Plan *) PlanTreeMutator(lfirst(cell),
-															 (void *) &subPlainTreeContext);
-					subplans = lappend(subplans, subplan);
-				}
-
-				stmt_serial->subplans = subplans;
+				MutatePlannedStmt(stmt_serial);
 			}
 
 			/*
-			 * Vectorization succeeded.  If Pass 1 did not produce a parallel
-			 * plan, keep the serial vectorized plan to preserve the existing
-			 * fast path and EXPLAIN visibility.
+			 * If Pass 1 was vectorized successfully, keep that plan whenever it
+			 * is cheaper than the serial vectorized fallback.  Otherwise prefer
+			 * the serial vectorized plan.  If Pass 1 could not be vectorized,
+			 * preserve the original fallback behavior.
 			 *
-			 * If Pass 1 really is parallel, only replace it when the serial
-			 * vectorized plan is estimated cheaper.  On ties we preserve the
-			 * original parallel plan.
+			 * If Pass 1 did not produce a parallel plan, keep the first
+			 * vectorized plan we managed to build.
 			 */
+			if (pass1Vectorized)
+			{
+				if (!PlanUsesParallelExecution(stmt->planTree))
+					return stmt;
+
+				if (stmt_serial->planTree->total_cost < stmt->planTree->total_cost)
+					return stmt_serial;
+
+				return stmt;
+			}
+
 			if (!PlanUsesParallelExecution(stmt->planTree))
 				return stmt_serial;
 
@@ -1048,23 +1161,7 @@ ColumnarPlannerHook(Query *parse,
 
 	PG_TRY();
 	{
-		List		*subplans = NULL;
-		ListCell	*cell;
-
-		PlanTreeMutatorContext plainTreeContext;
-		plainTreeContext.vectorizedAggregation = 0;
-
-		stmt->planTree = (Plan *) PlanTreeMutator(stmt->planTree, (void *) &plainTreeContext);
-
-		foreach(cell, stmt->subplans)
-		{
-			PlanTreeMutatorContext subPlainTreeContext;
-			plainTreeContext.vectorizedAggregation = 0;
-			Plan *subplan = (Plan *) PlanTreeMutator(lfirst(cell), (void *) &subPlainTreeContext);
-			subplans = lappend(subplans, subplan);
-		}
-
-		stmt->subplans = subplans;
+		MutatePlannedStmt(stmt);
 	}
 	PG_CATCH();
 	{
