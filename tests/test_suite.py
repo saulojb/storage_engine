@@ -804,8 +804,8 @@ class TestRunner:
         avg_group_sql = "SELECT grp, avg(v::float8) FROM _tpar_group GROUP BY grp"
         plan_avg = self.q(f"{pfx_parallel_vec} EXPLAIN {avg_group_sql}")
         self.check(
-            "parallel grouped avg: EXPLAIN falls back (no StorageEngineVectorGroupAgg)",
-            "StorageEngineVectorGroupAgg" not in plan_avg,
+            "parallel grouped avg(v::float8): EXPLAIN shows StorageEngineVectorGroupAgg",
+            "StorageEngineVectorGroupAgg" in plan_avg,
             plan_avg[:500],
         )
 

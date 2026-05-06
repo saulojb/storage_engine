@@ -38,6 +38,13 @@
 
   Unsupported `avg` shapes still fall back safely.
 
+  Additional planner coverage in this cycle:
+
+  - `avg(var::float8)` now vectorizes in `StorageEngineVectorGroupAgg` for
+    supported base types (`int4`, `int8`, `float4`, `float8`) by tracking
+    casted-input semantics per target and emitting the correct transition/output
+    representation.
+
   In addition to the aggregate coverage expansion, this release includes
   correctness and stability fixes found during PG18 validation:
 

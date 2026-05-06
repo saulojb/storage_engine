@@ -52,6 +52,7 @@ typedef struct VecGroupAggTarget
 	int		col_type;		/* VECGAGG_TYPE_INT4/INT8/FLOAT4/FLOAT8 */
 	int		col_attnum;		/* 0-based slot output position (-1 = unused, e.g. count(*)) */
 	int		result_attnum;	/* 0-based position in result tuple */
+	bool	avg_input_as_float8; /* avg(var::float8): accumulate as float8 transition */
 	Oid		result_typeoid;	/* SQL return type OID (e.g. NUMERICOID for sum(int8)) */
 } VecGroupAggTarget;
 

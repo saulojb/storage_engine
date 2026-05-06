@@ -248,7 +248,17 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 			switch (tgt->col_type)
 			{
 				case VECGAGG_TYPE_INT4:
-					entry->int64_acc[t_idx] += (int64) DatumGetInt32(val);
+					if (tgt->avg_input_as_float8)
+						entry->float8_acc[t_idx] += (float8) DatumGetInt32(val);
+					else
+						entry->int64_acc[t_idx] += (int64) DatumGetInt32(val);
+					entry->avg_count_acc[t_idx]++;
+					entry->acc_isnull[t_idx] = false;
+					break;
+				case VECGAGG_TYPE_INT8:
+					if (!tgt->avg_input_as_float8)
+						break;
+					entry->float8_acc[t_idx] += (float8) DatumGetInt64(val);
 					entry->avg_count_acc[t_idx]++;
 					entry->acc_isnull[t_idx] = false;
 					break;
@@ -608,7 +618,8 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 			case VECGAGG_AVG:
 				if (state->is_partial_serial)
 				{
-					if (tgt->col_type == VECGAGG_TYPE_INT4)
+					if (tgt->col_type == VECGAGG_TYPE_INT4 &&
+						!tgt->avg_input_as_float8)
 					{
 						Datum elems[2];
 
@@ -650,6 +661,7 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 				else
 				{
 					if (tgt->col_type == VECGAGG_TYPE_INT4 &&
+						!tgt->avg_input_as_float8 &&
 						tgt->result_typeoid == NUMERICOID)
 					{
 						Datum sum_numeric =
@@ -710,7 +722,8 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 	 *   [5] sort_output   (Int) — 1 if output must be sorted by key (AGG_SORTED)
 	 *   [6] aggsplit mode (AggSplit enum as int)
 	 *   [7] key_const (Const, optional; present only when key_is_const=1)
-	 *   [N..] encoded targets: 5 Ints each (kind, col_type, col_attnum, result_attnum, result_typeoid)
+	 *   [N..] encoded targets: 6 Ints each
+	 *         (kind, col_type, col_attnum, result_attnum, avg_input_as_float8, result_typeoid)
 	 */
 	List   *priv = cscan->custom_private;
 	int	target_idx;
@@ -750,6 +763,7 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 		state->targets[tno].col_type = PRIV_INT(list_nth(priv, target_idx++));
 		state->targets[tno].col_attnum = PRIV_INT(list_nth(priv, target_idx++));
 		state->targets[tno].result_attnum = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].avg_input_as_float8 = (bool) PRIV_INT(list_nth(priv, target_idx++));
 		state->targets[tno].result_typeoid = (Oid) PRIV_INT(list_nth(priv, target_idx++));
 	}
 
@@ -941,7 +955,7 @@ ExplainVecGroupAgg(CustomScanState *css, List *ancestors, ExplainState *es)
  *
  * Parameters are packed into custom_private as a flat list of Int Consts:
  *   key_attnum, key_typeoid, num_targets,
- *   [kind, col_type, col_attnum, result_attnum, result_typeoid] × num_targets
+ *   [kind, col_type, col_attnum, result_attnum, avg_input_as_float8, result_typeoid] × num_targets
  */
 CustomScan *
 engine_create_groupagg_node(int key_attnum,
@@ -990,6 +1004,7 @@ engine_create_groupagg_node(int key_attnum,
 		MKINT(targets[t].col_type);
 		MKINT(targets[t].col_attnum);
 		MKINT(targets[t].result_attnum);
+		MKINT((int) targets[t].avg_input_as_float8);
 		MKINT((int) targets[t].result_typeoid);
 	}
 

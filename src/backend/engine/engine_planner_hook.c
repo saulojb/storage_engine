@@ -581,15 +581,95 @@ KeyTypeOidToVecGaggType(Oid typeoid)
 }
 
 /*
+ * Extract a base Var from aggregate argument expressions and detect
+ * single-argument cast/coerce wrappers that produce float8.
+ */
+static bool
+ExtractAggInputVar(Node *expr, Var **out_var, Oid *out_expr_type,
+				   bool *out_cast_to_float8)
+{
+	Node   *cur = expr;
+	Oid		expr_type = InvalidOid;
+	bool	cast_to_float8 = false;
+
+	if (expr == NULL)
+		return false;
+
+	expr_type = exprType(expr);
+
+	for (;;)
+	{
+		if (cur == NULL)
+			return false;
+
+		if (IsA(cur, Var))
+			break;
+
+		if (IsA(cur, RelabelType))
+		{
+			RelabelType *r = (RelabelType *) cur;
+
+			if (r->resulttype == FLOAT8OID)
+				cast_to_float8 = true;
+			cur = (Node *) r->arg;
+			continue;
+		}
+
+		if (IsA(cur, FuncExpr))
+		{
+			FuncExpr *f = (FuncExpr *) cur;
+
+			if (list_length(f->args) != 1)
+				return false;
+			if (f->funcresulttype == FLOAT8OID)
+				cast_to_float8 = true;
+			cur = (Node *) linitial(f->args);
+			continue;
+		}
+
+		if (IsA(cur, CoerceViaIO))
+		{
+			CoerceViaIO *c = (CoerceViaIO *) cur;
+
+			if (c->resulttype == FLOAT8OID)
+				cast_to_float8 = true;
+			cur = (Node *) c->arg;
+			continue;
+		}
+
+		if (IsA(cur, CoerceToDomain))
+		{
+			CoerceToDomain *c = (CoerceToDomain *) cur;
+
+			if (c->resulttype == FLOAT8OID)
+				cast_to_float8 = true;
+			cur = (Node *) c->arg;
+			continue;
+		}
+
+		return false;
+	}
+
+	*out_var = (Var *) cur;
+	*out_expr_type = expr_type;
+	*out_cast_to_float8 = (cast_to_float8 && expr_type == FLOAT8OID);
+	return true;
+}
+
+/*
  * Classify an Aggref into VECGAGG_COUNT_STAR / SUM / MIN / MAX / AVG.
  * Fills *out_kind, *out_col_varattno, *out_col_typeoid.
  * Returns false if the aggregate is not supported.
  */
 static bool
 ClassifyAggref(Aggref *aggref, Plan *child_plan,
-			   int *out_kind, AttrNumber *out_col_varattno, Oid *out_col_typeoid)
+			   int *out_kind, AttrNumber *out_col_varattno, Oid *out_col_typeoid,
+			   bool *out_avg_input_as_float8)
 {
 	const char *fname;
+	Var		   *arg_var = NULL;
+	Oid			arg_expr_type = InvalidOid;
+	bool		arg_cast_to_float8 = false;
 
 	/* count(*): aggstar = true, no args */
 	if (aggref->aggstar)
@@ -597,6 +677,7 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 		*out_kind         = VECGAGG_COUNT_STAR;
 		*out_col_varattno = 0;
 		*out_col_typeoid  = INT8OID;
+		*out_avg_input_as_float8 = false;
 		return true;
 	}
 
@@ -605,10 +686,11 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 		return false;
 
 	TargetEntry *arg_te = (TargetEntry *) linitial(aggref->args);
-	if (!IsA(arg_te->expr, Var))
+	if (!ExtractAggInputVar((Node *) arg_te->expr,
+						 &arg_var,
+						 &arg_expr_type,
+						 &arg_cast_to_float8))
 		return false;
-
-	Var *arg_var = (Var *) arg_te->expr;
 
 	/* Map scan-output position to table varattno */
 	AttrNumber scan_pos  = arg_var->varattno;
@@ -627,28 +709,51 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 
 	if (strcmp(fname, "sum") == 0 || strcmp(fname, "int4_sum") == 0 ||
 		strcmp(fname, "int8_sum") == 0 || strcmp(fname, "float8pl") == 0)
+	{
+		if (arg_cast_to_float8)
+			return false;
 		*out_kind = VECGAGG_SUM;
+	}
 	else if (strcmp(fname, "avg") == 0)
 	{
-		/*
-		 * VecGroupAgg supports avg(float4/float8) and incremental support for
-		 * avg(int4) in AGGSPLIT_INITIAL_SERIAL (parallel partial path).
-		 */
-		if (arg_typeoid != FLOAT4OID && arg_typeoid != FLOAT8OID && arg_typeoid != INT4OID)
-			return false;
+		if (arg_cast_to_float8)
+		{
+			if (arg_expr_type != FLOAT8OID)
+				return false;
+			if (arg_typeoid != INT4OID && arg_typeoid != INT8OID &&
+				arg_typeoid != FLOAT4OID && arg_typeoid != FLOAT8OID)
+				return false;
+			*out_avg_input_as_float8 = true;
+		}
+		else
+		{
+			if (arg_typeoid != FLOAT4OID && arg_typeoid != FLOAT8OID && arg_typeoid != INT4OID)
+				return false;
+			*out_avg_input_as_float8 = false;
+		}
 		*out_kind = VECGAGG_AVG;
 	}
 	else if (strcmp(fname, "min") == 0 || strcmp(fname, "int4smaller") == 0 ||
 			 strcmp(fname, "int8smaller") == 0 || strcmp(fname, "float8smaller") == 0)
+	{
+		if (arg_cast_to_float8)
+			return false;
 		*out_kind = VECGAGG_MIN;
+	}
 	else if (strcmp(fname, "max") == 0 || strcmp(fname, "int4larger") == 0 ||
 			 strcmp(fname, "int8larger") == 0 || strcmp(fname, "float8larger") == 0)
+	{
+		if (arg_cast_to_float8)
+			return false;
 		*out_kind = VECGAGG_MAX;
+	}
 	else
 		return false;
 
 	*out_col_varattno = col_attno;
 	*out_col_typeoid  = arg_typeoid;
+	if (*out_kind != VECGAGG_AVG)
+		*out_avg_input_as_float8 = false;
 	return true;
 }
 
@@ -1023,9 +1128,11 @@ PlanTreeMutator(Plan *node, void *context)
 						int			kind;
 						AttrNumber	col_varattno;
 						Oid			col_typeoid;
+						bool		avg_input_as_float8 = false;
 
 					if (!ClassifyAggref(aggref, scan_plan,
-										&kind, &col_varattno, &col_typeoid))
+											&kind, &col_varattno, &col_typeoid,
+											&avg_input_as_float8))
 					{
 						fallback_reason = "aggregate target unsupported";
 						supported = false;
@@ -1063,6 +1170,7 @@ PlanTreeMutator(Plan *node, void *context)
 					targets[num_targets].agg_kind       = kind;
 					targets[num_targets].col_type       = TypeOidToVecGaggType(col_typeoid);
 					targets[num_targets].result_attnum  = result_att;
+					targets[num_targets].avg_input_as_float8 = avg_input_as_float8;
 					targets[num_targets].result_typeoid = aggref->aggtype;
 						num_targets++;
 						result_att++;
