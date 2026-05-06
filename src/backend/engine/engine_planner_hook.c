@@ -657,6 +657,58 @@ ExtractAggInputVar(Node *expr, Var **out_var, Oid *out_expr_type,
 }
 
 /*
+ * Extract an Aggref from a target expression that may be wrapped by
+ * single-argument coercion/finalize nodes.
+ */
+static bool
+ExtractTargetAggref(Node *expr, Aggref **out_aggref)
+{
+	Node   *cur = expr;
+
+	for (;;)
+	{
+		if (cur == NULL)
+			return false;
+
+		if (IsA(cur, Aggref))
+		{
+			*out_aggref = (Aggref *) cur;
+			return true;
+		}
+
+		if (IsA(cur, RelabelType))
+		{
+			cur = (Node *) ((RelabelType *) cur)->arg;
+			continue;
+		}
+
+		if (IsA(cur, FuncExpr))
+		{
+			FuncExpr *f = (FuncExpr *) cur;
+
+			if (list_length(f->args) != 1)
+				return false;
+			cur = (Node *) linitial(f->args);
+			continue;
+		}
+
+		if (IsA(cur, CoerceViaIO))
+		{
+			cur = (Node *) ((CoerceViaIO *) cur)->arg;
+			continue;
+		}
+
+		if (IsA(cur, CoerceToDomain))
+		{
+			cur = (Node *) ((CoerceToDomain *) cur)->arg;
+			continue;
+		}
+
+		return false;
+	}
+}
+
+/*
  * Classify an Aggref into VECGAGG_COUNT_STAR / SUM / MIN / MAX / AVG.
  * Fills *out_kind, *out_col_varattno, *out_col_typeoid.
  * Returns false if the aggregate is not supported.
@@ -714,8 +766,18 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 			return false;
 		*out_kind = VECGAGG_SUM;
 	}
-	else if (strcmp(fname, "avg") == 0)
+	else if (strcmp(fname, "avg") == 0 ||
+			 strcmp(fname, "vavg") == 0 ||
+			 strcmp(fname, "int8_avg") == 0 ||
+			 strcmp(fname, "float8_avg") == 0)
 	{
+#if PG_VERSION_NUM >= PG_VERSION_19
+		/*
+		 * PG19 currently crashes in VecGroupAgg avg output handling.
+		 * Keep avg on scalar fallback path until executor compatibility is fixed.
+		 */
+		return false;
+#endif
 		if (arg_cast_to_float8)
 		{
 			if (arg_expr_type != FLOAT8OID)
@@ -1090,29 +1152,87 @@ PlanTreeMutator(Plan *node, void *context)
 					goto groupagg_fallback;
 				}
 
-				/* Walk the result targetlist to find aggregate columns */
+				/*
+				 * Some versions expose AVG as a visible Var that references a
+				 * hidden (resjunk) Aggref target entry. Pre-scan those resjunk
+				 * Aggrefs so visible Vars can be mapped back to aggregate metadata.
+				 */
+				AttrNumber resjunk_agg_resno[VECGROUPAGG_MAX_TARGETS];
+				Aggref *resjunk_agg_expr[VECGROUPAGG_MAX_TARGETS];
+				int num_resjunk_aggs = 0;
+				ListCell *lc_pre;
+
+				foreach(lc_pre, aggNode->plan.targetlist)
+				{
+					TargetEntry *te_pre = (TargetEntry *) lfirst(lc_pre);
+					Aggref *resjunk_aggref = NULL;
+
+					if (!te_pre->resjunk)
+						continue;
+					if (num_resjunk_aggs >= VECGROUPAGG_MAX_TARGETS)
+						break;
+					if (!ExtractTargetAggref((Node *) te_pre->expr, &resjunk_aggref))
+						continue;
+
+					resjunk_agg_resno[num_resjunk_aggs] = te_pre->resno;
+					resjunk_agg_expr[num_resjunk_aggs] = resjunk_aggref;
+					num_resjunk_aggs++;
+				}
+
+				/* Walk the visible result targetlist to find aggregate columns */
 				result_att = 0;
 				foreach(lc, aggNode->plan.targetlist)
 				{
 					TargetEntry *te = (TargetEntry *) lfirst(lc);
+					Aggref *aggref = NULL;
+					int kind;
+					AttrNumber col_varattno;
+					Oid col_typeoid;
+					bool avg_input_as_float8 = false;
 
 					if (te->resjunk)
 						continue;
 
 					if (IsA(te->expr, Var))
 					{
+						Var *v = (Var *) te->expr;
+						int idx;
+
+						for (idx = 0; idx < num_resjunk_aggs; idx++)
+						{
+							if (v->varattno == resjunk_agg_resno[idx])
+							{
+								aggref = resjunk_agg_expr[idx];
+								break;
+							}
+						}
+
+						if (aggref != NULL)
+						{
+							/* Visible Var is a finalize wrapper over hidden Aggref */
+						}
+						else if (v->varattno == scan_key_pos)
+						{
 						/*
 						 * GROUP BY key column in output.  We already handle this
 						 * via VecGroupEntry.key; no extra target needed.
 						 * But we must account for result_att ordering.
 						 */
-						key_result_att = result_att;  /* record key's 0-based output position */
-						result_att++;
-						continue;
+							key_result_att = result_att;  /* record key's 0-based output position */
+							result_att++;
+							continue;
+						}
+						else
+						{
+							fallback_reason = "non-key Var target not linked to aggregate";
+							supported = false;
+							break;
+						}
 					}
-
-					if (!IsA(te->expr, Aggref))
+					else if (!ExtractTargetAggref((Node *) te->expr, &aggref))
 					{
+						fallback_reason = psprintf("target aggregate shape unsupported (nodeTag=%d)",
+									   (int) nodeTag(te->expr));
 						supported = false;
 						break;
 					}
@@ -1123,18 +1243,12 @@ PlanTreeMutator(Plan *node, void *context)
 						break;
 					}
 
-					{
-						Aggref	   *aggref = (Aggref *) te->expr;
-						int			kind;
-						AttrNumber	col_varattno;
-						Oid			col_typeoid;
-						bool		avg_input_as_float8 = false;
-
 					if (!ClassifyAggref(aggref, scan_plan,
 											&kind, &col_varattno, &col_typeoid,
 											&avg_input_as_float8))
 					{
-						fallback_reason = "aggregate target unsupported";
+						fallback_reason = psprintf("aggregate target unsupported: %s",
+										   get_func_name(aggref->aggfnoid));
 						supported = false;
 						break;
 					}
@@ -1172,14 +1286,13 @@ PlanTreeMutator(Plan *node, void *context)
 					targets[num_targets].result_attnum  = result_att;
 					targets[num_targets].avg_input_as_float8 = avg_input_as_float8;
 					targets[num_targets].result_typeoid = aggref->aggtype;
-						num_targets++;
-						result_att++;
-					}
+					num_targets++;
+					result_att++;
 				}
 
 				if (!supported || num_targets == 0 || key_result_att < 0)
 				{
-					if (num_targets == 0)
+					if (num_targets == 0 && strcmp(fallback_reason, "unspecified") == 0)
 						fallback_reason = "no vectorizable aggregate targets";
 					else if (key_result_att < 0)
 						fallback_reason = "group key not present in output targetlist";
