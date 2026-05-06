@@ -803,19 +803,38 @@ class TestRunner:
 
         avg_group_sql = "SELECT grp, avg(v::float8) FROM _tpar_group GROUP BY grp"
         plan_avg = self.q(f"{pfx_parallel_vec} EXPLAIN {avg_group_sql}")
-        self.check(
-            "parallel grouped avg(v::float8): EXPLAIN shows StorageEngineVectorGroupAgg",
-            "StorageEngineVectorGroupAgg" in plan_avg,
-            plan_avg[:500],
+        server_version_num = self.q1("SHOW server_version_num")
+        avg_groupagg_expected = (
+            server_version_num and
+            (int(server_version_num) < 160000 or int(server_version_num) == 180000)
         )
+        if avg_groupagg_expected:
+            self.check(
+                "parallel grouped avg(v::float8): EXPLAIN shows StorageEngineVectorGroupAgg",
+                "StorageEngineVectorGroupAgg" in plan_avg,
+                plan_avg[:500],
+            )
+        else:
+            self.check(
+                "parallel grouped avg(v::float8): EXPLAIN falls back (version-limited)",
+                "StorageEngineVectorGroupAgg" not in plan_avg,
+                plan_avg[:500],
+            )
 
         avg_group_int4_sql = "SELECT grp, avg(v) FROM _tpar_group GROUP BY grp"
         plan_avg_int4 = self.q(f"{pfx_parallel_vec} EXPLAIN {avg_group_int4_sql}")
-        self.check(
-            "parallel grouped avg(int4): EXPLAIN shows StorageEngineVectorGroupAgg",
-            "StorageEngineVectorGroupAgg" in plan_avg_int4,
-            plan_avg_int4[:500],
-        )
+        if avg_groupagg_expected:
+            self.check(
+                "parallel grouped avg(int4): EXPLAIN shows StorageEngineVectorGroupAgg",
+                "StorageEngineVectorGroupAgg" in plan_avg_int4,
+                plan_avg_int4[:500],
+            )
+        else:
+            self.check(
+                "parallel grouped avg(int4): EXPLAIN falls back (version-limited)",
+                "StorageEngineVectorGroupAgg" not in plan_avg_int4,
+                plan_avg_int4[:500],
+            )
 
         plan_avg_int4_serial = self.q(
             "SET storage_engine.enable_vectorization=on; "
@@ -823,11 +842,18 @@ class TestRunner:
             "SET max_parallel_workers_per_gather=0; "
             "EXPLAIN SELECT grp, avg(v) FROM _tpar_group GROUP BY grp"
         )
-        self.check(
-            "serial grouped avg(int4): EXPLAIN shows StorageEngineVectorGroupAgg",
-            "StorageEngineVectorGroupAgg" in plan_avg_int4_serial,
-            plan_avg_int4_serial[:500],
-        )
+        if avg_groupagg_expected:
+            self.check(
+                "serial grouped avg(int4): EXPLAIN shows StorageEngineVectorGroupAgg",
+                "StorageEngineVectorGroupAgg" in plan_avg_int4_serial,
+                plan_avg_int4_serial[:500],
+            )
+        else:
+            self.check(
+                "serial grouped avg(int4): EXPLAIN falls back (version-limited)",
+                "StorageEngineVectorGroupAgg" not in plan_avg_int4_serial,
+                plan_avg_int4_serial[:500],
+            )
 
         # PG15-only safety gate: numeric plain aggregate must fallback.
         server_version_num = self.q1("SHOW server_version_num")
