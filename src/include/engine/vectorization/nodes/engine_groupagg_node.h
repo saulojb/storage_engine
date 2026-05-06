@@ -80,6 +80,7 @@ typedef struct VecGroupEntry
 	VecGroupKey k;					/* MUST BE FIRST: HTAB HASH_BLOBS compares
 								 * first sizeof(VecGroupKey) bytes of entry */
 	int64		int64_acc[VECGROUPAGG_MAX_TARGETS];
+	int64		avg_count_acc[VECGROUPAGG_MAX_TARGETS];
 	float8		float8_acc[VECGROUPAGG_MAX_TARGETS];
 	bool		acc_isnull[VECGROUPAGG_MAX_TARGETS]; /* NULL if no non-null input */
 } VecGroupEntry;

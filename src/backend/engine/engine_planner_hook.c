@@ -630,7 +630,11 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 		*out_kind = VECGAGG_SUM;
 	else if (strcmp(fname, "avg") == 0)
 	{
-		if (arg_typeoid != FLOAT4OID && arg_typeoid != FLOAT8OID)
+		/*
+		 * VecGroupAgg supports avg(float4/float8) and incremental support for
+		 * avg(int4) in AGGSPLIT_INITIAL_SERIAL (parallel partial path).
+		 */
+		if (arg_typeoid != FLOAT4OID && arg_typeoid != FLOAT8OID && arg_typeoid != INT4OID)
 			return false;
 		*out_kind = VECGAGG_AVG;
 	}
@@ -1024,6 +1028,18 @@ PlanTreeMutator(Plan *node, void *context)
 										&kind, &col_varattno, &col_typeoid))
 					{
 						fallback_reason = "aggregate target unsupported";
+						supported = false;
+						break;
+					}
+
+					/*
+					 * avg(int4) currently emits transition state only for the
+					 * partial-serial path. Keep AGGSPLIT_SIMPLE on native executor.
+					 */
+					if (kind == VECGAGG_AVG && col_typeoid == INT4OID &&
+						aggNode->aggsplit != AGGSPLIT_INITIAL_SERIAL)
+					{
+						fallback_reason = "avg(int4) supported only for partial-serial VecGroupAgg";
 						supported = false;
 						break;
 					}

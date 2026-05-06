@@ -247,14 +247,19 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 		case VECGAGG_AVG:
 			switch (tgt->col_type)
 			{
+				case VECGAGG_TYPE_INT4:
+					entry->int64_acc[t_idx] += (int64) DatumGetInt32(val);
+					entry->avg_count_acc[t_idx]++;
+					entry->acc_isnull[t_idx] = false;
+					break;
 				case VECGAGG_TYPE_FLOAT4:
 					entry->float8_acc[t_idx] += (float8) DatumGetFloat4(val);
-					entry->int64_acc[t_idx]++;
+					entry->avg_count_acc[t_idx]++;
 						entry->acc_isnull[t_idx] = false;
 					break;
 				case VECGAGG_TYPE_FLOAT8:
 					entry->float8_acc[t_idx] += DatumGetFloat8(val);
-					entry->int64_acc[t_idx]++;
+					entry->avg_count_acc[t_idx]++;
 						entry->acc_isnull[t_idx] = false;
 					break;
 				default:
@@ -603,28 +608,50 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 			case VECGAGG_AVG:
 				if (state->is_partial_serial)
 				{
-					Datum elems[3];
+					if (tgt->col_type == VECGAGG_TYPE_INT4)
+					{
+						Datum elems[2];
 
-					/*
-					 * avg(float8) transition state is float8[] with
-					 * [count_nonnull, sum, reserved].
-					 */
-					elems[0] = Float8GetDatum((float8) entry->int64_acc[t]);
-					elems[1] = Float8GetDatum(entry->float8_acc[t]);
-					elems[2] = Float8GetDatum(0.0);
+						/*
+						 * avg(int4) transition state is bigint[] with [count, sum].
+						 */
+						elems[0] = Int64GetDatum(entry->avg_count_acc[t]);
+						elems[1] = Int64GetDatum(entry->int64_acc[t]);
 
-					slot->tts_values[ra] = PointerGetDatum(
-						construct_array(elems,
-									3,
-									FLOAT8OID,
-									sizeof(float8),
-									FLOAT8PASSBYVAL,
-									TYPALIGN_DOUBLE));
+						slot->tts_values[ra] = PointerGetDatum(
+							construct_array(elems,
+										2,
+										INT8OID,
+										sizeof(int64),
+										true,
+										TYPALIGN_DOUBLE));
+					}
+					else
+					{
+						Datum elems[3];
+
+						/*
+						 * avg(float8) transition state is float8[] with
+						 * [count_nonnull, sum, reserved].
+						 */
+						elems[0] = Float8GetDatum((float8) entry->avg_count_acc[t]);
+						elems[1] = Float8GetDatum(entry->float8_acc[t]);
+						elems[2] = Float8GetDatum(0.0);
+
+						slot->tts_values[ra] = PointerGetDatum(
+							construct_array(elems,
+										3,
+										FLOAT8OID,
+										sizeof(float8),
+										FLOAT8PASSBYVAL,
+										TYPALIGN_DOUBLE));
+					}
 				}
 				else
 				{
 					slot->tts_values[ra] =
-						Float8GetDatum(entry->float8_acc[t] / (float8) entry->int64_acc[t]);
+						Float8GetDatum(entry->float8_acc[t] /
+									   (float8) entry->avg_count_acc[t]);
 				}
 				break;
 		}
