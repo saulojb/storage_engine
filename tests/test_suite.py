@@ -817,6 +817,18 @@ class TestRunner:
             plan_avg_int4[:500],
         )
 
+        plan_avg_int4_serial = self.q(
+            "SET storage_engine.enable_vectorization=on; "
+            "SET storage_engine.enable_vectorized_groupagg=on; "
+            "SET max_parallel_workers_per_gather=0; "
+            "EXPLAIN SELECT grp, avg(v) FROM _tpar_group GROUP BY grp"
+        )
+        self.check(
+            "serial grouped avg(int4): EXPLAIN shows StorageEngineVectorGroupAgg",
+            "StorageEngineVectorGroupAgg" in plan_avg_int4_serial,
+            plan_avg_int4_serial[:500],
+        )
+
         # PG15-only safety gate: numeric plain aggregate must fallback.
         server_version_num = self.q1("SHOW server_version_num")
         if server_version_num and int(server_version_num) < 160000:

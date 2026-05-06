@@ -649,9 +649,27 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 				}
 				else
 				{
-					slot->tts_values[ra] =
-						Float8GetDatum(entry->float8_acc[t] /
-									   (float8) entry->avg_count_acc[t]);
+					if (tgt->col_type == VECGAGG_TYPE_INT4 &&
+						tgt->result_typeoid == NUMERICOID)
+					{
+						Datum sum_numeric =
+							DirectFunctionCall1(int8_numeric,
+											Int64GetDatum(entry->int64_acc[t]));
+						Datum count_numeric =
+							DirectFunctionCall1(int8_numeric,
+											Int64GetDatum(entry->avg_count_acc[t]));
+
+						slot->tts_values[ra] =
+							DirectFunctionCall2(numeric_div,
+											sum_numeric,
+											count_numeric);
+					}
+					else
+					{
+						slot->tts_values[ra] =
+							Float8GetDatum(entry->float8_acc[t] /
+										   (float8) entry->avg_count_acc[t]);
+					}
 				}
 				break;
 		}

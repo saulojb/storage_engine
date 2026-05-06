@@ -1033,18 +1033,6 @@ PlanTreeMutator(Plan *node, void *context)
 					}
 
 					/*
-					 * avg(int4) currently emits transition state only for the
-					 * partial-serial path. Keep AGGSPLIT_SIMPLE on native executor.
-					 */
-					if (kind == VECGAGG_AVG && col_typeoid == INT4OID &&
-						aggNode->aggsplit != AGGSPLIT_INITIAL_SERIAL)
-					{
-						fallback_reason = "avg(int4) supported only for partial-serial VecGroupAgg";
-						supported = false;
-						break;
-					}
-
-					/*
 					 * Incremental parallel support: AGGSPLIT_INITIAL_SERIAL is
 					 * supported here, including AVG. The executor emits the
 					 * aggregate transition representation expected by finalize.
