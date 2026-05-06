@@ -771,13 +771,6 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 			 strcmp(fname, "int8_avg") == 0 ||
 			 strcmp(fname, "float8_avg") == 0)
 	{
-#if PG_VERSION_NUM >= PG_VERSION_19
-		/*
-		 * PG19 currently crashes in VecGroupAgg avg output handling.
-		 * Keep avg on scalar fallback path until executor compatibility is fixed.
-		 */
-		return false;
-#endif
 		if (arg_cast_to_float8)
 		{
 			if (arg_expr_type != FLOAT8OID)

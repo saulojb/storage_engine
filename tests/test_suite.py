@@ -806,7 +806,7 @@ class TestRunner:
         server_version_num = self.q1("SHOW server_version_num")
         avg_groupagg_expected = (
             server_version_num and
-            (int(server_version_num) < 190000)
+            (int(server_version_num) < 200000)
         )
         if avg_groupagg_expected:
             self.check(
