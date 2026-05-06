@@ -82,6 +82,35 @@ Real-world simulation: all sessions on a multi-core server competing for CPU. JI
 - **Q5 (date range) in parallel:** colcompress reads all stripes (242 ms) while heap stays at 21 ms. Each parallel worker receives an independent block range and scans it without the global stripe-pruning pass; stripe pruning only works in the sequential single-process path. For date-range workloads, run with parallelism disabled or rely on a GIN / B-tree index on a non-colcompress table.
 - **Q3 (GROUP BY country):** heap wins in parallel (57.6 ms vs 171 ms colcompress) because the heap parallel path decompresses full rows at memory bandwidth speed while colcompress's per-column decompression adds per-worker overhead for low-column-count projections.
 
+## PG18 VecGroupAgg Follow-up (bench_am_30m)
+
+Targeted validation was rerun on PostgreSQL 18 (`5432`) using
+`bench_am_30m.events_col` with:
+
+- `storage_engine.enable_vectorization = on`
+- `storage_engine.enable_vectorized_groupagg = on`
+
+This follow-up focuses on low-cardinality `GROUP BY` shapes where
+`StorageEngineVectorGroupAgg` runs in parallel partial mode and the native
+PostgreSQL finalize step combines worker states.
+
+| Query shape | Observed behavior |
+|---|---|
+| `COUNT(*)` grouped | Vectorized parallel plan confirmed; observed around **232 ms** in session validation |
+| `COUNT(*) + SUM(price)` grouped | Vectorized parallel plan confirmed; observed around **329 ms** (filtered case) |
+| `COUNT(*) + SUM(price)` grouped (unfiltered) | Improved from fallback around **925 ms** to vectorized around **657 ms** |
+| `COUNT(*) + MIN(price) + MAX(price)` grouped | Vectorized parallel plan confirmed in PG18 |
+| `COUNT(*) + AVG(price)` grouped | Expected fallback to native aggregate path (partial-state mismatch still gated) |
+
+Notes:
+
+- The planner/executor path is currently validated for partial mode with
+  `count/sum/min/max`.
+- `avg` remains intentionally outside the partial vectorized allowlist and
+  should continue to use PostgreSQL native aggregate nodes.
+- Regression status for this change set in the same environment: **155/155
+  tests passed**.
+
 ---
 
 ## Query Definitions

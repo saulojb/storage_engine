@@ -118,6 +118,13 @@ Supported vectorized operations:
 SET storage_engine.enable_vectorization = on;   -- default: on
 ```
 
+When a plain aggregate query mixes `numeric` and `money` inputs in the same
+aggregate node, `storage_engine` intentionally leaves that plan on
+PostgreSQL's native `Agg` executor instead of forcing `StorageEngineVectorAgg`.
+That mixed shape is covered by regression tests and preserves correctness and
+stability, while supported non-mixed aggregate shapes still use the vectorized
+path.
+
 ### engine.uint8 — Unsigned 64-bit Integer
 
 `storage_engine` ships a native **unsigned 64-bit integer** type (`engine.uint8`) designed for columns that carry values in the full `[0, 2⁶⁴−1]` range, such as ClickBench's `WatchID` and `UserID` columns. Storing these as `bigint` silently wraps around and produces negative values.
@@ -700,13 +707,21 @@ See [tests/README.md](tests/README.md) for full environment description and step
 
 | PostgreSQL | Status |
 |---|---|
-| 13 | Supported |
-| 14 | Supported |
-| 15 | Supported |
+| 12 | Legacy via 1.3.4 only |
+| 13 | Legacy via 1.3.4 only |
+| 14 | Legacy via 1.3.4 only |
+| 15 | Validation target for 2.0.0 |
 | 16 | Supported |
 | 17 | Supported |
 | 18 | Supported (current stable target) |
 | 19 | Supported (devel — tested against `19~~devel` snapshot) |
+
+Current policy:
+
+- `1.3.4` is the last legacy release intended for older PostgreSQL installations.
+- `1.4.x` and the current development line are validated on PostgreSQL 16 and newer.
+- PostgreSQL 15 is the next candidate for re-entry into the official support matrix, but it is not advertised as supported until build and regression validation are green.
+- PostgreSQL 12, 13, and 14 should be documented as historical compatibility only, not as part of the active support matrix.
 
 ---
 

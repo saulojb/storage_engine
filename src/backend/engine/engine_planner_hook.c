@@ -56,7 +56,7 @@ static planner_hook_type PreviousPlannerHook = NULL;
 
 static PlannedStmt * ColumnarPlannerHook(Query *parse,
 #if PG_VERSION_NUM >= PG_VERSION_13
-									 const char *query_string,
+                                         const char *query_string,
 #endif
 									 int cursorOptions, ParamListInfo boundParams
 #if PG_VERSION_NUM >= PG_VERSION_19
@@ -64,12 +64,16 @@ static PlannedStmt * ColumnarPlannerHook(Query *parse,
 #endif
 									 );
 static bool IsCreateTableAs(const char *query);
-static bool PlanUsesParallelExecution(Plan *plan);
 
 #if PG_VERSION_NUM >= PG_VERSION_14
 static Oid engine_tableam_oid = InvalidOid;
 static bool QueryStringHasPlainExplain(const char *query);
 static bool QueryHasVectorizableAggregate(Query *parse);
+static bool QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse);
+static Oid GetRelationTableAmOid(Oid relid);
+static bool PlanHasColumnarCustomScan(Plan *plan);
+static bool PlanHasPathologicalSortedColumnarAgg(Plan *plan);
+static bool PlanHasHashColumnarAgg(Plan *plan);
 static void MutatePlannedStmt(PlannedStmt *stmt);
 static void CollectProjectedAttnos(Plan *scan_plan, AttrNumber *attnos, int *count);
 
@@ -77,13 +81,23 @@ typedef struct PlanTreeMutatorContext
 {
 	bool vectorizedAggregation;
 	bool vectorizedAggStarOnly;
+	List *rtable;
 } PlanTreeMutatorContext;
+
+static double EstimateGroupByDistinct(PlanTreeMutatorContext *ctx, Plan *scan_plan,
+								   AttrNumber key_table_attno, double fallback);
 
 typedef struct
 {
 	bool foundAggref;
 	bool allAggrefsAreStar;
 } AggrefStarContext;
+
+typedef struct
+{
+	bool foundNumericAgg;
+	bool foundMoneyAgg;
+} MixedAggTypeContext;
 
 static bool
 AggrefStarWalker(Node *node, void *context)
@@ -116,6 +130,142 @@ PlanAllAggrefsAreStar(Plan *plan)
 	(void) AggrefStarWalker((Node *) plan->qual, &ctx);
 
 	return ctx.foundAggref && ctx.allAggrefsAreStar;
+}
+
+static bool
+MixedAggTypeWalker(Node *node, void *context)
+{
+	MixedAggTypeContext *ctx = (MixedAggTypeContext *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Aggref))
+	{
+		Aggref *aggref = (Aggref *) node;
+
+		if (!aggref->aggstar && list_length(aggref->args) == 1)
+		{
+			TargetEntry *arg_te = (TargetEntry *) linitial(aggref->args);
+
+			if (arg_te != NULL && IsA(arg_te->expr, Var))
+			{
+				Var *arg_var = (Var *) arg_te->expr;
+
+				if (arg_var->vartype == NUMERICOID)
+					ctx->foundNumericAgg = true;
+				else if (arg_var->vartype == CASHOID)
+					ctx->foundMoneyAgg = true;
+			}
+		}
+
+		if (ctx->foundNumericAgg && ctx->foundMoneyAgg)
+			return true;
+	}
+
+	return expression_tree_walker(node, MixedAggTypeWalker, context);
+}
+
+static bool
+PlanHasMixedNumericMoneyAggrefs(Plan *plan)
+{
+	MixedAggTypeContext ctx;
+
+	ctx.foundNumericAgg = false;
+	ctx.foundMoneyAgg = false;
+	(void) MixedAggTypeWalker((Node *) plan->targetlist, &ctx);
+	(void) MixedAggTypeWalker((Node *) plan->qual, &ctx);
+
+	return ctx.foundNumericAgg && ctx.foundMoneyAgg;
+}
+
+#if PG_VERSION_NUM < PG_VERSION_16
+static bool
+PlanHasNumericAggrefs(Plan *plan)
+{
+	MixedAggTypeContext ctx;
+
+	ctx.foundNumericAgg = false;
+	ctx.foundMoneyAgg = false;
+	(void) MixedAggTypeWalker((Node *) plan->targetlist, &ctx);
+	(void) MixedAggTypeWalker((Node *) plan->qual, &ctx);
+
+	return ctx.foundNumericAgg;
+}
+#endif
+
+/*
+ * Estimate GROUP BY cardinality for a single table key.
+ *
+ * Priority:
+ *   1) Planner-provided fallback (Agg.numGroups / plan_rows)
+ *   2) pg_statistic stadistinct for the key column (if available)
+ *
+ * Result is bounded by scan input rows when available.
+ */
+static double
+EstimateGroupByDistinct(PlanTreeMutatorContext *ctx, Plan *scan_plan,
+								 AttrNumber key_table_attno, double fallback)
+{
+	CustomScan *cscan;
+	Index		scanrelid;
+	RangeTblEntry *rte;
+	HeapTuple statTuple;
+	double		estimate = fallback;
+
+	if (ctx == NULL || scan_plan == NULL || key_table_attno <= 0)
+		return fallback;
+
+	if (!IsA(scan_plan, CustomScan))
+		return fallback;
+
+	cscan = (CustomScan *) scan_plan;
+	scanrelid = cscan->scan.scanrelid;
+	if (scanrelid <= 0 || ctx->rtable == NIL)
+		return fallback;
+
+	rte = rt_fetch(scanrelid, ctx->rtable);
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return fallback;
+
+	statTuple = SearchSysCache3(STATRELATTINH,
+							   ObjectIdGetDatum(rte->relid),
+							   Int16GetDatum(key_table_attno),
+							   BoolGetDatum(false));
+	if (!HeapTupleIsValid(statTuple))
+		return fallback;
+
+	{
+		Form_pg_statistic stats = (Form_pg_statistic) GETSTRUCT(statTuple);
+
+		if (stats->stadistinct > 0.0)
+			estimate = stats->stadistinct;
+		else if (stats->stadistinct < 0.0)
+		{
+			double reltuples = -1.0;
+			HeapTuple classTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(rte->relid));
+
+			if (HeapTupleIsValid(classTuple))
+			{
+				Form_pg_class classForm = (Form_pg_class) GETSTRUCT(classTuple);
+				reltuples = classForm->reltuples;
+				ReleaseSysCache(classTuple);
+			}
+
+			if (reltuples > 0.0)
+				estimate = (-stats->stadistinct) * reltuples;
+		}
+	}
+
+	ReleaseSysCache(statTuple);
+
+	if (estimate <= 0.0)
+		return fallback;
+
+	if (scan_plan->plan_rows > 0.0 && estimate > scan_plan->plan_rows)
+		estimate = scan_plan->plan_rows;
+
+	return estimate;
 }
 
 #define FLATCOPY(newnode, node, nodetype)  \
@@ -404,13 +554,34 @@ TypeOidToVecGaggType(Oid typeoid)
 	{
 		case INT4OID:	return VECGAGG_TYPE_INT4;
 		case INT8OID:	return VECGAGG_TYPE_INT8;
+		case FLOAT4OID:	return VECGAGG_TYPE_FLOAT4;
 		case FLOAT8OID:	return VECGAGG_TYPE_FLOAT8;
 		default:		return -1;
 	}
 }
 
 /*
- * Classify an Aggref into VECGAGG_COUNT_STAR / SUM / MIN / MAX.
+ * Map a GROUP BY key type OID to VECGAGG_TYPE_* code.
+ * Key support is broader than aggregate-input support because Q3 groups by
+ * bpchar/text while aggregating numeric values.
+ */
+static int
+KeyTypeOidToVecGaggType(Oid typeoid)
+{
+	switch (typeoid)
+	{
+		case INT4OID:	return VECGAGG_TYPE_INT4;
+		case INT8OID:	return VECGAGG_TYPE_INT8;
+		case FLOAT4OID:	return VECGAGG_TYPE_FLOAT4;
+		case FLOAT8OID:	return VECGAGG_TYPE_FLOAT8;
+		case BPCHAROID:	return VECGAGG_TYPE_BPCHAR;
+		case TEXTOID:	return VECGAGG_TYPE_TEXT;
+		default:		return -1;
+	}
+}
+
+/*
+ * Classify an Aggref into VECGAGG_COUNT_STAR / SUM / MIN / MAX / AVG.
  * Fills *out_kind, *out_col_varattno, *out_col_typeoid.
  * Returns false if the aggregate is not supported.
  */
@@ -457,6 +628,12 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 	if (strcmp(fname, "sum") == 0 || strcmp(fname, "int4_sum") == 0 ||
 		strcmp(fname, "int8_sum") == 0 || strcmp(fname, "float8pl") == 0)
 		*out_kind = VECGAGG_SUM;
+	else if (strcmp(fname, "avg") == 0)
+	{
+		if (arg_typeoid != FLOAT4OID && arg_typeoid != FLOAT8OID)
+			return false;
+		*out_kind = VECGAGG_AVG;
+	}
 	else if (strcmp(fname, "min") == 0 || strcmp(fname, "int4smaller") == 0 ||
 			 strcmp(fname, "int8smaller") == 0 || strcmp(fname, "float8smaller") == 0)
 		*out_kind = VECGAGG_MIN;
@@ -529,10 +706,10 @@ PlanTreeMutator(Plan *node, void *context)
 			Agg *aggNode = (Agg *) node;
 			Agg	*newAgg;
 			CustomScan *vectorizedAggNode;
+			PlanTreeMutatorContext *planTreeContext = (PlanTreeMutatorContext *) context;
 
 			if (!engine_enable_vectorization)
 				return node;
-
 			if (aggNode->plan.lefttree->type == T_CustomScan)
 			{
 				/*
@@ -545,6 +722,24 @@ PlanTreeMutator(Plan *node, void *context)
 					(aggNode->aggsplit == AGGSPLIT_SIMPLE ||
 					 aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL))
 				{
+#if PG_VERSION_NUM < PG_VERSION_16
+					/*
+					 * PG15 still crashes for numeric aggregates in the vectorized
+					 * plain-aggregate path; keep the regular executor there.
+					 */
+					if (PlanHasNumericAggrefs((Plan *) aggNode))
+						break;
+#endif
+
+					/*
+					 * Mixed numeric + money plain aggregates still crash in the
+					 * vectorized executor on newer PostgreSQL builds. Keep the
+					 * regular executor for that combination until the transition
+					 * path is fixed.
+					 */
+					if (PlanHasMixedNumericMoneyAggrefs((Plan *) aggNode))
+						break;
+
 					vectorizedAggNode = engine_create_aggregator_node();
 
 					FLATCOPY(newAgg, aggNode, Agg);
@@ -583,7 +778,6 @@ PlanTreeMutator(Plan *node, void *context)
 					vectorizedAggNodePlan->plan_width = aggNode->plan.plan_width;
 
 
-					PlanTreeMutatorContext *planTreeContext = (PlanTreeMutatorContext *) context;
 					bool oldVectorizedAggStarOnly = planTreeContext->vectorizedAggStarOnly;
 					planTreeContext->vectorizedAggregation = true;
 					planTreeContext->vectorizedAggStarOnly = PlanAllAggrefsAreStar((Plan *) newAgg);
@@ -611,24 +805,32 @@ PlanTreeMutator(Plan *node, void *context)
 			 *   - Aggregates: count(*), sum, min, max over int4/int8/float8
 			 *   - Direct ColcompressScan child (no intermediate nodes)
 			 */
-			if ((aggNode->aggstrategy == AGG_HASHED ||
+			if (engine_enable_vectorized_groupagg &&
+				(aggNode->aggstrategy == AGG_HASHED ||
 				 aggNode->aggstrategy == AGG_SORTED) &&
-				aggNode->aggsplit == AGGSPLIT_SIMPLE &&
-				aggNode->numCols == 1 &&
+				(aggNode->aggsplit == AGGSPLIT_SIMPLE ||
+				 aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL) &&
+				(aggNode->numCols == 1 || aggNode->numCols == 0) &&
 				engine_enable_vectorization)
 			{
 				Plan		   *child_plan = node->lefttree;
 				Plan		   *scan_plan;  /* the actual ColcompressScan */
 				CustomScan	   *childScan;
+				const char	   *fallback_reason = "unspecified";
 				AttrNumber		scan_key_pos;
-				AttrNumber		key_varattno;
+				AttrNumber		key_table_attno;
+				int				key_slot_idx;
 				TargetEntry	   *key_scan_te;
 				Oid				key_typeoid;
+				bool			key_is_const = false;
+				Const		   *key_const = NULL;
 				VecGroupAggTarget targets[VECGROUPAGG_MAX_TARGETS];
 				int				num_targets = 0;
 				bool			supported = true;
 				ListCell	   *lc;
-				int				result_att;  /* 0-based position in result tuple */				int				key_result_att = 0; /* 0-based position of GROUP BY key in result */
+				int				result_att;
+				int				key_result_att = -1;
+				double			estimated_groups = 0.0;
 				/*
 				 * For AGG_SORTED the planner inserts a Sort node between
 				 * the Agg and the scan.  Strip it — VecGroupAgg uses a
@@ -640,36 +842,144 @@ PlanTreeMutator(Plan *node, void *context)
 
 				/* Child must be our ColcompressScan */
 				if (scan_plan->type != T_CustomScan)
+				{
+					fallback_reason = "child is not CustomScan";
 					goto groupagg_fallback;
+				}
 				childScan = (CustomScan *) scan_plan;
-				if (childScan->methods != engine_customscan_methods())
+				if (childScan->methods != engine_customscan_methods() &&
+					(childScan->methods == NULL ||
+					 strcmp(childScan->methods->CustomName, "ColcompressScan") != 0))
+				{
+					fallback_reason = "child CustomScan is not ColcompressScan";
 					goto groupagg_fallback;
+				}
 
-				/* Get GROUP BY key info from the scan plan's targetlist */
-				scan_key_pos = aggNode->grpColIdx[0];  /* 1-based in scan output */
-				key_varattno = ScanOutputPosToVarAttno(scan_plan, scan_key_pos);
-				if (key_varattno == 0)
+				if (aggNode->numCols == 1)
+				{
+					/* Get GROUP BY key info from the scan plan's targetlist */
+					scan_key_pos = aggNode->grpColIdx[0];
+					key_table_attno = ScanOutputPosToVarAttno(scan_plan, scan_key_pos);
+					if (key_table_attno == 0)
+					{
+						fallback_reason = "failed to map GROUP BY key to table attno";
+						goto groupagg_fallback;
+					}
+				}
+				else
+				{
+					/*
+					 * Degenerate grouping (numCols==0): infer constant key from
+					 * a single Var=Const qual on the scan.
+					 */
+					ListCell *qlc;
+					AttrNumber const_key_attno = 0;
+
+					foreach(qlc, scan_plan->qual)
+					{
+						Node *q = (Node *) lfirst(qlc);
+
+						if (q != NULL && IsA(q, OpExpr))
+						{
+							OpExpr *op = (OpExpr *) q;
+							Var *v = NULL;
+							Const *c = NULL;
+
+							if (list_length(op->args) != 2)
+								continue;
+
+							if (IsA(linitial(op->args), Var) && IsA(lsecond(op->args), Const))
+							{
+								v = (Var *) linitial(op->args);
+								c = (Const *) lsecond(op->args);
+							}
+							else if (IsA(lsecond(op->args), Var) && IsA(linitial(op->args), Const))
+							{
+								v = (Var *) lsecond(op->args);
+								c = (Const *) linitial(op->args);
+							}
+
+							if (v != NULL && c != NULL && v->varattno > 0)
+							{
+								if (const_key_attno == 0)
+								{
+									const_key_attno = v->varattno;
+									key_const = c;
+									key_typeoid = v->vartype;
+								}
+								else if (const_key_attno != v->varattno)
+								{
+									fallback_reason = "multiple Var=Const quals with different keys";
+									goto groupagg_fallback;
+								}
+							}
+						}
+					}
+
+					if (const_key_attno == 0 || key_const == NULL)
+					{
+						fallback_reason = "numCols=0 without inferable Var=Const key";
+						goto groupagg_fallback;
+					}
+
+					key_table_attno = const_key_attno;
+					key_is_const = true;
+					scan_key_pos = 0;
+				}
+
+				estimated_groups = (aggNode->numGroups > 0.0)
+					? aggNode->numGroups
+					: aggNode->plan.plan_rows;
+
+				estimated_groups = EstimateGroupByDistinct(planTreeContext,
+											   scan_plan,
+											   key_table_attno,
+											   estimated_groups);
+
+				/*
+				 * Bail out early if estimated distinct groups exceed VecGroupAgg
+				 * safety margin. This avoids runtime overflow at MAX_GROUPS.
+				 */
+				if (estimated_groups > (double) (VECGROUPAGG_MAX_GROUPS * 3 / 4))
+				{
+					fallback_reason = "estimated groups exceed safety margin";
 					goto groupagg_fallback;
+				}
 
 				/*
 				 * Compute the 0-based slot output position for the GROUP BY key.
 				 * ColumnarReadNextVector stores columns at the rank of their
 				 * varattno in the sorted projected-attno list, NOT at varattno-1.
 				 */
+				if (!key_is_const)
 				{
-					int key_slot_idx = VarAttnoToSlotIdx(scan_plan, key_varattno);
+					key_slot_idx = VarAttnoToSlotIdx(scan_plan, key_table_attno);
 					if (key_slot_idx < 0)
+					{
+						fallback_reason = "failed to map GROUP BY key to vector slot";
 						goto groupagg_fallback;
-					/* Reuse key_varattno variable to carry the slot index forward */
-					key_varattno = (AttrNumber) key_slot_idx;
+					}
+				}
+				else
+				{
+					key_slot_idx = -1;
 				}
 
-				key_scan_te = get_tle_by_resno(scan_plan->targetlist, scan_key_pos);
-				if (key_scan_te == NULL || !IsA(key_scan_te->expr, Var))
+				if (!key_is_const)
+				{
+					key_scan_te = get_tle_by_resno(scan_plan->targetlist, scan_key_pos);
+					if (key_scan_te == NULL || !IsA(key_scan_te->expr, Var))
+					{
+						fallback_reason = "GROUP BY key target is not Var";
+						goto groupagg_fallback;
+					}
+					key_typeoid = ((Var *) key_scan_te->expr)->vartype;
+				}
+				if (KeyTypeOidToVecGaggType(key_typeoid) < 0)
+				{
+					fallback_reason = "GROUP BY key type unsupported";
 					goto groupagg_fallback;
-				key_typeoid = ((Var *) key_scan_te->expr)->vartype;
-				if (TypeOidToVecGaggType(key_typeoid) < 0)
-					goto groupagg_fallback;
+				}
 
 				/* Walk the result targetlist to find aggregate columns */
 				result_att = 0;
@@ -713,9 +1023,16 @@ PlanTreeMutator(Plan *node, void *context)
 					if (!ClassifyAggref(aggref, scan_plan,
 										&kind, &col_varattno, &col_typeoid))
 					{
+						fallback_reason = "aggregate target unsupported";
 						supported = false;
 						break;
 					}
+
+					/*
+					 * Incremental parallel support: AGGSPLIT_INITIAL_SERIAL is
+					 * supported here, including AVG. The executor emits the
+					 * aggregate transition representation expected by finalize.
+					 */
 
 					/*
 					 * For non-count(*) aggregates, map table varattno to the
@@ -731,6 +1048,7 @@ PlanTreeMutator(Plan *node, void *context)
 							col_slot_idx = VarAttnoToSlotIdx(scan_plan, col_varattno);
 							if (col_slot_idx < 0)
 							{
+								fallback_reason = "failed to map aggregate input to vector slot";
 								supported = false;
 								break;
 							}
@@ -747,16 +1065,27 @@ PlanTreeMutator(Plan *node, void *context)
 					}
 				}
 
-				if (!supported || num_targets == 0)
+				if (!supported || num_targets == 0 || key_result_att < 0)
+				{
+					if (num_targets == 0)
+						fallback_reason = "no vectorizable aggregate targets";
+					else if (key_result_att < 0)
+						fallback_reason = "group key not present in output targetlist";
+					else if (supported == false && strcmp(fallback_reason, "unspecified") == 0)
+						fallback_reason = "targetlist shape incompatible with VecGroupAgg";
 					goto groupagg_fallback;
+				}
 
 				{
 					/* Build VectorGroupAgg plan node */
 					CustomScan *vgaNode = engine_create_groupagg_node(
-						(int) key_varattno,
+						key_slot_idx,
 						key_typeoid,
+						key_is_const,
+						key_const,
 						key_result_att,
 						(aggNode->aggstrategy == AGG_SORTED), /* sort_output */
+						(int) aggNode->aggsplit,
 						num_targets,
 						targets);
 
@@ -764,8 +1093,6 @@ PlanTreeMutator(Plan *node, void *context)
 					 * The child ColcompressScan must be signaled to return
 					 * VectorTupleTableSlot batches.
 					 */
-					PlanTreeMutatorContext *planTreeContext =
-						(PlanTreeMutatorContext *) context;
 					bool oldVectorizedAggStarOnly = planTreeContext->vectorizedAggStarOnly;
 					planTreeContext->vectorizedAggregation = true;
 					planTreeContext->vectorizedAggStarOnly = false;
@@ -776,6 +1103,7 @@ PlanTreeMutator(Plan *node, void *context)
 
 					/* Set up node cost/row estimates from original agg */
 					Plan *vgaNodePlan = (Plan *) vgaNode;
+					vgaNodePlan->parallel_aware = scan_plan->parallel_aware;
 					vgaNodePlan->startup_cost = aggNode->plan.startup_cost;
 					vgaNodePlan->total_cost   = aggNode->plan.total_cost;
 					vgaNodePlan->plan_rows    = aggNode->plan.plan_rows;
@@ -795,13 +1123,29 @@ PlanTreeMutator(Plan *node, void *context)
 						CustomBuildTargetList(aggNode->plan.targetlist, INDEX_VAR);
 					vgaNode->custom_scan_tlist = aggNode->plan.targetlist;
 
-					/* Child plan goes in custom_plans for ExecInitNode */
-					vgaNode->custom_plans = lappend(vgaNode->custom_plans, scan_plan);
+					/*
+					 * Store child in lefttree (not custom_plans) so that
+					 * deparse_context_for_plan_tree can resolve OUTER_VAR
+					 * references in custom_scan_tlist during EXPLAIN VERBOSE.
+					 * ExplainNode also walks outerPlanState to show the child.
+					 */
+					vgaNodePlan->lefttree = scan_plan;
 
 					return (Plan *) vgaNode;
 				}
 
 groupagg_fallback:
+				if (engine_debug_vectorized_groupagg_fallback)
+				{
+					elog(DEBUG1,
+						 "VecGroupAgg fallback: reason=%s strategy=%d split=%d numCols=%d plan_rows=%.0f est_groups=%.0f",
+						 fallback_reason,
+						 (int) aggNode->aggstrategy,
+						 (int) aggNode->aggsplit,
+						 aggNode->numCols,
+						 aggNode->plan.plan_rows,
+						 estimated_groups);
+				}
 				/* Fall through to default: recurse normally */
 				;
 			}
@@ -869,12 +1213,12 @@ groupagg_fallback:
 				/*
 				 * Only absorb single-key Sorts.  The GROUP BY key is at
 				 * 1-based position (key_result_att + 1) in VecGroupAgg's
-				 * output; sort_output is at custom_private[3] as key_result_att.
+				 * output; key_result_att is at custom_private[4].
 				 */
 				if (sortNode->numCols == 1)
 				{
 					int key_result_att_vga = DatumGetInt32(
-						((Const *) list_nth(vga->custom_private, 3))->constvalue);
+						((Const *) list_nth(vga->custom_private, 4))->constvalue);
 
 					if (sortNode->sortColIdx[0] == (AttrNumber)(key_result_att_vga + 1))
 					{
@@ -904,6 +1248,7 @@ MutatePlannedStmt(PlannedStmt *stmt)
 
 	plainTreeContext.vectorizedAggregation = false;
 	plainTreeContext.vectorizedAggStarOnly = false;
+	plainTreeContext.rtable = stmt->rtable;
 
 	stmt->planTree = (Plan *) PlanTreeMutator(stmt->planTree,
 										 (void *) &plainTreeContext);
@@ -915,6 +1260,7 @@ MutatePlannedStmt(PlannedStmt *stmt)
 
 		subPlainTreeContext.vectorizedAggregation = false;
 		subPlainTreeContext.vectorizedAggStarOnly = false;
+		subPlainTreeContext.rtable = stmt->rtable;
 		subplan = (Plan *) PlanTreeMutator(lfirst(cell),
 										  (void *) &subPlainTreeContext);
 		subplans = lappend(subplans, subplan);
@@ -939,6 +1285,9 @@ ColumnarPlannerHook(Query *parse,
 	PlannedStmt	*stmt;
 #if PG_VERSION_NUM >= PG_VERSION_14
 	bool pass1Vectorized = false;
+	bool pass2Vectorized = false;
+	bool run_automatic_plan = false;
+	bool lowCardinalityGroupBy = QueryHasSingleLowCardinalityColumnarGroupBy(parse);
 	Plan *savedPlanTree;
 	List *savedSubplan;
 	MemoryContext saved_context;
@@ -946,7 +1295,9 @@ ColumnarPlannerHook(Query *parse,
 	List *savedParallelSubplan;
 	MemoryContext saved_parallel_context;
 	int saved_max_parallel_workers_per_gather = max_parallel_workers_per_gather;
+	bool saved_enable_sort = enable_sort;
 	Query *parse_for_pass2 = NULL;
+	Query *parse_for_sortavoid = NULL;
 #endif
 #if PG_VERSION_NUM < PG_VERSION_13
 	/* query_string not passed by PG12 planner hook — not available */
@@ -962,8 +1313,13 @@ ColumnarPlannerHook(Query *parse,
 	 * We must save a deep copy BEFORE Pass 1 if we may need Pass 2.
 	 */
 #if PG_VERSION_NUM >= PG_VERSION_14
-	if (engine_enable_vectorization && QueryHasVectorizableAggregate(parse))
+	run_automatic_plan = engine_enable_automatic_plan && QueryHasVectorizableAggregate(parse);
+	if (run_automatic_plan)
 		parse_for_pass2 = copyObject(parse);
+	if (lowCardinalityGroupBy)
+		parse_for_sortavoid = copyObject(parse);
+	if (lowCardinalityGroupBy)
+		enable_sort = false;
 #endif
 	if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
@@ -980,6 +1336,9 @@ ColumnarPlannerHook(Query *parse,
 			stmt = standard_planner(parse, query_string, cursorOptions, boundParams);
 #else
 			stmt = standard_planner(parse, cursorOptions, boundParams);
+#endif
+#if PG_VERSION_NUM >= PG_VERSION_14
+	enable_sort = saved_enable_sort;
 #endif
 	/*
 	 * In the case of a CREATE TABLE AS query, we are not able to successfully
@@ -1019,13 +1378,59 @@ ColumnarPlannerHook(Query *parse,
 	if (engine_tableam_oid == InvalidOid)
 		engine_tableam_oid = get_table_am_oid("columnar", true);
 
+#if PG_VERSION_NUM >= PG_VERSION_14
+	if (parse_for_sortavoid != NULL &&
+		PlanHasPathologicalSortedColumnarAgg(stmt->planTree))
+	{
+		PlannedStmt *stmt_hash = NULL;
+
+		enable_sort = false;
+		PG_TRY();
+		{
+			if (PreviousPlannerHook)
+#if PG_VERSION_NUM >= PG_VERSION_19
+				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, query_string, cursorOptions, boundParams, es);
+#elif PG_VERSION_NUM >= PG_VERSION_13
+				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, query_string, cursorOptions, boundParams);
+#else
+				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, cursorOptions, boundParams);
+#endif
+			else
+#if PG_VERSION_NUM >= PG_VERSION_19
+				stmt_hash = standard_planner(parse_for_sortavoid, query_string, cursorOptions, boundParams, es);
+#elif PG_VERSION_NUM >= PG_VERSION_13
+				stmt_hash = standard_planner(parse_for_sortavoid, query_string, cursorOptions, boundParams);
+#else
+				stmt_hash = standard_planner(parse_for_sortavoid, cursorOptions, boundParams);
+#endif
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(CurrentMemoryContext);
+			FlushErrorState();
+			stmt_hash = NULL;
+		}
+		PG_END_TRY();
+		enable_sort = saved_enable_sort;
+
+		if (stmt_hash != NULL && PlanHasHashColumnarAgg(stmt_hash->planTree))
+			stmt = stmt_hash;
+	}
+
+	enable_sort = saved_enable_sort;
+#endif
+
 	/*
-	 * Vectorized aggregation strategy (two-pass planning):
+	 * Automatic plan strategy (two-pass planning, only when enabled):
 	 *
-	 * Vectorized aggregates only work with AGGSPLIT_SIMPLE (serial T_Agg).
+	 * Plain vectorized aggregates currently require AGGSPLIT_SIMPLE
+	 * (serial T_Agg).
 	 * When parallel workers are available the planner generates
 	 * AGGSPLIT_INITIAL_SERIAL / AGGSPLIT_FINAL_DESERIAL split nodes instead,
-	 * making vectorization impossible.
+	 * which is generally incompatible with the plain vectorized aggregate path.
+	 *
+	 * Note: VectorGroupAgg has incremental support for AGGSPLIT_INITIAL_SERIAL
+	 * in specific safe shapes (currently count/sum/min/max).
 	 *
 	 * To handle mixed queries correctly (some aggregates vectorizable, some
 	 * not — e.g. SELECT min(a), my_custom_agg(b) FROM foo), we use a
@@ -1040,10 +1445,11 @@ ColumnarPlannerHook(Query *parse,
 	 *         Failure → PG_CATCH discards serial plan, returns stmt from
 	 *                   Pass 1 (the original parallel plan).
 	 *
-	 * Cost: one extra planner call only when the query has aggregates AND
-	 * vectorization is enabled.  Pure scan queries pay zero overhead.
+	 * Cost: one extra planner call only when automatic planning is enabled
+	 * and the query has vectorizable aggregates.  Pure scan queries pay
+	 * zero overhead.
 	 */
-	if (engine_enable_vectorization && parse_for_pass2 != NULL)
+	if (parse_for_pass2 != NULL)
 	{
 		PlannedStmt *stmt_serial;
 
@@ -1051,31 +1457,37 @@ ColumnarPlannerHook(Query *parse,
 		savedParallelSubplan = stmt->subplans;
 		saved_parallel_context = CurrentMemoryContext;
 
-		PG_TRY();
+		if (engine_enable_vectorization)
 		{
-			MutatePlannedStmt(stmt);
-			pass1Vectorized = true;
-		}
-		PG_CATCH();
-		{
-			ErrorData  *edata;
+			PG_TRY();
+			{
+				MutatePlannedStmt(stmt);
+				pass1Vectorized = true;
+			}
+			PG_CATCH();
+			{
+				ErrorData  *edata;
 
-			MemoryContextSwitchTo(saved_parallel_context);
-			edata = CopyErrorData();
-			FlushErrorState();
-			ereport(DEBUG1,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("Parallel plan can't be vectorized. Falling back to original parallel execution."),
-					 errdetail("%s", edata->message)));
-			stmt->planTree = savedParallelPlanTree;
-			stmt->subplans = savedParallelSubplan;
+				MemoryContextSwitchTo(saved_parallel_context);
+				edata = CopyErrorData();
+				FlushErrorState();
+				ereport(DEBUG1,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("Parallel plan can't be vectorized. Falling back to original parallel execution."),
+						 errdetail("%s", edata->message)));
+				stmt->planTree = savedParallelPlanTree;
+				stmt->subplans = savedParallelSubplan;
+			}
+			PG_END_TRY();
 		}
-		PG_END_TRY();
 
 		max_parallel_workers_per_gather = 0;
 
 		PG_TRY();
 		{
+			if (lowCardinalityGroupBy)
+				enable_sort = false;
+
 			if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
 				stmt_serial = PreviousPlannerHook(parse_for_pass2, query_string, cursorOptions, boundParams, es);
@@ -1093,14 +1505,36 @@ ColumnarPlannerHook(Query *parse,
 				stmt_serial = standard_planner(parse_for_pass2, cursorOptions, boundParams);
 #endif
 
+			enable_sort = saved_enable_sort;
 			max_parallel_workers_per_gather = saved_max_parallel_workers_per_gather;
 
 			savedPlanTree = stmt_serial->planTree;
 			savedSubplan  = stmt_serial->subplans;
 			saved_context = CurrentMemoryContext;
 
+			if (engine_enable_vectorization)
 			{
-				MutatePlannedStmt(stmt_serial);
+				PG_TRY();
+				{
+					MutatePlannedStmt(stmt_serial);
+					pass2Vectorized = true;
+				}
+				PG_CATCH();
+				{
+					ErrorData  *edata;
+
+					MemoryContextSwitchTo(saved_context);
+					edata = CopyErrorData();
+					FlushErrorState();
+					ereport(DEBUG1,
+							(errcode(ERRCODE_INTERNAL_ERROR),
+							 errmsg("Serial plan can't be vectorized. Falling back to native serial execution."),
+							 errdetail("%s", edata->message)));
+					stmt_serial->planTree = savedPlanTree;
+					stmt_serial->subplans = savedSubplan;
+					pass2Vectorized = false;
+				}
+				PG_END_TRY();
 			}
 
 			/*
@@ -1112,19 +1546,26 @@ ColumnarPlannerHook(Query *parse,
 			 * If Pass 1 did not produce a parallel plan, keep the first
 			 * vectorized plan we managed to build.
 			 */
-			if (pass1Vectorized)
+			/*
+			 * Automatic planning is enabled in this path: evaluate both axes.
+			 * Axis 1: vectorized vs native (for pass1/parallel and pass2/serial).
+			 * Axis 2: parallel(best) vs serial(best).
+			 */
+			if (pass1Vectorized &&
+				savedParallelPlanTree->total_cost < stmt->planTree->total_cost)
 			{
-				if (!PlanUsesParallelExecution(stmt->planTree))
-					return stmt;
-
-				if (stmt_serial->planTree->total_cost < stmt->planTree->total_cost)
-					return stmt_serial;
-
-				return stmt;
+				stmt->planTree = savedParallelPlanTree;
+				stmt->subplans = savedParallelSubplan;
+				pass1Vectorized = false;
 			}
 
-			if (!PlanUsesParallelExecution(stmt->planTree))
-				return stmt_serial;
+			if (pass2Vectorized &&
+				savedPlanTree->total_cost < stmt_serial->planTree->total_cost)
+			{
+				stmt_serial->planTree = savedPlanTree;
+				stmt_serial->subplans = savedSubplan;
+				pass2Vectorized = false;
+			}
 
 			if (stmt_serial->planTree->total_cost < stmt->planTree->total_cost)
 				return stmt_serial;
@@ -1135,6 +1576,7 @@ ColumnarPlannerHook(Query *parse,
 		{
 			ErrorData  *edata;
 			MemoryContextSwitchTo(saved_context);
+			enable_sort = saved_enable_sort;
 			max_parallel_workers_per_gather = saved_max_parallel_workers_per_gather;
 
 			edata = CopyErrorData();
@@ -1239,31 +1681,162 @@ IsCreateTableAs(const char *query)
 
 #if PG_VERSION_NUM >= PG_VERSION_14
 static bool
-PlanUsesParallelExecution(Plan *plan)
+QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse)
+{
+	SortGroupClause *groupClause;
+	TargetEntry *groupTle;
+	Var *groupVar;
+	RangeTblEntry *rte;
+	HeapTuple statTuple;
+	bool lowCardinality = false;
+
+	if (parse == NULL || parse->groupClause == NIL || list_length(parse->groupClause) != 1)
+		return false;
+
+	groupClause = linitial_node(SortGroupClause, parse->groupClause);
+	groupTle = get_sortgroupclause_tle(groupClause, parse->targetList);
+	if (groupTle == NULL || !IsA(groupTle->expr, Var))
+		return false;
+
+	groupVar = (Var *) groupTle->expr;
+	if (groupVar->varno <= 0 || groupVar->varlevelsup != 0)
+		return false;
+
+	rte = rt_fetch(groupVar->varno, parse->rtable);
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return false;
+
+	if (engine_tableam_oid == InvalidOid)
+		engine_tableam_oid = get_table_am_oid("columnar", true);
+
+	if (!OidIsValid(engine_tableam_oid) || GetRelationTableAmOid(rte->relid) != engine_tableam_oid)
+		return false;
+
+	statTuple = SearchSysCache3(STATRELATTINH,
+							   ObjectIdGetDatum(rte->relid),
+							   Int16GetDatum(groupVar->varattno),
+							   BoolGetDatum(false));
+	if (!HeapTupleIsValid(statTuple))
+		return false;
+
+	{
+		Form_pg_statistic stats = (Form_pg_statistic) GETSTRUCT(statTuple);
+
+		if (stats->stadistinct > 0.0 && stats->stadistinct <= 1024.0)
+			lowCardinality = true;
+		else if (stats->stadistinct <= 0.0)
+		{
+			AttStatsSlot mcvSlot;
+
+			if (get_attstatsslot(&mcvSlot, statTuple,
+							   STATISTIC_KIND_MCV, InvalidOid,
+							   ATTSTATSSLOT_VALUES))
+			{
+				if (mcvSlot.nvalues > 0 && mcvSlot.nvalues <= 64)
+					lowCardinality = true;
+				free_attstatsslot(&mcvSlot);
+			}
+			else
+			{
+				/*
+				 * PG19 can report pathological stadistinct values for colcompress
+				 * before ANALYZE captures usable MCVs. Let the follow-up plan check
+				 * decide whether sort avoidance is worthwhile.
+				 */
+				lowCardinality = true;
+			}
+		}
+	}
+
+	ReleaseSysCache(statTuple);
+	return lowCardinality;
+}
+
+static Oid
+GetRelationTableAmOid(Oid relid)
+{
+	HeapTuple classTuple;
+	Form_pg_class classForm;
+	Oid relam = InvalidOid;
+
+	classTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(classTuple))
+		return InvalidOid;
+
+	classForm = (Form_pg_class) GETSTRUCT(classTuple);
+	relam = classForm->relam;
+	ReleaseSysCache(classTuple);
+
+	return relam;
+}
+
+static bool
+PlanHasColumnarCustomScan(Plan *plan)
 {
 	if (plan == NULL)
 		return false;
-
-	if (IsA(plan, Gather) || IsA(plan, GatherMerge) || plan->parallel_aware)
-		return true;
-
-	if (PlanUsesParallelExecution(plan->lefttree) ||
-		PlanUsesParallelExecution(plan->righttree))
-		return true;
 
 	if (IsA(plan, CustomScan))
 	{
 		CustomScan *cscan = (CustomScan *) plan;
 		ListCell *lc;
 
+		if (cscan->methods == engine_customscan_methods() ||
+			(cscan->methods != NULL && cscan->methods->CustomName != NULL &&
+			 strcmp(cscan->methods->CustomName, "ColcompressScan") == 0))
+			return true;
+
 		foreach(lc, cscan->custom_plans)
 		{
-			if (PlanUsesParallelExecution((Plan *) lfirst(lc)))
+			if (PlanHasColumnarCustomScan((Plan *) lfirst(lc)))
 				return true;
 		}
 	}
 
-	return false;
+	return PlanHasColumnarCustomScan(plan->lefttree) ||
+		PlanHasColumnarCustomScan(plan->righttree);
+}
+
+static bool
+PlanHasPathologicalSortedColumnarAgg(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+
+	if (IsA(plan, Agg))
+	{
+		Agg *agg = (Agg *) plan;
+		Plan *child = agg->plan.lefttree;
+
+		if (agg->numCols == 1 &&
+			agg->aggstrategy == AGG_SORTED &&
+			child != NULL &&
+			agg->plan.plan_rows >= child->plan_rows * 0.50 &&
+			PlanHasColumnarCustomScan(child))
+			return true;
+	}
+
+	return PlanHasPathologicalSortedColumnarAgg(plan->lefttree) ||
+		PlanHasPathologicalSortedColumnarAgg(plan->righttree);
+}
+
+static bool
+PlanHasHashColumnarAgg(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+
+	if (IsA(plan, Agg))
+	{
+		Agg *agg = (Agg *) plan;
+
+		if (agg->aggstrategy == AGG_HASHED &&
+			PlanHasColumnarCustomScan(agg->plan.lefttree))
+			return true;
+	}
+
+	return PlanHasHashColumnarAgg(plan->lefttree) ||
+		PlanHasHashColumnarAgg(plan->righttree);
 }
 
 /*

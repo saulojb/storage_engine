@@ -68,10 +68,20 @@ psql_ms() {
 
     local -a times=()
     for ((i=0; i<RUNS; i++)); do
-        local t
-        t=$(psql -U "$PG_USER" -p "$PGPORT" -d "$db" --no-psqlrc -P pager=off -f "$tmpf" 2>&1 \
-            | grep -oP '(?:Time|Tempo):\s*\K[0-9]+[.,][0-9]+' | tail -1 | tr ',' '.')
-        times+=("${t:-9999}")
+    local output
+    local t
+    if ! output=$(psql -U "$PG_USER" -p "$PGPORT" -d "$db" --no-psqlrc -P pager=off -f "$tmpf" 2>&1); then
+      rm -f "$tmpf"
+      printf 'benchmark query failed for %s.%s\n%s\n' "$db" "$tbl" "$output" >&2
+      return 1
+    fi
+    t=$(printf '%s\n' "$output" | grep -oP '(?:Time|Tempo):\s*\K[0-9]+[.,][0-9]+' | tail -1 | tr ',' '.' || true)
+    if [[ -z "$t" ]]; then
+      rm -f "$tmpf"
+      printf 'benchmark timing parse failed for %s.%s\n%s\n' "$db" "$tbl" "$output" >&2
+      return 1
+    fi
+    times+=("$t")
     done
     rm -f "$tmpf"
     printf '%s\n' "${times[@]}" | LC_ALL=C sort -n | LC_NUMERIC=C awk "NR==$(( (RUNS+1)/2 )) {printf \"%.3f\", \$1}"

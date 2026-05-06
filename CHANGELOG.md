@@ -2,6 +2,87 @@
 
 ## 1.4.0
 
+* decision: **keep `storage_engine.enable_automatic_plan` (default: `on`)**
+
+  Bench validation for the grouped `avg` shape on `bench_am_30m`
+  (`country_code in ('BR','US')`, `GROUP BY country_code`, `ORDER BY avg(price)`)
+  showed no stable downside for keeping automatic planning enabled.
+
+  Observed behavior during repeated PG18 runs:
+
+  - final plan shape remained stable between `on` and `off` for this query;
+  - serial latency deltas were small and noisy (no consistent winner);
+  - parallel runs tended to be slightly better with `on` on median and tail.
+
+  Policy for 1.4.x:
+
+  - keep `storage_engine.enable_automatic_plan = on` as the recommended default;
+  - keep `off` as an operational/diagnostic escape hatch for targeted troubleshooting
+    and benchmark comparisons.
+
+* feature: **VectorGroupAgg parallel partial mode expanded and hardened**
+
+  The `StorageEngineVectorGroupAgg` planner path now supports
+  `AGGSPLIT_INITIAL_SERIAL` for low-cardinality `GROUP BY` plans with
+  `count(*)`, `sum(...)`, `min(...)`, and `max(...)` targets, allowing the
+  vectorized group aggregate node to run inside parallel workers and feed the
+  native `Finalize GroupAggregate` combine step.
+
+  In addition to the aggregate coverage expansion, this release includes
+  correctness and stability fixes found during PG18 validation:
+
+  - constant-key grouped plans (`numCols=0`, e.g. inferred `Var = Const`) are
+    now handled end-to-end in planner + executor;
+  - vector batch processing now respects `VectorTupleTableSlot.keep[]` so
+    filtered-out rows are not accumulated;
+  - textual group keys use the correct hash key layout (excluding pointer-like
+    `Datum` bytes) to avoid duplicate-group mismatches;
+  - planner fallback diagnostics were added via
+    `storage_engine.debug_vectorized_groupagg_fallback` (`DEBUG1` reasons);
+  - non-essential EXPLAIN telemetry was reduced while keeping debug logging.
+
+  Validation status for this change set:
+
+  - PG18 (`5432`) regression suite: **ALL 155 TESTS PASSED**;
+  - real plans on `bench_am_30m` show
+    `Parallel Custom Scan (StorageEngineVectorGroupAgg)` for
+    `count/sum/min/max` grouped shapes;
+  - unsupported partial-state shapes (notably `avg`) still fall back safely to
+    native PostgreSQL aggregate nodes.
+
+* note: **compatibility policy update**
+
+  `1.3.4` is now treated as the legacy line for older PostgreSQL releases.
+  The active support matrix for the current code line remains PostgreSQL 16,
+  17, 18, and 19. PostgreSQL 15 is the next compatibility target under
+  evaluation for a future major release, but it should not be advertised as
+  officially supported until its build and regression matrix are green.
+  PostgreSQL 12, 13, and 14 should be documented as historical compatibility
+  via `1.3.4`, not as active support for `1.4.x` and later.
+
+* fix: **stabilized vectorized aggregate fallback for mixed `numeric` + `money` plans**
+
+  Plain aggregate lists that mix `numeric` and `money` inputs are now kept on
+  PostgreSQL's native `Agg` executor instead of being rewritten to
+  `StorageEngineVectorAgg`.  The vectorized functions for `numeric` and
+  `money` remain available and still run for supported non-mixed shapes, but
+  this specific mixed plan shape was crashing the backend inside
+  `numeric_avg_accum` on recent PostgreSQL builds.
+
+  The fallback is intentionally planner-level rather than per-aggregate inside
+  the custom node: an attempted `Aggref`-level scalar fallback still reproduced
+  the same crash, so the safe boundary is to leave the whole plain aggregate on
+  the native executor for now.
+
+  Regression coverage was added for:
+
+  - `EXPLAIN` on mixed `numeric` + `money` aggregates with vectorization enabled
+  - result equality between `enable_vectorization=off` and `on`
+  - successful execution of the mixed query without backend termination
+
+  The updated regression suite completed with `ALL 155 TESTS PASSED` on both
+  PG 18 (`5432`) and PG 15 (`5436`) during validation.
+
 * feature: **VectorGroupAgg — vectorized GROUP BY aggregation for `colcompress` tables**
 
   `colcompress` tables can now execute `GROUP BY` queries entirely in vectorized

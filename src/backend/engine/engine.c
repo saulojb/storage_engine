@@ -49,6 +49,9 @@ int engine_compression_level = 3;
 bool engine_enable_parallel_execution = true;
 int engine_min_parallel_processes = 8;
 bool engine_enable_vectorization = true;
+bool engine_enable_vectorized_groupagg = true;
+bool engine_enable_automatic_plan = true;
+bool engine_debug_vectorized_groupagg_fallback = false;
 bool engine_enable_dml = true;
 bool engine_enable_page_cache = false;
 int engine_page_cache_size = 200U;
@@ -177,6 +180,39 @@ engine_guc_init()
 							 0,
 							 NULL, 
 							 NULL, 
+							 NULL);
+
+	DefineCustomBoolVariable("storage_engine.enable_vectorized_groupagg",
+							 "Enables vectorized grouped aggregation",
+							 NULL,
+							 &engine_enable_vectorized_groupagg,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("storage_engine.enable_automatic_plan",
+							 "Automatically compares serial and parallel aggregate plans",
+							 NULL,
+							 &engine_enable_automatic_plan,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("storage_engine.debug_vectorized_groupagg_fallback",
+							 "Logs DEBUG1 reasons when planner falls back from VectorGroupAgg",
+							 NULL,
+							 &engine_debug_vectorized_groupagg_fallback,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
 							 NULL);
 
 	DefineCustomBoolVariable("storage_engine.enable_dml",

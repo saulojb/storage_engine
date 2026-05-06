@@ -7,7 +7,8 @@
  *      VectorColumn batches directly from ColcompressScan and accumulating
  *      per-group results in a HTAB, then emitting one result tuple per group.
  *
- *      Supported aggregates: count(*), sum, min, max for int4/int8/float8.
+ *      Supported aggregates: count(*), sum, min, max, avg for int4/int8/float4/float8.
+ *      Supported GROUP BY key types: int4/int8/float4/float8/bpchar/text.
  *      Single GROUP BY key only (no composite keys).
  *
  *-------------------------------------------------------------------------
@@ -30,25 +31,43 @@
 #define VECGAGG_SUM         2   /* sum(col) */
 #define VECGAGG_MIN         3   /* min(col) */
 #define VECGAGG_MAX         4   /* max(col) */
+#define VECGAGG_AVG         5   /* avg(col) */
 
 /*
  * Column type codes used in VecGroupAggTarget.
  */
 #define VECGAGG_TYPE_INT4   1
 #define VECGAGG_TYPE_INT8   2
-#define VECGAGG_TYPE_FLOAT8 3
+#define VECGAGG_TYPE_FLOAT4 3
+#define VECGAGG_TYPE_FLOAT8 4
+#define VECGAGG_TYPE_BPCHAR 5
+#define VECGAGG_TYPE_TEXT   6
 
 /*
  * Describes one aggregate target in the GROUP BY query.
  */
 typedef struct VecGroupAggTarget
 {
-	int		agg_kind;		/* VECGAGG_COUNT_STAR / SUM / MIN / MAX */
-	int		col_type;		/* VECGAGG_TYPE_INT4/INT8/FLOAT8 */
+	int		agg_kind;		/* VECGAGG_COUNT_STAR / SUM / MIN / MAX / AVG */
+	int		col_type;		/* VECGAGG_TYPE_INT4/INT8/FLOAT4/FLOAT8 */
 	int		col_attnum;		/* 0-based slot output position (-1 = unused, e.g. count(*)) */
 	int		result_attnum;	/* 0-based position in result tuple */
 	Oid		result_typeoid;	/* SQL return type OID (e.g. NUMERICOID for sum(int8)) */
 } VecGroupAggTarget;
+
+/*
+ * HTAB lookup key for per-group entries.
+ * VecGroupEntry MUST start with this struct so that HTAB HASH_BLOBS
+ * compares the right bytes when searching for an existing group.
+ */
+typedef struct VecGroupKey
+{
+	int		key_type;		/* VECGAGG_TYPE_* */
+	bool	isnull;
+	int16	text_len;		/* byte length for BPCHAR/TEXT keys */
+	char	text_key[16];	/* inline text storage (up to 16 bytes) */
+	Datum	key;			/* numeric key value (by-value types) */
+} VecGroupKey;
 
 /*
  * Per-group accumulator entry stored in the HTAB.
@@ -58,8 +77,8 @@ typedef struct VecGroupAggTarget
 
 typedef struct VecGroupEntry
 {
-	Datum		key;					/* group key value (hash key) */
-	bool		key_isnull;
+	VecGroupKey k;					/* MUST BE FIRST: HTAB HASH_BLOBS compares
+								 * first sizeof(VecGroupKey) bytes of entry */
 	int64		int64_acc[VECGROUPAGG_MAX_TARGETS];
 	float8		float8_acc[VECGROUPAGG_MAX_TARGETS];
 	bool		acc_isnull[VECGROUPAGG_MAX_TARGETS]; /* NULL if no non-null input */
@@ -74,8 +93,13 @@ typedef struct VecGroupAggState
 
 	/* Scan info */
 	int					key_attnum;		/* 0-based slot output position of GROUP BY column */
+	bool				key_is_const;	/* true when key comes from qual constant */
+	Datum				key_const;
+	bool				key_const_isnull;
 	int					key_col_type;	/* VECGAGG_TYPE_* */
 	Oid					key_typeoid;
+	int16				key_typlen;
+	bool				key_typbyval;
 
 	/* Aggregate targets */
 	int					num_targets;
@@ -97,6 +121,7 @@ typedef struct VecGroupAggState
 	/* sorted emission: built after phase 1 when sort_output=true */
 	VecGroupEntry	  **sorted_arr;		/* palloc'd array of entry pointers */
 	int					sorted_idx;		/* next index to emit */
+	bool				is_partial_serial; /* AGGSPLIT_INITIAL_SERIAL */
 
 	/* Result emission state */
 	bool				scan_done;
@@ -109,8 +134,11 @@ typedef struct VecGroupAggState
 
 extern CustomScan *engine_create_groupagg_node(int key_attnum,
 											   Oid key_typeoid,
+											   bool key_is_const,
+											   Const *key_const,
 											   int key_result_att,
 											   bool sort_output,
+										   int aggsplit_mode,
 											   int num_targets,
 											   VecGroupAggTarget *targets);
 extern bool engine_is_groupagg_node(Plan *plan);

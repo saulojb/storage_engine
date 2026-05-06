@@ -2987,7 +2987,7 @@ agg_retrieve_direct(VectorAggState *vectoraggstate)
 								fcinfo->args[1].isnull = false;
 
 								advance_transition_function(aggstate, pertrans,
-															pergroupstate);
+													pergroupstate);
 							}
 						}
 					}

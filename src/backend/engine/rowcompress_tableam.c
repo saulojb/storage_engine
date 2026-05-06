@@ -322,6 +322,7 @@ static void RCDeleteOptions(Oid relationId, bool missingOk);
 static Datum *RCDetoastValues(TupleDesc tupdesc, Datum *orig_values, bool *isnull);
 static RowCompressWriteState *RCFindWriteState(RelFileLocator relfilelocator);
 static RowCompressWriteState *RCGetOrCreateWriteState(Relation rel);
+static void RCFlushWriteStateForRelation(Relation rel);
 static void RCFlushBatch(RowCompressWriteState *ws, Relation rel);
 static void RCFlushAllWriteStates(void);
 static void RCDiscardAllWriteStates(void);
@@ -1206,6 +1207,29 @@ RCGetOrCreateWriteState(Relation rel)
 	return ws;
 }
 
+/*
+ * Make buffered inserts visible to later reads in the same transaction.
+ * rowcompress batches are normally flushed at commit, but any path that
+ * consults engine.rowcompress_batch needs pending writes materialized first.
+ */
+static void
+RCFlushWriteStateForRelation(Relation rel)
+{
+	RowCompressWriteState *ws;
+#if PG_VERSION_NUM >= PG_VERSION_16
+	RelFileLocator rfl = rel->rd_locator;
+#else
+	RelFileLocator rfl = rel->rd_node;
+#endif
+
+	ws = RCFindWriteState(rfl);
+	if (ws == NULL || ws->rowCount == 0)
+		return;
+
+	RCFlushBatch(ws, rel);
+	CommandCounterIncrement();
+}
+
 /* ================================================================
  * PRUNING HELPERS
  * ================================================================ */
@@ -1363,6 +1387,7 @@ RCBatchCanBePruned(RowCompressScanDesc *scan,
 				   TupleDesc tupdesc)
 {
 	RCPruningCtx *ctx = scan->pruningCtx;
+
 	if (ctx == NULL || !meta->hasMinMax)
 		return false;
 
@@ -1815,6 +1840,7 @@ scan->rc_base.rs_parallel  = parallel_scan;
 
 scan->storageId        = RCStorageId(relation);
 RCReadOptions(RelationGetRelid(relation), &scan->options);
+	RCFlushWriteStateForRelation(relation);
 
 scan->batchList        = RCGetBatches(scan->storageId);
 scan->currentBatchCell = list_head(scan->batchList);
@@ -1872,6 +1898,8 @@ rowcompress_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
    bool allow_strat, bool allow_sync, bool allow_pagemode)
 {
 RowCompressScanDesc *scan = (RowCompressScanDesc *) sscan;
+
+	RCFlushWriteStateForRelation(scan->rc_base.rs_rd);
 
 if (scan->batchList)
 list_free_deep(scan->batchList);
@@ -2202,6 +2230,8 @@ rowcompress_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 	uint64 rowNumber  = rc_tid_to_row_number(tid);
 	uint64 storageId  = RCStorageId(rel);
 
+	RCFlushWriteStateForRelation(rel);
+
 	List *batches = RCGetBatches(storageId);
 	RowCompressBatchMetadata *meta = RCFindBatchInList(batches, rowNumber);
 
@@ -2464,6 +2494,8 @@ rowcompress_tuple_delete(Relation relation, ItemPointer tid,
 	DirectFunctionCall1(pg_advisory_xact_lock_int8,
 						Int64GetDatum((int64) storageId));
 
+	RCFlushWriteStateForRelation(relation);
+
 	List *batches = RCGetBatches(storageId);
 	RowCompressBatchMetadata *meta = RCFindBatchInList(batches, rowNumber);
 
@@ -2508,6 +2540,8 @@ rowcompress_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *sl
 	/* Advisory lock: serialize concurrent DML on the same relation */
 	DirectFunctionCall1(pg_advisory_xact_lock_int8,
 						Int64GetDatum((int64) storageId));
+
+	RCFlushWriteStateForRelation(relation);
 
 	List *batches = RCGetBatches(storageId);
 	RowCompressBatchMetadata *meta = RCFindBatchInList(batches, rowNumber);

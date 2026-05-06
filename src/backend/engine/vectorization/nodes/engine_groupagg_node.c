@@ -9,8 +9,8 @@
  *
  *      Only engaged when:
  *        - Single GROUP BY key
- *        - Key type: int4, int8, float8, or text (low-cardinality)
- *        - Aggregates: count(*), sum, min, max over int4/int8/float8
+ *        - Key type: int4, int8, float4, float8, or text (low-cardinality)
+ *        - Aggregates: count(*), sum, min, max, avg over int4/int8/float4/float8
  *        - n_distinct estimate < VECGROUPAGG_MAX_GROUPS
  *
  *-------------------------------------------------------------------------
@@ -30,11 +30,14 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/pathnodes.h"
+#include "utils/array.h"
 #include "utils/datum.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/typcache.h"
+#include "utils/varlena.h"
 
 /* INT4OID / INT8OID / FLOAT8OID — pg_type_d.h is required from PG 19 onwards */
 #include "catalog/pg_type_d.h"
@@ -70,14 +73,7 @@ static CustomExecMethods VecGroupAggExecMethods = {
 	.ExplainCustomScan	= ExplainVecGroupAgg,
 };
 
-/* ----------------------------------------------------------------
- *  HTAB key structure for group lookup
- * ---------------------------------------------------------------- */
-typedef struct VecGroupKey
-{
-	Datum	key;
-	bool	isnull;
-} VecGroupKey;
+/* VecGroupKey and VecGroupEntry are defined in engine_groupagg_node.h */
 
 /* ----------------------------------------------------------------
  *  Helpers
@@ -94,8 +90,45 @@ type_oid_to_vectype(Oid typeoid)
 	{
 		case INT4OID:	return VECGAGG_TYPE_INT4;
 		case INT8OID:	return VECGAGG_TYPE_INT8;
+		case FLOAT4OID:	return VECGAGG_TYPE_FLOAT4;
 		case FLOAT8OID:	return VECGAGG_TYPE_FLOAT8;
+		case BPCHAROID:	return VECGAGG_TYPE_BPCHAR;
+		case TEXTOID:	return VECGAGG_TYPE_TEXT;
 		default:		return -1;
+	}
+}
+
+static void
+build_group_key(VecGroupAggState *state, Datum key, bool isnull, VecGroupKey *hkey)
+{
+	MemSet(hkey, 0, sizeof(*hkey));
+	hkey->key_type = state->key_col_type;
+	hkey->isnull = isnull;
+
+	if (isnull)
+		return;
+
+	switch (state->key_col_type)
+	{
+		case VECGAGG_TYPE_BPCHAR:
+		case VECGAGG_TYPE_TEXT:
+		{
+			text   *txt = DatumGetTextPP(key);
+			int		len = VARSIZE_ANY_EXHDR(txt);
+
+			if (len > (int) sizeof(hkey->text_key))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("VectorGroupAgg: textual GROUP BY key too long (%d > %zu)",
+								len, sizeof(hkey->text_key))));
+
+			hkey->text_len = (int16) len;
+			memcpy(hkey->text_key, VARDATA_ANY(txt), len);
+			break;
+		}
+		default:
+			hkey->key = key;
+			break;
 	}
 }
 
@@ -103,11 +136,20 @@ type_oid_to_vectype(Oid typeoid)
  * Initialize per-group HTAB.
  */
 static HTAB *
-create_group_htab(MemoryContext ctx)
+create_group_htab(VecGroupAggState *state, MemoryContext ctx)
 {
 	HASHCTL		ctl;
 	MemSet(&ctl, 0, sizeof(ctl));
-	ctl.keysize		= sizeof(VecGroupKey);
+	/*
+	 * For textual keys, hash on the inline (type,isnull,text_len,text_key)
+	 * portion only. Including Datum key would hash pointer identity and make
+	 * equal text values fail to match.
+	 */
+	if (state->key_col_type == VECGAGG_TYPE_BPCHAR ||
+		state->key_col_type == VECGAGG_TYPE_TEXT)
+		ctl.keysize = offsetof(VecGroupKey, key);
+	else
+		ctl.keysize = sizeof(VecGroupKey);
 	ctl.entrysize	= sizeof(VecGroupEntry);
 	ctl.hcxt		= ctx;
 	return hash_create("VecGroupAgg groups",
@@ -126,9 +168,7 @@ lookup_or_create_group(VecGroupAggState *state, Datum key, bool isnull)
 	VecGroupEntry  *entry;
 	bool			found;
 
-	MemSet(&hkey, 0, sizeof(hkey));	/* zero padding for HASH_BLOBS memcmp */
-	hkey.key	= key;
-	hkey.isnull	= isnull;
+	build_group_key(state, key, isnull, &hkey);
 
 	entry = (VecGroupEntry *) hash_search(state->group_htab,
 										  &hkey,
@@ -144,9 +184,10 @@ lookup_or_create_group(VecGroupAggState *state, Datum key, bool isnull)
 					 errmsg("VectorGroupAgg: too many distinct groups (limit %d)",
 							VECGROUPAGG_MAX_GROUPS)));
 
-		/* Initialize new entry */
-		entry->key		 = isnull ? (Datum) 0 : datumCopy(key, true, -1);
-		entry->key_isnull = isnull;
+		/* Initialize new entry — k.key/k.isnull serve as both the HTAB
+		 * lookup key AND the values we emit in fill_and_store_slot. */
+		entry->k.key     = isnull ? (Datum) 0 : datumCopy(key, state->key_typbyval, state->key_typlen);
+		entry->k.isnull  = isnull;
 
 		for (i = 0; i < state->num_targets; i++)
 		{
@@ -179,8 +220,6 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 	if (isnull)
 		return;		/* other aggregates skip NULLs */
 
-	entry->acc_isnull[t_idx] = false;
-
 	switch (tgt->agg_kind)
 	{
 		case VECGAGG_SUM:
@@ -188,12 +227,37 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 			{
 				case VECGAGG_TYPE_INT4:
 					entry->int64_acc[t_idx] += (int64) DatumGetInt32(val);
+					entry->acc_isnull[t_idx] = false;
 					break;
 				case VECGAGG_TYPE_INT8:
 					entry->int64_acc[t_idx] += DatumGetInt64(val);
+					entry->acc_isnull[t_idx] = false;
+					break;
+				case VECGAGG_TYPE_FLOAT4:
+					entry->float8_acc[t_idx] += (float8) DatumGetFloat4(val);
+					entry->acc_isnull[t_idx] = false;
 					break;
 				case VECGAGG_TYPE_FLOAT8:
 					entry->float8_acc[t_idx] += DatumGetFloat8(val);
+					entry->acc_isnull[t_idx] = false;
+					break;
+			}
+			break;
+
+		case VECGAGG_AVG:
+			switch (tgt->col_type)
+			{
+				case VECGAGG_TYPE_FLOAT4:
+					entry->float8_acc[t_idx] += (float8) DatumGetFloat4(val);
+					entry->int64_acc[t_idx]++;
+						entry->acc_isnull[t_idx] = false;
+					break;
+				case VECGAGG_TYPE_FLOAT8:
+					entry->float8_acc[t_idx] += DatumGetFloat8(val);
+					entry->int64_acc[t_idx]++;
+						entry->acc_isnull[t_idx] = false;
+					break;
+				default:
 					break;
 			}
 			break;
@@ -204,21 +268,48 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 				case VECGAGG_TYPE_INT4:
 				{
 					int64 v = (int64) DatumGetInt32(val);
-					if (entry->acc_isnull[t_idx] || v < entry->int64_acc[t_idx])
+					if (entry->acc_isnull[t_idx])
+					{
+						entry->int64_acc[t_idx] = v;
+						entry->acc_isnull[t_idx] = false;
+					}
+					else if (v < entry->int64_acc[t_idx])
 						entry->int64_acc[t_idx] = v;
 					break;
 				}
 				case VECGAGG_TYPE_INT8:
 				{
 					int64 v = DatumGetInt64(val);
-					if (entry->acc_isnull[t_idx] || v < entry->int64_acc[t_idx])
+					if (entry->acc_isnull[t_idx])
+					{
 						entry->int64_acc[t_idx] = v;
+						entry->acc_isnull[t_idx] = false;
+					}
+					else if (v < entry->int64_acc[t_idx])
+						entry->int64_acc[t_idx] = v;
+					break;
+				}
+				case VECGAGG_TYPE_FLOAT4:
+				{
+					float8 v = (float8) DatumGetFloat4(val);
+					if (entry->acc_isnull[t_idx])
+					{
+						entry->float8_acc[t_idx] = v;
+						entry->acc_isnull[t_idx] = false;
+					}
+					else if (v < entry->float8_acc[t_idx])
+						entry->float8_acc[t_idx] = v;
 					break;
 				}
 				case VECGAGG_TYPE_FLOAT8:
 				{
 					float8 v = DatumGetFloat8(val);
-					if (entry->acc_isnull[t_idx] || v < entry->float8_acc[t_idx])
+					if (entry->acc_isnull[t_idx])
+					{
+						entry->float8_acc[t_idx] = v;
+						entry->acc_isnull[t_idx] = false;
+					}
+					else if (v < entry->float8_acc[t_idx])
 						entry->float8_acc[t_idx] = v;
 					break;
 				}
@@ -231,21 +322,48 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 				case VECGAGG_TYPE_INT4:
 				{
 					int64 v = (int64) DatumGetInt32(val);
-					if (entry->acc_isnull[t_idx] || v > entry->int64_acc[t_idx])
+					if (entry->acc_isnull[t_idx])
+					{
+						entry->int64_acc[t_idx] = v;
+						entry->acc_isnull[t_idx] = false;
+					}
+					else if (v > entry->int64_acc[t_idx])
 						entry->int64_acc[t_idx] = v;
 					break;
 				}
 				case VECGAGG_TYPE_INT8:
 				{
 					int64 v = DatumGetInt64(val);
-					if (entry->acc_isnull[t_idx] || v > entry->int64_acc[t_idx])
+					if (entry->acc_isnull[t_idx])
+					{
 						entry->int64_acc[t_idx] = v;
+						entry->acc_isnull[t_idx] = false;
+					}
+					else if (v > entry->int64_acc[t_idx])
+						entry->int64_acc[t_idx] = v;
+					break;
+				}
+				case VECGAGG_TYPE_FLOAT4:
+				{
+					float8 v = (float8) DatumGetFloat4(val);
+					if (entry->acc_isnull[t_idx])
+					{
+						entry->float8_acc[t_idx] = v;
+						entry->acc_isnull[t_idx] = false;
+					}
+					else if (v > entry->float8_acc[t_idx])
+						entry->float8_acc[t_idx] = v;
 					break;
 				}
 				case VECGAGG_TYPE_FLOAT8:
 				{
 					float8 v = DatumGetFloat8(val);
-					if (entry->acc_isnull[t_idx] || v > entry->float8_acc[t_idx])
+					if (entry->acc_isnull[t_idx])
+					{
+						entry->float8_acc[t_idx] = v;
+						entry->acc_isnull[t_idx] = false;
+					}
+					else if (v > entry->float8_acc[t_idx])
 						entry->float8_acc[t_idx] = v;
 					break;
 				}
@@ -267,32 +385,52 @@ vecgroup_entry_cmp(const void *a, const void *b)
 	const VecGroupEntry *eb = *(const VecGroupEntry **) b;
 
 	/* NULLs sort last */
-	if (ea->key_isnull && eb->key_isnull)
+	if (ea->k.isnull && eb->k.isnull)
 		return 0;
-	if (ea->key_isnull)
+	if (ea->k.isnull)
 		return 1;
-	if (eb->key_isnull)
+	if (eb->k.isnull)
 		return -1;
 
 	switch (g_key_col_type)
 	{
 		case VECGAGG_TYPE_INT4:
 		{
-			int64 va = DatumGetInt32(ea->key);
-			int64 vb = DatumGetInt32(eb->key);
+			int64 va = DatumGetInt32(ea->k.key);
+			int64 vb = DatumGetInt32(eb->k.key);
 			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
 		}
 		case VECGAGG_TYPE_INT8:
 		{
-			int64 va = DatumGetInt64(ea->key);
-			int64 vb = DatumGetInt64(eb->key);
+			int64 va = DatumGetInt64(ea->k.key);
+			int64 vb = DatumGetInt64(eb->k.key);
+			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+		}
+		case VECGAGG_TYPE_FLOAT4:
+		{
+			float4 va = DatumGetFloat4(ea->k.key);
+			float4 vb = DatumGetFloat4(eb->k.key);
 			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
 		}
 		case VECGAGG_TYPE_FLOAT8:
 		{
-			float8 va = DatumGetFloat8(ea->key);
-			float8 vb = DatumGetFloat8(eb->key);
+			float8 va = DatumGetFloat8(ea->k.key);
+			float8 vb = DatumGetFloat8(eb->k.key);
 			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+		}
+		case VECGAGG_TYPE_BPCHAR:
+		case VECGAGG_TYPE_TEXT:
+		{
+			text   *ta = DatumGetTextPP(ea->k.key);
+			text   *tb = DatumGetTextPP(eb->k.key);
+			int		lena = VARSIZE_ANY_EXHDR(ta);
+			int		lenb = VARSIZE_ANY_EXHDR(tb);
+			int		minlen = (lena < lenb) ? lena : lenb;
+			int		cmp = memcmp(VARDATA_ANY(ta), VARDATA_ANY(tb), minlen);
+
+			if (cmp != 0)
+				return cmp;
+			return (lena < lenb) ? -1 : (lena > lenb) ? 1 : 0;
 		}
 		default:
 			return 0;
@@ -319,10 +457,19 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 	int		key_idx = state->key_attnum;
 	VectorColumn *key_col;
 
-	key_col = (VectorColumn *) slot->tts_values[key_idx];
+	key_col = (state->key_is_const || key_idx < 0)
+		? NULL
+		: (VectorColumn *) slot->tts_values[key_idx];
 
 	for (i = 0; i < dim; i++)
 	{
+		/*
+		 * ColcompressScan keeps vector dimension fixed and marks rows that
+		 * survived quals in keep[]. Skip rows filtered out by quals.
+		 */
+		if (!vslot->keep[i])
+			continue;
+
 		/*
 		 * VectorColumn.value is a compact byte array where element i is at
 		 * byte offset (i * columnTypeLen), NOT at Datum pointer offset i*8.
@@ -333,7 +480,12 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 		VecGroupEntry *entry;
 		int			t;
 
-		if (key_col)
+		if (state->key_is_const)
+		{
+			key_val = state->key_const;
+			key_null = state->key_const_isnull;
+		}
+		else if (key_col)
 		{
 			int8 *rawPtr = (int8 *) key_col->value + (int) key_col->columnTypeLen * i;
 			key_val  = fetch_att(rawPtr, key_col->columnIsVal, key_col->columnTypeLen);
@@ -390,8 +542,8 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 	}
 
 	/* Slot att key_result_attnum: group key */
-	slot->tts_values[state->key_result_attnum] = entry->key;
-	slot->tts_isnull[state->key_result_attnum] = entry->key_isnull;
+	slot->tts_values[state->key_result_attnum] = entry->k.key;
+	slot->tts_isnull[state->key_result_attnum] = entry->k.isnull;
 
 	/* Aggregate result atts */
 	for (t = 0; t < state->num_targets; t++)
@@ -437,9 +589,42 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 							slot->tts_values[ra] =
 								Int64GetDatum(entry->int64_acc[t]);
 						break;
+					case VECGAGG_TYPE_FLOAT4:
+						if (tgt->result_typeoid == FLOAT4OID)
+							slot->tts_values[ra] = Float4GetDatum((float4) entry->float8_acc[t]);
+						else
+							slot->tts_values[ra] = Float8GetDatum(entry->float8_acc[t]);
+						break;
 					case VECGAGG_TYPE_FLOAT8:
 						slot->tts_values[ra] = Float8GetDatum(entry->float8_acc[t]);
 						break;
+				}
+				break;
+			case VECGAGG_AVG:
+				if (state->is_partial_serial)
+				{
+					Datum elems[3];
+
+					/*
+					 * avg(float8) transition state is float8[] with
+					 * [count_nonnull, sum, reserved].
+					 */
+					elems[0] = Float8GetDatum((float8) entry->int64_acc[t]);
+					elems[1] = Float8GetDatum(entry->float8_acc[t]);
+					elems[2] = Float8GetDatum(0.0);
+
+					slot->tts_values[ra] = PointerGetDatum(
+						construct_array(elems,
+									3,
+									FLOAT8OID,
+									sizeof(float8),
+									FLOAT8PASSBYVAL,
+									TYPALIGN_DOUBLE));
+				}
+				else
+				{
+					slot->tts_values[ra] =
+						Float8GetDatum(entry->float8_acc[t] / (float8) entry->int64_acc[t]);
 				}
 				break;
 		}
@@ -467,53 +652,63 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 {
 	VecGroupAggState *state = (VecGroupAggState *) css;
 	CustomScan		 *cscan = (CustomScan *) css->ss.ps.plan;
-	ListCell		 *lc;
 
+	elog(DEBUG1, "VecGroupAgg: BeginVecGroupAgg entered, eflags=%d", eflags);
 
 	/*
 	 * Unpack parameters from custom_private:
 	 *   [0] key_attnum   (Int)
 	 *   [1] key_typeoid  (Int)
-	 *   [2] num_targets  (Int)
-	 *   [3] key_result_att (Int) — 0-based position of GROUP BY key in output
-	 *   [4] sort_output   (Int) — 1 if output must be sorted by key (AGG_SORTED)
-	 *   [5..] encoded targets: 5 Ints each (kind, col_type, col_attnum, result_attnum, result_typeoid)
+	 *   [2] key_is_const (Int)
+	 *   [3] num_targets  (Int)
+	 *   [4] key_result_att (Int) — 0-based position of GROUP BY key in output
+	 *   [5] sort_output   (Int) — 1 if output must be sorted by key (AGG_SORTED)
+	 *   [6] aggsplit mode (AggSplit enum as int)
+	 *   [7] key_const (Const, optional; present only when key_is_const=1)
+	 *   [N..] encoded targets: 5 Ints each (kind, col_type, col_attnum, result_attnum, result_typeoid)
 	 */
 	List   *priv = cscan->custom_private;
-	int		idx = 0;
+	int	target_idx;
 
-	foreach(lc, priv)
-	{
-		Const *c = (Const *) lfirst(lc);
-		int	   v = (int) DatumGetInt32(c->constvalue);
+	#define PRIV_INT(nodeptr) ((int) DatumGetInt32(((Const *) (nodeptr))->constvalue))
 
-		if (idx == 0)		state->key_attnum  = v;
-		else if (idx == 1)	state->key_typeoid = (Oid) v;
-		else if (idx == 2)	state->num_targets = v;
-		else if (idx == 3)	state->key_result_attnum = v;
-		else if (idx == 4)	state->sort_output = (bool) v;
-		else
-		{
-			int tbase = (idx - 5);
-			int tno   = tbase / 5;
-			int toff  = tbase % 5;
-
-			if (tno < VECGROUPAGG_MAX_TARGETS)
-			{
-				switch (toff)
-				{
-					case 0: state->targets[tno].agg_kind       = v; break;
-					case 1: state->targets[tno].col_type       = v; break;
-					case 2: state->targets[tno].col_attnum     = v; break;
-					case 3: state->targets[tno].result_attnum  = v; break;
-					case 4: state->targets[tno].result_typeoid = (Oid) v; break;
-				}
-			}
-		}
-		idx++;
-	}
+	state->key_attnum = PRIV_INT(list_nth(priv, 0));
+	state->key_typeoid = (Oid) PRIV_INT(list_nth(priv, 1));
+	state->key_is_const = (bool) PRIV_INT(list_nth(priv, 2));
+	state->num_targets = PRIV_INT(list_nth(priv, 3));
+	state->key_result_attnum = PRIV_INT(list_nth(priv, 4));
+	state->sort_output = (bool) PRIV_INT(list_nth(priv, 5));
+	state->is_partial_serial =
+		(PRIV_INT(list_nth(priv, 6)) == (int) AGGSPLIT_INITIAL_SERIAL);
 
 	state->key_col_type = type_oid_to_vectype(state->key_typeoid);
+	get_typlenbyval(state->key_typeoid, &state->key_typlen, &state->key_typbyval);
+
+	state->key_const = (Datum) 0;
+	state->key_const_isnull = true;
+
+	if (state->key_is_const)
+	{
+		Const *kconst = (Const *) list_nth(priv, 7);
+
+		state->key_const_isnull = kconst->constisnull;
+		if (!kconst->constisnull)
+			state->key_const = datumCopy(kconst->constvalue,
+									 state->key_typbyval,
+									 state->key_typlen);
+	}
+
+	target_idx = state->key_is_const ? 8 : 7;
+	for (int tno = 0; tno < state->num_targets && tno < VECGROUPAGG_MAX_TARGETS; tno++)
+	{
+		state->targets[tno].agg_kind = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].col_type = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].col_attnum = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].result_attnum = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].result_typeoid = (Oid) PRIV_INT(list_nth(priv, target_idx++));
+	}
+
+	#undef PRIV_INT
 
 	/* Create memory context for per-group data */
 	state->agg_context = AllocSetContextCreate(CurrentMemoryContext,
@@ -521,7 +716,7 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 											   ALLOCSET_DEFAULT_SIZES);
 
 	/* Initialize group hash table */
-	state->group_htab = create_group_htab(state->agg_context);
+	state->group_htab = create_group_htab(state, state->agg_context);
 	state->num_groups = 0;
 	state->scan_done  = false;
 	state->seq_started = false;
@@ -530,13 +725,12 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 
 	/*
 	 * Initialize the child ColcompressScan.
-	 * PG does not auto-initialize custom_plans in ExecInitCustomScan,
-	 * so we must call ExecInitNode ourselves.
+	 * Child plan is in lefttree (not custom_plans) so that
+	 * deparse_context_for_plan_tree can resolve OUTER_VAR references.
 	 */
 	{
-		Plan *child_plan = (Plan *) linitial(cscan->custom_plans);
-		PlanState *child_ps = ExecInitNode(child_plan, estate, eflags);
-		state->css.custom_ps = lappend(state->css.custom_ps, child_ps);
+		Plan *child_plan = outerPlan(cscan);
+		outerPlanState(css) = ExecInitNode(child_plan, estate, eflags);
 	}
 }
 
@@ -544,7 +738,7 @@ static TupleTableSlot *
 ExecVecGroupAgg(CustomScanState *css)
 {
 	VecGroupAggState *state = (VecGroupAggState *) css;
-	PlanState		 *child_ps = (PlanState *) linitial(state->css.custom_ps);
+	PlanState		 *child_ps = outerPlanState(css);
 
 	/* Phase 1: consume all batches from ColcompressScan */
 	if (!state->scan_done)
@@ -645,8 +839,8 @@ EndVecGroupAgg(CustomScanState *css)
 		state->group_htab = NULL;
 	}
 
-	if (state->css.custom_ps != NIL)
-		ExecEndNode((PlanState *) linitial(state->css.custom_ps));
+	if (outerPlanState(css) != NULL)
+		ExecEndNode(outerPlanState(css));
 
 	MemoryContextDelete(state->agg_context);
 }
@@ -668,13 +862,13 @@ ReScanVecGroupAgg(CustomScanState *css)
 	if (state->group_htab)
 		hash_destroy(state->group_htab);
 
-	state->group_htab = create_group_htab(state->agg_context);
+	state->group_htab = create_group_htab(state, state->agg_context);
 	state->num_groups = 0;
 	state->scan_done  = false;
 	state->sorted_arr = NULL;
 	state->sorted_idx = 0;
 
-	ExecReScan((PlanState *) linitial(state->css.custom_ps));
+	ExecReScan(outerPlanState(css));
 }
 
 static void
@@ -707,8 +901,11 @@ ExplainVecGroupAgg(CustomScanState *css, List *ancestors, ExplainState *es)
 CustomScan *
 engine_create_groupagg_node(int key_attnum,
 							Oid key_typeoid,
+							bool key_is_const,
+							Const *key_const,
 							int key_result_att,
 							bool sort_output,
+							int aggsplit_mode,
 							int num_targets,
 							VecGroupAggTarget *targets)
 {
@@ -733,9 +930,14 @@ engine_create_groupagg_node(int key_attnum,
 
 	MKINT(key_attnum);
 	MKINT((int) key_typeoid);
+	MKINT((int) key_is_const);
 	MKINT(num_targets);
 	MKINT(key_result_att);
 	MKINT((int) sort_output);
+	MKINT(aggsplit_mode);
+
+	if (key_is_const)
+		priv = lappend(priv, copyObject(key_const));
 
 	for (t = 0; t < num_targets; t++)
 	{
@@ -778,12 +980,12 @@ engine_is_groupagg_node(Plan *plan)
 /*
  * Enable sorted output for an already-built VecGroupAgg plan node.
  * (Used when an outer Sort node is absorbed by PlanTreeMutator.)
- * sort_output is serialized at index [4] in custom_private.
+ * sort_output is serialized at index [5] in custom_private.
  */
 void
 engine_groupagg_enable_sort_output(CustomScan *cscan)
 {
-	Const *c = (Const *) list_nth(cscan->custom_private, 4);
+	Const *c = (Const *) list_nth(cscan->custom_private, 5);
 
 	c->constvalue = Int32GetDatum(1);
 }

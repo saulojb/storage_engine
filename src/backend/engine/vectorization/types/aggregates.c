@@ -17,9 +17,19 @@ static Datum
 CallBuiltinAggUnary(PGFunction fn, FunctionCallInfo outer_fcinfo,
 					Datum arg0, bool arg0isnull)
 {
+	FmgrInfo	inner_flinfo;
 	LOCAL_FCINFO(inner_fcinfo, 1);
 
-	InitFunctionCallInfoData(*inner_fcinfo, NULL, 1, InvalidOid,
+	memset(&inner_flinfo, 0, sizeof(inner_flinfo));
+	inner_flinfo.fn_addr = fn;
+	if (outer_fcinfo->flinfo != NULL)
+	{
+		inner_flinfo.fn_mcxt = outer_fcinfo->flinfo->fn_mcxt;
+		inner_flinfo.fn_expr = outer_fcinfo->flinfo->fn_expr;
+	}
+
+	InitFunctionCallInfoData(*inner_fcinfo, &inner_flinfo, 1,
+						 outer_fcinfo->fncollation,
 						 outer_fcinfo->context, NULL);
 	inner_fcinfo->args[0].value = arg0;
 	inner_fcinfo->args[0].isnull = arg0isnull;
@@ -32,9 +42,19 @@ CallBuiltinAggBinary(PGFunction fn, FunctionCallInfo outer_fcinfo,
 					 Datum arg0, bool arg0isnull,
 					 Datum arg1, bool arg1isnull)
 {
+	FmgrInfo	inner_flinfo;
 	LOCAL_FCINFO(inner_fcinfo, 2);
 
-	InitFunctionCallInfoData(*inner_fcinfo, NULL, 2, InvalidOid,
+	memset(&inner_flinfo, 0, sizeof(inner_flinfo));
+	inner_flinfo.fn_addr = fn;
+	if (outer_fcinfo->flinfo != NULL)
+	{
+		inner_flinfo.fn_mcxt = outer_fcinfo->flinfo->fn_mcxt;
+		inner_flinfo.fn_expr = outer_fcinfo->flinfo->fn_expr;
+	}
+
+	InitFunctionCallInfoData(*inner_fcinfo, &inner_flinfo, 2,
+						 outer_fcinfo->fncollation,
 						 outer_fcinfo->context, NULL);
 	inner_fcinfo->args[0].value = arg0;
 	inner_fcinfo->args[0].isnull = arg0isnull;
@@ -667,21 +687,34 @@ se_vnumericavg_accum(PG_FUNCTION_ARGS)
 	VectorColumn *arg1 = (VectorColumn *) PG_GETARG_POINTER(1);
 	Datum	   *vectorValues = (Datum *) arg1->value;
 	Datum		stateDatum;
+	Oid			numeric_avg_accum_oid;
+	FmgrInfo	flinfo;
+	LOCAL_FCINFO(inner_fcinfo, 2);
 	int			i;
 
 	stateDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
+	numeric_avg_accum_oid = fmgr_internal_function("numeric_avg_accum");
+	if (!OidIsValid(numeric_avg_accum_oid))
+		elog(ERROR, "could not resolve numeric_avg_accum");
+
+	fmgr_info_cxt(numeric_avg_accum_oid, &flinfo,
+				  fcinfo->flinfo != NULL ? fcinfo->flinfo->fn_mcxt : CurrentMemoryContext);
+	InitFunctionCallInfoData(*inner_fcinfo, &flinfo, 2,
+					 fcinfo->fncollation,
+					 fcinfo->context, NULL);
 
 	for (i = 0; i < arg1->dimension; i++)
 	{
 		if (arg1->isnull[i])
 			continue;
 
-		stateDatum = CallBuiltinAggBinary(numeric_avg_accum,
-								 fcinfo,
-								 stateDatum,
-								 stateDatum == (Datum) 0,
-								 vectorValues[i],
-								 false);
+		inner_fcinfo->args[0].value = stateDatum;
+		inner_fcinfo->args[0].isnull = (stateDatum == (Datum) 0);
+		inner_fcinfo->args[1].value = vectorValues[i];
+		inner_fcinfo->args[1].isnull = false;
+		inner_fcinfo->isnull = false;
+
+		stateDatum = FunctionCallInvoke(inner_fcinfo);
 	}
 
 	PG_RETURN_DATUM(stateDatum);
