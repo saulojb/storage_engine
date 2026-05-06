@@ -28,6 +28,11 @@
   vectorized group aggregate node to run inside parallel workers and feed the
   native `Finalize GroupAggregate` combine step.
 
+  This line also adds incremental `avg(int4)` support for the parallel
+  partial path (`AGGSPLIT_INITIAL_SERIAL`). In this shape, the vectorized node
+  emits the transition state expected by PostgreSQL finalize (`bigint[]`
+  `[count,sum]`), while unsupported `avg` shapes still fall back safely.
+
   In addition to the aggregate coverage expansion, this release includes
   correctness and stability fixes found during PG18 validation:
 
@@ -43,12 +48,12 @@
 
   Validation status for this change set:
 
-  - PG18 (`5432`) regression suite: **ALL 155 TESTS PASSED**;
+  - PG18 (`5432`) regression suite: **ALL 163 TESTS PASSED**;
   - real plans on `bench_am_30m` show
     `Parallel Custom Scan (StorageEngineVectorGroupAgg)` for
     `count/sum/min/max` grouped shapes;
-  - unsupported partial-state shapes (notably `avg`) still fall back safely to
-    native PostgreSQL aggregate nodes.
+  - unsupported partial-state shapes still fall back safely to native
+    PostgreSQL aggregate nodes.
 
 * note: **compatibility policy update**
 
