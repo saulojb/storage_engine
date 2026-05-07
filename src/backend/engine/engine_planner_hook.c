@@ -1116,8 +1116,7 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 
 	/* Check type is supported */
 	Oid arg_typeoid = arg_var->vartype;
-	if (TypeOidToVecGaggType(arg_typeoid) < 0)
-		return false;
+	int arg_vectype = TypeOidToVecGaggType(arg_typeoid);
 
 	fname = get_func_name(aggref->aggfnoid);
 	if (fname == NULL)
@@ -1126,6 +1125,8 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 	if (strcmp(fname, "sum") == 0 || strcmp(fname, "int4_sum") == 0 ||
 		strcmp(fname, "int8_sum") == 0 || strcmp(fname, "float8pl") == 0)
 	{
+		if (arg_vectype < 0)
+			return false;
 		if (arg_cast_to_float8)
 			return false;
 		*out_kind = VECGAGG_SUM;
@@ -1135,6 +1136,8 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 			 strcmp(fname, "int8_avg") == 0 ||
 			 strcmp(fname, "float8_avg") == 0)
 	{
+		if (arg_vectype < 0)
+			return false;
 		/*
 		 * Determine the true final result type.  In AGGSPLIT_INITIAL_SERIAL,
 		 * aggref->aggtype is the serialized transition type (BYTEAOID), not
@@ -1184,9 +1187,32 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 		if (has_case)
 			return false;
 		if (aggref->aggdistinct != NIL)
+		{
+			/*
+			 * COUNT(DISTINCT col): executor uses a hash set, so any
+			 * by-value type or passable-by-reference type (text, bpchar,
+			 * varchar, …) is fine.  The only hard requirement is that we
+			 * can read the Datum from a VectorColumn batch slot, which all
+			 * supported column types satisfy.  Types that TypeOidToVecGaggType
+			 * returns < 0 for (e.g. text, bpchar) are still valid here because
+			 * the executor uses VECGAGG_TYPE_TEXT / VECGAGG_TYPE_BPCHAR paths.
+			 */
+			int cd_col_type = arg_vectype;	/* may be -1 for text types */
+			if (cd_col_type < 0)
+			{
+				/* Allow text-family types via KeyTypeOidToVecGaggType */
+				cd_col_type = KeyTypeOidToVecGaggType(arg_typeoid);
+				if (cd_col_type < 0)
+					return false;	/* truly unsupported type */
+			}
 			*out_kind = VECGAGG_COUNT_DISTINCT;
+		}
 		else
+		{
+			if (arg_vectype < 0)
+				return false;
 			*out_kind = VECGAGG_COUNT_COL;
+		}
 	}
 	else if (strcmp(fname, "min") == 0 || strcmp(fname, "int4smaller") == 0 ||
 			 strcmp(fname, "int8smaller") == 0 || strcmp(fname, "float8smaller") == 0)
@@ -1818,7 +1844,12 @@ PlanTreeMutator(Plan *node, void *context)
 					}
 
 					targets[num_targets].agg_kind       = kind;
-					targets[num_targets].col_type       = TypeOidToVecGaggType(col_typeoid);
+					{
+						int ct = TypeOidToVecGaggType(col_typeoid);
+						if (ct < 0)
+							ct = KeyTypeOidToVecGaggType(col_typeoid);
+						targets[num_targets].col_type = ct;
+					}
 					targets[num_targets].result_attnum  = result_att;
 					targets[num_targets].avg_input_as_float8 = avg_input_as_float8;
 					{
