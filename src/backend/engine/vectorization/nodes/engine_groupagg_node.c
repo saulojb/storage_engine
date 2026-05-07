@@ -867,6 +867,55 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 				}
 			}
 
+			/*
+			 * CASE WHEN col = const THEN val END filter.
+			 * If the filter condition is false (or NULL), treat the value as
+			 * NULL so that accumulate_value skips it.
+			 */
+			if (tgt->has_case_filter && !val_null)
+			{
+				VectorColumn *fcol = (tgt->filter_col_attnum >= 0)
+					? (VectorColumn *) slot->tts_values[tgt->filter_col_attnum]
+					: NULL;
+
+				if (fcol == NULL || fcol->isnull[i])
+				{
+					val_null = true;	/* NULL filter column → skip */
+				}
+				else
+				{
+					int8  *frawPtr = (int8 *) fcol->value +
+									 (int) fcol->columnTypeLen * i;
+					Datum  fval    = fetch_att(frawPtr, fcol->columnIsVal,
+											   fcol->columnTypeLen);
+					bool   matches;
+
+					if (tgt->filter_col_type == VECGAGG_TYPE_TEXT ||
+						tgt->filter_col_type == VECGAGG_TYPE_BPCHAR)
+					{
+						/*
+						 * Varlena text comparison: compare raw bytes after
+						 * stripping any varlena header (VARDATA_ANY / VARSIZE_ANY_EXHDR).
+						 */
+						text *fa = DatumGetTextPP(fval);
+						text *fb = DatumGetTextPP(tgt->filter_eq_value);
+						Size  la = VARSIZE_ANY_EXHDR(fa);
+						Size  lb = VARSIZE_ANY_EXHDR(fb);
+
+						matches  = (la == lb &&
+									memcmp(VARDATA_ANY(fa), VARDATA_ANY(fb), la) == 0);
+					}
+					else
+					{
+						/* By-value comparison (int4, int8, float8, bool, etc.) */
+						matches = (fval == tgt->filter_eq_value);
+					}
+
+					if (!matches)
+						val_null = true;	/* condition false → skip */
+				}
+			}
+
 			accumulate_value(state, entry, t, tgt, val, val_null);
 		}
 	}
@@ -1137,7 +1186,8 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 	 *   [4*num_keys+3]  aggsplit_mode
 	 *   [Const nodes for ki where key_is_consts[ki]=true, in order]
 	 *   [8 Ints per target: kind, col_type, col_attnum, result_attnum,
-	 *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid]
+	 *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid,
+	 *    has_case_filter, filter_col_attnum, filter_col_type, <Const filter_value>]
 	 */
 	List   *priv = cscan->custom_private;
 	int		target_idx;
@@ -1197,6 +1247,32 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 		state->targets[tno].result_typeoid = (Oid) PRIV_INT(list_nth(priv, target_idx++));
 		state->targets[tno].use_int8_avg_path = (bool) PRIV_INT(list_nth(priv, target_idx++));
 		state->targets[tno].avg_transfn_oid = (Oid) PRIV_INT(list_nth(priv, target_idx++));
+		/* CASE WHEN filter deserialization */
+		state->targets[tno].has_case_filter   = (bool) PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].filter_col_attnum = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].filter_col_type   = PRIV_INT(list_nth(priv, target_idx++));
+		{
+			Const *fc = (Const *) list_nth(priv, target_idx++);
+			state->targets[tno].filter_const_plan = NULL; /* runtime: unused */
+			if (state->targets[tno].has_case_filter && !fc->constisnull)
+			{
+				state->targets[tno].filter_eq_typeoid = fc->consttype;
+				get_typlenbyval(fc->consttype,
+								&state->targets[tno].filter_typlen,
+								&state->targets[tno].filter_typbyval);
+				state->targets[tno].filter_eq_value =
+					datumCopy(fc->constvalue,
+							  state->targets[tno].filter_typbyval,
+							  state->targets[tno].filter_typlen);
+			}
+			else
+			{
+				state->targets[tno].filter_eq_typeoid = InvalidOid;
+				state->targets[tno].filter_typlen     = 0;
+				state->targets[tno].filter_typbyval   = true;
+				state->targets[tno].filter_eq_value   = (Datum) 0;
+			}
+		}
 	}
 
 	#undef PRIV_INT
@@ -1413,8 +1489,10 @@ ExplainVecGroupAgg(CustomScanState *css, List *ancestors, ExplainState *es)
  *   [4*num_keys+2]  sort_output
  *   [4*num_keys+3]  aggsplit_mode
  *   [Const nodes for each ki where key_is_consts[ki]=true, in order]
- *   [8 Ints per target: kind, col_type, col_attnum, result_attnum,
- *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid]
+ *   [12 items per target: 11 ints + 1 Const:
+ *    kind, col_type, col_attnum, result_attnum,
+ *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid,
+ *    has_case_filter, filter_col_attnum, filter_col_type, <Const filter_value>]
  */
 CustomScan *
 engine_create_groupagg_node(int num_keys,
@@ -1474,6 +1552,14 @@ engine_create_groupagg_node(int num_keys,
 		MKINT((int) targets[t].result_typeoid);
 		MKINT((int) targets[t].use_int8_avg_path);
 		MKINT((int) targets[t].avg_transfn_oid);
+		/* CASE WHEN filter: 3 ints + 1 Const node */
+		MKINT((int) targets[t].has_case_filter);
+		MKINT(targets[t].filter_col_attnum);
+		MKINT(targets[t].filter_col_type);
+		if (targets[t].has_case_filter && targets[t].filter_const_plan != NULL)
+			priv = lappend(priv, copyObject(targets[t].filter_const_plan));
+		else
+			priv = lappend(priv, makeNullConst(INT4OID, -1, InvalidOid));
 	}
 
 #undef MKINT

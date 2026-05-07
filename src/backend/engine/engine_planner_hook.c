@@ -589,6 +589,119 @@ KeyTypeOidToVecGaggType(Oid typeoid)
 }
 
 /*
+ * Detect: SUM(CASE WHEN filter_col = const THEN value_col END)
+ *
+ * Matches a CaseExpr with exactly one CaseWhen whose condition is
+ * (Var = Const) or (Const = Var), and whose THEN result is a plain Var.
+ * The ELSE branch must be absent or explicitly NULL.
+ *
+ * On success, fills:
+ *   out_value_var        — Var for the value column (THEN branch)
+ *   out_filter_scan_pos  — varattno of the filter column (1-based scan pos)
+ *   out_filter_const     — the Const node from the equality condition
+ *   out_filter_typeoid   — type OID of the filter column
+ *
+ * Returns false if the expression does not match the pattern.
+ */
+static bool
+ExtractCaseWhenFilter(Node *expr,
+					  Var **out_value_var,
+					  AttrNumber *out_filter_scan_pos,
+					  Const **out_filter_const,
+					  Oid *out_filter_typeoid)
+{
+	CaseExpr   *caseexpr;
+	CaseWhen   *casewhen;
+	OpExpr	   *opexpr;
+	Var		   *filter_var;
+	Const	   *filter_const;
+	Node	   *then_node;
+	Node	   *arg0, *arg1;
+	Node	   *cond;
+
+	if (expr == NULL || !IsA(expr, CaseExpr))
+		return false;
+
+	caseexpr = (CaseExpr *) expr;
+
+	/* Must have exactly one WHEN clause */
+	if (list_length(caseexpr->args) != 1)
+		return false;
+
+	/* ELSE must be absent or explicitly NULL */
+	if (caseexpr->defresult != NULL)
+	{
+		if (!IsA(caseexpr->defresult, Const))
+			return false;
+		if (!((Const *) caseexpr->defresult)->constisnull)
+			return false;
+	}
+
+	casewhen = (CaseWhen *) linitial(caseexpr->args);
+	if (!IsA(casewhen, CaseWhen))
+		return false;
+
+	/* Peel any RelabelType wrapping the condition */
+	cond = (Node *) casewhen->expr;
+	while (IsA(cond, RelabelType))
+		cond = (Node *) ((RelabelType *) cond)->arg;
+
+	if (!IsA(cond, OpExpr))
+		return false;
+
+	opexpr = (OpExpr *) cond;
+	if (list_length(opexpr->args) != 2)
+		return false;
+
+	/* Verify operator is equality ("=") */
+	{
+		HeapTuple  optup = SearchSysCache1(OPEROID, ObjectIdGetDatum(opexpr->opno));
+		bool	   is_eq;
+		if (!HeapTupleIsValid(optup))
+			return false;
+		is_eq = (strcmp(NameStr(((Form_pg_operator) GETSTRUCT(optup))->oprname), "=") == 0);
+		ReleaseSysCache(optup);
+		if (!is_eq)
+			return false;
+	}
+
+	/* Peel casts from each argument */
+	arg0 = (Node *) linitial(opexpr->args);
+	arg1 = (Node *) lsecond(opexpr->args);
+	while (IsA(arg0, RelabelType)) arg0 = (Node *) ((RelabelType *) arg0)->arg;
+	while (IsA(arg1, RelabelType)) arg1 = (Node *) ((RelabelType *) arg1)->arg;
+
+	/* One side must be a Var, the other a Const */
+	if (IsA(arg0, Var) && IsA(arg1, Const))
+	{
+		filter_var   = (Var *) arg0;
+		filter_const = (Const *) arg1;
+	}
+	else if (IsA(arg0, Const) && IsA(arg1, Var))
+	{
+		filter_var   = (Var *) arg1;
+		filter_const = (Const *) arg0;
+	}
+	else
+		return false;
+
+	/* THEN branch must be a plain Var (the value column) */
+	then_node = (Node *) casewhen->result;
+	while (IsA(then_node, RelabelType))
+		then_node = (Node *) ((RelabelType *) then_node)->arg;
+
+	if (!IsA(then_node, Var))
+		return false;
+
+	*out_value_var       = (Var *) then_node;
+	*out_filter_scan_pos = filter_var->varattno;
+	*out_filter_const    = filter_const;
+	*out_filter_typeoid  = filter_var->vartype;
+
+	return true;
+}
+
+/*
  * Extract a base Var from aggregate argument expressions and detect
  * single-argument cast/coerce wrappers that produce float8.
  */
@@ -719,17 +832,46 @@ ExtractTargetAggref(Node *expr, Aggref **out_aggref)
 /*
  * Classify an Aggref into VECGAGG_COUNT_STAR / SUM / MIN / MAX / AVG.
  * Fills *out_kind, *out_col_varattno, *out_col_typeoid.
+ *
+ * Optional CASE WHEN output params (all nullable — pass NULL to ignore):
+ *   out_has_case_filter   — true when SUM(CASE WHEN col=const THEN val END)
+ *   out_filter_scan_pos   — 1-based scan output pos of the filter column
+ *   out_filter_const      — Const node for the equality constant
+ *   out_filter_typeoid    — type OID of the filter column
+ *
  * Returns false if the aggregate is not supported.
  */
 static bool
 ClassifyAggref(Aggref *aggref, Plan *child_plan,
 			   int *out_kind, AttrNumber *out_col_varattno, Oid *out_col_typeoid,
-			   bool *out_avg_input_as_float8)
+			   bool *out_avg_input_as_float8,
+			   bool *out_has_case_filter,
+			   AttrNumber *out_filter_scan_pos,
+			   Const **out_filter_const,
+			   Oid *out_filter_typeoid)
 {
 	const char *fname;
 	Var		   *arg_var = NULL;
 	Oid			arg_expr_type = InvalidOid;
 	bool		arg_cast_to_float8 = false;
+	bool		has_case = false;
+	AttrNumber	case_filter_scan_pos = 0;
+	Const	   *case_filter_const = NULL;
+	Oid			case_filter_typeoid = InvalidOid;
+
+	/* Initialize optional outputs */
+	if (out_has_case_filter)  *out_has_case_filter  = false;
+	if (out_filter_scan_pos)  *out_filter_scan_pos  = 0;
+	if (out_filter_const)     *out_filter_const     = NULL;
+	if (out_filter_typeoid)   *out_filter_typeoid   = InvalidOid;
+
+	/* DISTINCT aggregates are not vectorizable (e.g. COUNT(DISTINCT col)) */
+	if (aggref->aggdistinct != NIL)
+		return false;
+
+	/* FILTER clause not supported */
+	if (aggref->aggfilter != NULL)
+		return false;
 
 	/* count(*): aggstar = true, no args */
 	if (aggref->aggstar)
@@ -750,7 +892,25 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 						 &arg_var,
 						 &arg_expr_type,
 						 &arg_cast_to_float8))
-		return false;
+	{
+		/*
+		 * Not a plain Var — try CASE WHEN col = const THEN value_col END.
+		 * Only valid for SUM / MIN / MAX (not AVG or COUNT).
+		 */
+		Var		   *case_value_var = NULL;
+
+		if (!ExtractCaseWhenFilter((Node *) arg_te->expr,
+								   &case_value_var,
+								   &case_filter_scan_pos,
+								   &case_filter_const,
+								   &case_filter_typeoid))
+			return false;
+
+		arg_var            = case_value_var;
+		arg_expr_type      = arg_var->vartype;
+		arg_cast_to_float8 = false;
+		has_case           = true;
+	}
 
 	/* Map scan-output position to table varattno */
 	AttrNumber scan_pos  = arg_var->varattno;
@@ -824,6 +984,9 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 		/* count(col): NULL-aware — only count non-null values */
 		if (arg_cast_to_float8)
 			return false;
+		/* CASE WHEN filter is not meaningful for COUNT — fall back */
+		if (has_case)
+			return false;
 		*out_kind = VECGAGG_COUNT_COL;
 	}
 	else if (strcmp(fname, "min") == 0 || strcmp(fname, "int4smaller") == 0 ||
@@ -843,10 +1006,24 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 	else
 		return false;
 
+	/* AVG with CASE WHEN is not supported */
+	if (has_case && *out_kind == VECGAGG_AVG)
+		return false;
+
 	*out_col_varattno = col_attno;
 	*out_col_typeoid  = arg_typeoid;
 	if (*out_kind != VECGAGG_AVG)
 		*out_avg_input_as_float8 = false;
+
+	/* Propagate CASE WHEN filter info to caller */
+	if (has_case)
+	{
+		if (out_has_case_filter)  *out_has_case_filter  = true;
+		if (out_filter_scan_pos)  *out_filter_scan_pos  = case_filter_scan_pos;
+		if (out_filter_const)     *out_filter_const     = case_filter_const;
+		if (out_filter_typeoid)   *out_filter_typeoid   = case_filter_typeoid;
+	}
+
 	return true;
 }
 
@@ -1329,14 +1506,58 @@ PlanTreeMutator(Plan *node, void *context)
 						break;
 					}
 
-					if (!ClassifyAggref(aggref, scan_plan,
-											&kind, &col_varattno, &col_typeoid,
-											&avg_input_as_float8))
 					{
-						fallback_reason = psprintf("aggregate target unsupported: %s",
-										   get_func_name(aggref->aggfnoid));
-						supported = false;
-						break;
+						bool        agg_has_case     = false;
+						AttrNumber  agg_filter_spos  = 0;
+						Const      *agg_filter_const = NULL;
+						Oid         agg_filter_toid  = InvalidOid;
+
+						if (!ClassifyAggref(aggref, scan_plan,
+												&kind, &col_varattno, &col_typeoid,
+												&avg_input_as_float8,
+												&agg_has_case,
+												&agg_filter_spos,
+												&agg_filter_const,
+												&agg_filter_toid))
+						{
+							fallback_reason = psprintf("aggregate target unsupported: %s",
+											   get_func_name(aggref->aggfnoid));
+							supported = false;
+							break;
+						}
+
+						targets[num_targets].has_case_filter   = agg_has_case;
+						targets[num_targets].filter_const_plan = NULL;
+
+						if (agg_has_case)
+						{
+							/* Map filter column scan-output pos to table varattno */
+							AttrNumber filter_table_attno =
+								ScanOutputPosToVarAttno(scan_plan, agg_filter_spos);
+							if (filter_table_attno == 0)
+							{
+								fallback_reason = "CASE WHEN filter column not in scan output";
+								supported = false;
+								break;
+							}
+							/* Map table varattno to 0-based slot index */
+							int filter_slot_idx = VarAttnoToSlotIdx(scan_plan, filter_table_attno);
+							if (filter_slot_idx < 0)
+							{
+								fallback_reason = "failed to map CASE WHEN filter column to slot";
+								supported = false;
+								break;
+							}
+							targets[num_targets].filter_col_attnum  = filter_slot_idx;
+							targets[num_targets].filter_col_type    =
+								KeyTypeOidToVecGaggType(agg_filter_toid);
+							targets[num_targets].filter_const_plan  = agg_filter_const;
+						}
+						else
+						{
+							targets[num_targets].filter_col_attnum = -1;
+							targets[num_targets].filter_col_type   = -1;
+						}
 					}
 
 					/*

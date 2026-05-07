@@ -58,6 +58,22 @@ typedef struct VecGroupAggTarget
 	bool	use_int8_avg_path;  /* true for avg(int/bigint) partial: use aggtransfn/int8_avg_serialize */
 	Oid		avg_transfn_oid;    /* pg_aggregate.aggtransfn OID when use_int8_avg_path */
 	Oid		result_typeoid;	/* SQL return type OID (e.g. NUMERICOID for sum(int8)) */
+
+	/*
+	 * CASE WHEN col = const THEN val END conditional filter.
+	 * When has_case_filter is true, a row is accumulated only when the
+	 * filter column equals filter_eq_value.  Otherwise val is treated as NULL.
+	 * Only supported for SUM / MIN / MAX.
+	 */
+	bool	has_case_filter;      /* true: SUM(CASE WHEN col=const THEN val END) */
+	int		filter_col_attnum;    /* 0-based slot pos of filter column */
+	int		filter_col_type;      /* VECGAGG_TYPE_* of filter column */
+	Datum	filter_eq_value;      /* stable copy of the constant (runtime) */
+	Oid		filter_eq_typeoid;    /* type OID of the filter column */
+	int16	filter_typlen;        /* type length for datumCopy */
+	bool	filter_typbyval;      /* by-value type? */
+	/* Plan-time only: Const node used during serialization. NULL at runtime. */
+	struct Const *filter_const_plan;
 } VecGroupAggTarget;
 
 /* Maximum composite GROUP BY keys */
