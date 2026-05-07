@@ -489,7 +489,7 @@ BEGIN
         WHEN 'ok' THEN
             RETURN QUERY SELECT
                 'ok'::text,
-                format('%s/%s %ss dirty (%.1f%%), below all thresholds',
+                format('%s/%s %ss dirty (%s%%), below all thresholds',
                        _h.dirty_units, _h.total_units,
                        CASE _h.am_name WHEN 'colcompress' THEN 'stripe' ELSE 'batch' END,
                        _h.dirty_ratio * 100)::text,
@@ -499,7 +499,7 @@ BEGIN
         WHEN 'run_incremental_merge' THEN
             RETURN QUERY SELECT
                 'degraded'::text,
-                format('%s/%s %ss dirty (%.1f%%), above merge_trigger_ratio threshold',
+                format('%s/%s %ss dirty (%s%%), above merge_trigger_ratio threshold',
                        _h.dirty_units, _h.total_units,
                        CASE _h.am_name WHEN 'colcompress' THEN 'stripe' ELSE 'batch' END,
                        _h.dirty_ratio * 100)::text,
@@ -516,7 +516,7 @@ BEGIN
         WHEN 'run_full_repack' THEN
             RETURN QUERY SELECT
                 'critical'::text,
-                format('%s/%s %ss dirty (%.1f%%), exceeds (1 - target_pruning_ratio) threshold',
+                format('%s/%s %ss dirty (%s%%), exceeds (1 - target_pruning_ratio) threshold',
                        _h.dirty_units, _h.total_units,
                        CASE _h.am_name WHEN 'colcompress' THEN 'stripe' ELSE 'batch' END,
                        _h.dirty_ratio * 100)::text,

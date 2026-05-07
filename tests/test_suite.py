@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-storage_engine comprehensive test suite.
+storage_engine comprehensive regression test suite — v2.1.0.
 
-Covers all features before PGXN publication:
+Covers:
   - Extension lifecycle (install, schema, catalog objects)
   - colcompress and rowcompress DML
   - Compression codec options (zstd, lz4, pglz)
@@ -17,11 +17,25 @@ Covers all features before PGXN publication:
   - Multi-column aggregate query
   - Upgrade path chain traversability
 
+  Phase 1–3 Maintenance / Merge Incremental (v2.1.0):
+  - Catalog: col_maintenance_options, row_maintenance_options tables
+  - Catalog: stripe.pruning_valid, stripe.dirty_rows columns
+  - Catalog: row_batch.pruning_valid, row_batch.deleted_count columns
+  - API: colcompress_set_maintenance / rowcompress_set_maintenance
+  - API: storage_health view — dirty_units, tombstone_rows, recommended_action
+  - API: storage_maintenance_recommendation function
+  - API: storage_maintenance_stats function
+  - Phase 2: pruning_valid marked false + dirty_rows incremented on DELETE
+  - Phase 3: colcompress_merge_incremental — rewrite dirty stripes
+  - Phase 3: rowcompress_merge_incremental — rewrite dirty batches
+  - Merge idempotency, fully-dead stripe handling, live_rows preservation
+
 Usage:
     python3 tests/test_suite.py                     # PG@5432 only
     python3 tests/test_suite.py --pg19              # PG@5432 + PG@5433
     python3 tests/test_suite.py --port 5433         # single custom port
     python3 tests/test_suite.py --port 5432 --pg19 --pg19-port 5433
+    python3 tests/test_suite.py --ports 5432,5435   # multiple ports
 """
 
 import argparse
@@ -170,20 +184,70 @@ class TestRunner:
 
         # Version
         ver = self.q1("SELECT extversion FROM pg_extension WHERE extname='storage_engine'")
-        self.check("extension version = 1.3.4", ver == "1.3.4", f"got {ver!r}")
+        self.check("extension version = 2.1.0", ver == "2.1.0", f"got {ver!r}")
 
         # Schema
         ns = self.q1("SELECT nspname FROM pg_namespace WHERE nspname='engine'")
         self.check("schema engine exists", ns == "engine")
 
-        # Catalog tables
-        for tbl in ("col_options", "stripe", "chunk_group", "chunk"):
+        # Core catalog tables
+        for tbl in ("col_options", "stripe", "chunk_group", "chunk",
+                    "row_options", "row_batch",
+                    "col_maintenance_options", "row_maintenance_options"):
             cnt = self.q1(
                 f"SELECT count(*) FROM pg_class c "
                 f"JOIN pg_namespace n ON n.oid = c.relnamespace "
                 f"WHERE c.relname = '{tbl}' AND n.nspname = 'engine'"
             )
             self.check(f"catalog table engine.{tbl} exists", cnt == "1")
+
+        # Phase 2/2.5: new columns on stripe and row_batch
+        for tbl, col in (
+            ("stripe",    "pruning_valid"),
+            ("stripe",    "dirty_rows"),
+            ("row_batch", "pruning_valid"),
+            ("row_batch", "deleted_count"),
+        ):
+            cnt = self.q1(
+                f"SELECT count(*) FROM pg_attribute a "
+                f"JOIN pg_class c ON c.oid = a.attrelid "
+                f"JOIN pg_namespace n ON n.oid = c.relnamespace "
+                f"WHERE n.nspname = 'engine' AND c.relname = '{tbl}' "
+                f"  AND a.attname = '{col}' AND NOT a.attisdropped"
+            )
+            self.check(f"column engine.{tbl}.{col} exists", cnt == "1")
+
+        # Phase 1: storage_health view
+        cnt_view = self.q1(
+            "SELECT count(*) FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname = 'storage_health' AND n.nspname = 'engine' AND c.relkind = 'v'"
+        )
+        self.check("view engine.storage_health exists", cnt_view == "1")
+
+        # Phase 1: maintenance functions
+        for fn_name, arg_types in (
+            ("colcompress_set_maintenance",       "regclass, text, real, real"),
+            ("rowcompress_set_maintenance",       "regclass, text, real, real"),
+            ("storage_maintenance_recommendation", "regclass"),
+            ("storage_maintenance_stats",          "regclass"),
+        ):
+            cnt = self.q1(
+                f"SELECT count(*) FROM pg_proc p "
+                f"JOIN pg_namespace n ON n.oid = p.pronamespace "
+                f"WHERE n.nspname = 'engine' AND p.proname = '{fn_name}'"
+            )
+            self.check(f"function engine.{fn_name}({arg_types}) exists", cnt != "0")
+
+        # Phase 3: merge incremental procedures
+        for proc_name in ("colcompress_merge_incremental", "rowcompress_merge_incremental"):
+            cnt = self.q1(
+                f"SELECT count(*) FROM pg_proc p "
+                f"JOIN pg_namespace n ON n.oid = p.pronamespace "
+                f"WHERE n.nspname = 'engine' AND p.proname = '{proc_name}' "
+                f"  AND p.prokind = 'p'"  # 'p' = procedure
+            )
+            self.check(f"procedure engine.{proc_name}(regclass, int) exists", cnt != "0")
 
         # Table access methods
         for am in ("colcompress", "rowcompress"):
@@ -1021,6 +1085,538 @@ class TestRunner:
         self.check("composite GROUP BY (3 keys): VEC ON == VEC OFF",
                    r_off6 == r_on6, f"OFF={r_off6[:200]!r}  ON={r_on6[:200]!r}")
 
+    # ------------------------------------------------------------------ maintenance API (Phase 1)
+
+    def test_maintenance_api(self) -> None:
+        self.section("Maintenance API — colcompress_set_maintenance / rowcompress_set_maintenance")
+
+        self.exec("""
+            DROP TABLE IF EXISTS _tmaint_col;
+            DROP TABLE IF EXISTS _tmaint_row;
+            CREATE TABLE _tmaint_col (id int, val text) USING colcompress;
+            CREATE TABLE _tmaint_row (id int, val text) USING rowcompress;
+            INSERT INTO _tmaint_col SELECT i, 'x' FROM generate_series(1,1000) i;
+            INSERT INTO _tmaint_row SELECT i, 'x' FROM generate_series(1,1000) i;
+        """)
+
+        # --- colcompress_set_maintenance ---
+        rc, err = self.exec(
+            "SELECT engine.colcompress_set_maintenance('_tmaint_col', 'lazy', 0.80, 0.10)"
+        )
+        self.check("colcompress_set_maintenance: no error", rc == 0, err[:200] if err else "")
+
+        mode = self.q1(
+            "SELECT maintenance_mode FROM engine.col_maintenance_options "
+            "WHERE regclass = '_tmaint_col'::regclass"
+        )
+        self.check_eq("colcompress_set_maintenance: mode='lazy' persisted", mode, "lazy")
+
+        target = self.q1(
+            "SELECT maintenance_target_pruning_ratio FROM engine.col_maintenance_options "
+            "WHERE regclass = '_tmaint_col'::regclass"
+        )
+        self.check_eq("colcompress_set_maintenance: target_pruning=0.8 persisted",
+                      target, "0.8")
+
+        merge = self.q1(
+            "SELECT maintenance_merge_trigger_ratio FROM engine.col_maintenance_options "
+            "WHERE regclass = '_tmaint_col'::regclass"
+        )
+        self.check_eq("colcompress_set_maintenance: merge_trigger=0.1 persisted",
+                      merge, "0.1")
+
+        # UPSERT: re-call updates existing row
+        self.exec(
+            "SELECT engine.colcompress_set_maintenance('_tmaint_col', 'eager', 0.70, 0.20)"
+        )
+        mode2 = self.q1(
+            "SELECT maintenance_mode FROM engine.col_maintenance_options "
+            "WHERE regclass = '_tmaint_col'::regclass"
+        )
+        self.check_eq("colcompress_set_maintenance: UPSERT updates existing row", mode2, "eager")
+
+        cnt_rows = self.q1(
+            "SELECT count(*) FROM engine.col_maintenance_options "
+            "WHERE regclass = '_tmaint_col'::regclass"
+        )
+        self.check_eq("col_maintenance_options: exactly one row per table", cnt_rows, "1")
+
+        # wrong AM: colcompress_set_maintenance on rowcompress table should fail
+        rc_bad, err_bad = self.exec(
+            "SELECT engine.colcompress_set_maintenance('_tmaint_row', 'eager')"
+        )
+        self.check("colcompress_set_maintenance on rowcompress table: raises error",
+                   rc_bad != 0, f"expected error, got rc={rc_bad}")
+
+        # validation: invalid mode
+        rc_inv, err_inv = self.exec(
+            "SELECT engine.colcompress_set_maintenance('_tmaint_col', 'turbo')"
+        )
+        self.check("colcompress_set_maintenance: invalid mode raises error",
+                   rc_inv != 0, f"expected error, got rc={rc_inv}")
+
+        # validation: ratio > 1.0
+        rc_r, err_r = self.exec(
+            "SELECT engine.colcompress_set_maintenance('_tmaint_col', 'eager', 1.5)"
+        )
+        self.check("colcompress_set_maintenance: target_pruning > 1.0 raises error",
+                   rc_r != 0, f"expected error, got rc={rc_r}")
+
+        # validation: merge_trigger > target_pruning
+        rc_t, err_t = self.exec(
+            "SELECT engine.colcompress_set_maintenance('_tmaint_col', 'eager', 0.50, 0.80)"
+        )
+        self.check("colcompress_set_maintenance: merge_trigger > target raises error",
+                   rc_t != 0, f"expected error, got rc={rc_t}")
+
+        # --- rowcompress_set_maintenance ---
+        rc2, err2 = self.exec(
+            "SELECT engine.rowcompress_set_maintenance('_tmaint_row', 'lazy', 0.60, 0.15)"
+        )
+        self.check("rowcompress_set_maintenance: no error", rc2 == 0, err2[:200] if err2 else "")
+
+        mode3 = self.q1(
+            "SELECT maintenance_mode FROM engine.row_maintenance_options "
+            "WHERE regclass = '_tmaint_row'::regclass"
+        )
+        self.check_eq("rowcompress_set_maintenance: mode='lazy' persisted", mode3, "lazy")
+
+        # wrong AM: rowcompress_set_maintenance on colcompress table should fail
+        rc_bad2, _ = self.exec(
+            "SELECT engine.rowcompress_set_maintenance('_tmaint_col', 'eager')"
+        )
+        self.check("rowcompress_set_maintenance on colcompress table: raises error",
+                   rc_bad2 != 0, f"expected error, got rc={rc_bad2}")
+
+        # storage_health reflects configured maintenance_mode
+        sh_mode = self.q1(
+            "SELECT maintenance_mode FROM engine.storage_health "
+            "WHERE table_name = '_tmaint_col'"
+        )
+        self.check_eq("storage_health reflects colcompress maintenance_mode=eager",
+                      sh_mode, "eager")
+
+    # ------------------------------------------------------------------ storage_health (Phase 2/2.5)
+
+    def test_storage_health(self) -> None:
+        self.section("storage_health View — dirty_units, tombstone_rows, recommended_action")
+
+        # --- colcompress ---
+        self.exec("""
+            DROP TABLE IF EXISTS _thealth_col;
+            CREATE TABLE _thealth_col (id int, val text) USING colcompress;
+            INSERT INTO _thealth_col SELECT i, repeat('x', 100) FROM generate_series(1,10000) i;
+        """)
+
+        # fresh table: all clean
+        dirty_u = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_thealth_col'"
+        )
+        self.check_eq("colcompress fresh: dirty_units = 0", dirty_u, "0")
+
+        tomb0 = self.q1(
+            "SELECT tombstone_rows FROM engine.storage_health "
+            "WHERE table_name = '_thealth_col'"
+        )
+        self.check_eq("colcompress fresh: tombstone_rows = 0", tomb0, "0")
+
+        act_ok = self.q1(
+            "SELECT recommended_action FROM engine.storage_health "
+            "WHERE table_name = '_thealth_col'"
+        )
+        self.check_eq("colcompress fresh: recommended_action = ok", act_ok, "ok")
+
+        # delete some rows → stripe becomes dirty
+        self.exec("DELETE FROM _thealth_col WHERE id <= 100")
+
+        dirty_after = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_thealth_col'"
+        )
+        self.check("colcompress after DELETE: dirty_units > 0",
+                   dirty_after.isdigit() and int(dirty_after) > 0,
+                   f"got {dirty_after!r}")
+
+        tomb_after = self.q1(
+            "SELECT tombstone_rows FROM engine.storage_health "
+            "WHERE table_name = '_thealth_col'"
+        )
+        self.check("colcompress after DELETE: tombstone_rows > 0",
+                   tomb_after.isdigit() and int(tomb_after) > 0,
+                   f"got {tomb_after!r}")
+
+        live_after = self.q1(
+            "SELECT live_rows FROM engine.storage_health "
+            "WHERE table_name = '_thealth_col'"
+        )
+        self.check_eq("colcompress after DELETE: live_rows = 9900", live_after, "9900")
+
+        total_u = self.q1(
+            "SELECT total_units FROM engine.storage_health "
+            "WHERE table_name = '_thealth_col'"
+        )
+        self.check("colcompress after DELETE: total_units >= dirty_units",
+                   total_u.isdigit() and dirty_after.isdigit()
+                   and int(total_u) >= int(dirty_after),
+                   f"total={total_u!r} dirty={dirty_after!r}")
+
+        # --- rowcompress ---
+        self.exec("""
+            DROP TABLE IF EXISTS _thealth_row;
+            CREATE TABLE _thealth_row (id int, val text) USING rowcompress;
+            INSERT INTO _thealth_row SELECT i, repeat('y', 100) FROM generate_series(1,10000) i;
+        """)
+
+        # fresh
+        dirty_r0 = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_thealth_row'"
+        )
+        self.check_eq("rowcompress fresh: dirty_units = 0", dirty_r0, "0")
+
+        tomb_r0 = self.q1(
+            "SELECT tombstone_rows FROM engine.storage_health "
+            "WHERE table_name = '_thealth_row'"
+        )
+        self.check_eq("rowcompress fresh: tombstone_rows = 0", tomb_r0, "0")
+
+        act_r_ok = self.q1(
+            "SELECT recommended_action FROM engine.storage_health "
+            "WHERE table_name = '_thealth_row'"
+        )
+        self.check_eq("rowcompress fresh: recommended_action = ok", act_r_ok, "ok")
+
+        # delete some rows
+        self.exec("DELETE FROM _thealth_row WHERE id <= 200")
+
+        dirty_r1 = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_thealth_row'"
+        )
+        self.check("rowcompress after DELETE: dirty_units > 0",
+                   dirty_r1.isdigit() and int(dirty_r1) > 0,
+                   f"got {dirty_r1!r}")
+
+        tomb_r1 = self.q1(
+            "SELECT tombstone_rows FROM engine.storage_health "
+            "WHERE table_name = '_thealth_row'"
+        )
+        self.check("rowcompress after DELETE: tombstone_rows > 0",
+                   tomb_r1.isdigit() and int(tomb_r1) > 0,
+                   f"got {tomb_r1!r}")
+
+        live_r1 = self.q1(
+            "SELECT live_rows FROM engine.storage_health "
+            "WHERE table_name = '_thealth_row'"
+        )
+        self.check_eq("rowcompress after DELETE: live_rows = 9800", live_r1, "9800")
+
+        # recommended_action escalation: set thresholds so merge is triggered
+        # dirty_units > 0 with merge_trigger=0.0 (every dirty unit triggers)
+        self.exec(
+            "SELECT engine.rowcompress_set_maintenance('_thealth_row', 'eager', 0.70, 0.00)"
+        )
+        act_merge = self.q1(
+            "SELECT recommended_action FROM engine.storage_health "
+            "WHERE table_name = '_thealth_row'"
+        )
+        self.check("rowcompress: recommended_action=run_incremental_merge when trigger_ratio=0",
+                   act_merge in ("run_incremental_merge", "run_full_repack"),
+                   f"got {act_merge!r}")
+
+        # restore default
+        self.exec(
+            "SELECT engine.rowcompress_set_maintenance('_thealth_row', 'eager', 0.70, 0.20)"
+        )
+
+        # storage_maintenance_recommendation returns a row
+        rec = self.q(
+            "SELECT status FROM engine.storage_maintenance_recommendation('_thealth_col'::regclass)"
+        )
+        self.check("storage_maintenance_recommendation returns a row for colcompress",
+                   len(rec) > 0, f"got {rec!r}")
+
+        rec_row = self.q(
+            "SELECT status FROM engine.storage_maintenance_recommendation('_thealth_row'::regclass)"
+        )
+        self.check("storage_maintenance_recommendation returns a row for rowcompress",
+                   len(rec_row) > 0, f"got {rec_row!r}")
+
+        # storage_maintenance_stats returns am_name column
+        stats = self.q1(
+            "SELECT am_name FROM engine.storage_maintenance_stats('_thealth_col'::regclass)"
+        )
+        self.check_eq("storage_maintenance_stats: am_name=colcompress", stats, "colcompress")
+
+        stats_row = self.q1(
+            "SELECT am_name FROM engine.storage_maintenance_stats('_thealth_row'::regclass)"
+        )
+        self.check_eq("storage_maintenance_stats: am_name=rowcompress", stats_row, "rowcompress")
+
+        # stripe.pruning_valid directly: at least one false after delete
+        pv_false = self.q1(
+            "SELECT count(*) FROM engine.stripe s "
+            "JOIN engine.col_options co ON co.regclass = '_thealth_col'::regclass "
+            "WHERE s.storage_id = engine.colcompress_relation_storageid(co.regclass) "
+            "  AND NOT s.pruning_valid"
+        )
+        self.check("stripe.pruning_valid=false after DELETE",
+                   pv_false.isdigit() and int(pv_false) > 0,
+                   f"got {pv_false!r}")
+
+        # row_batch.pruning_valid directly: at least one false after delete
+        pv_row_false = self.q1(
+            "SELECT count(*) FROM engine.row_batch rb "
+            "JOIN engine.row_options ro ON ro.regclass = '_thealth_row'::regclass "
+            "WHERE rb.storage_id = engine.rowcompress_relation_storageid(ro.regclass) "
+            "  AND NOT rb.pruning_valid"
+        )
+        self.check("row_batch.pruning_valid=false after DELETE",
+                   pv_row_false.isdigit() and int(pv_row_false) > 0,
+                   f"got {pv_row_false!r}")
+
+    # ------------------------------------------------------------------ colcompress_merge_incremental (Phase 3)
+
+    def test_colcompress_merge_incremental(self) -> None:
+        self.section("Phase 3 — colcompress_merge_incremental")
+
+        self.exec("""
+            DROP TABLE IF EXISTS _tmerge_col;
+            CREATE TABLE _tmerge_col (id int, val text) USING colcompress;
+            INSERT INTO _tmerge_col SELECT i, repeat('col', 50) FROM generate_series(1,50000) i;
+        """)
+
+        # total before
+        cnt_before = self.q1("SELECT count(*) FROM _tmerge_col")
+        self.check_eq("colcompress merge: 50000 rows before any delete", cnt_before, "50000")
+
+        # clean table: merge is a no-op (idempotent)
+        rc_noop, err_noop = self.exec("CALL engine.colcompress_merge_incremental('_tmerge_col')")
+        self.check("colcompress_merge_incremental on clean table: no error",
+                   rc_noop == 0, err_noop[:200] if err_noop else "")
+
+        dirty_clean = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_col'"
+        )
+        self.check_eq("colcompress merge on clean: dirty_units still 0", dirty_clean, "0")
+
+        # delete rows to dirty stripes
+        self.exec("DELETE FROM _tmerge_col WHERE id BETWEEN 1 AND 500")
+
+        dirty_pre = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_col'"
+        )
+        self.check("colcompress after DELETE: has dirty_units before merge",
+                   dirty_pre.isdigit() and int(dirty_pre) > 0,
+                   f"got {dirty_pre!r}")
+
+        # run merge
+        rc_merge, err_merge = self.exec(
+            "CALL engine.colcompress_merge_incremental('_tmerge_col')"
+        )
+        self.check("colcompress_merge_incremental: no error", rc_merge == 0,
+                   err_merge[:200] if err_merge else "")
+
+        # dirty_units must be 0 after merge
+        dirty_post = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_col'"
+        )
+        self.check_eq("colcompress after merge: dirty_units = 0", dirty_post, "0")
+
+        # tombstone_rows must be 0 after merge
+        tomb_post = self.q1(
+            "SELECT tombstone_rows FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_col'"
+        )
+        self.check_eq("colcompress after merge: tombstone_rows = 0", tomb_post, "0")
+
+        # live_rows preserved (500 deleted, 49500 remain)
+        cnt_after = self.q1("SELECT count(*) FROM _tmerge_col")
+        self.check_eq("colcompress after merge: live_rows = 49500", cnt_after, "49500")
+
+        # data correctness: specific row survives
+        spot = self.q1("SELECT val FROM _tmerge_col WHERE id = 50000")
+        self.check_eq("colcompress after merge: data correct (id=50000 readable)",
+                      spot, "col" * 50)
+
+        # deleted rows are gone
+        cnt_deleted = self.q1("SELECT count(*) FROM _tmerge_col WHERE id BETWEEN 1 AND 500")
+        self.check_eq("colcompress after merge: deleted rows are gone", cnt_deleted, "0")
+
+        # idempotent: second call is a no-op
+        rc_idem, _ = self.exec("CALL engine.colcompress_merge_incremental('_tmerge_col')")
+        self.check("colcompress_merge_incremental: idempotent (no error on re-call)",
+                   rc_idem == 0)
+
+        dirty_idem = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_col'"
+        )
+        self.check_eq("colcompress_merge_incremental: dirty_units=0 after idempotent call",
+                      dirty_idem, "0")
+
+        # fully-dead stripe: delete all rows in a stripe, merge should clean metadata only
+        self.exec("""
+            DROP TABLE IF EXISTS _tmerge_col_dead;
+            CREATE TABLE _tmerge_col_dead (id int, val text) USING colcompress;
+            INSERT INTO _tmerge_col_dead SELECT i, 'dead' FROM generate_series(1,10000) i;
+        """)
+        # delete everything (all stripes become fully dead)
+        self.exec("DELETE FROM _tmerge_col_dead")
+
+        total_dead = self.q1(
+            "SELECT total_units FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_col_dead'"
+        )
+        self.check("colcompress fully-dead: total_units > 0 before merge",
+                   total_dead.isdigit() and int(total_dead) > 0,
+                   f"got {total_dead!r}")
+
+        rc_dead, err_dead = self.exec(
+            "CALL engine.colcompress_merge_incremental('_tmerge_col_dead')"
+        )
+        self.check("colcompress fully-dead stripe: merge succeeds", rc_dead == 0,
+                   err_dead[:200] if err_dead else "")
+
+        dirty_dead_post = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_col_dead'"
+        )
+        self.check_eq("colcompress fully-dead: dirty_units = 0 after merge",
+                      dirty_dead_post, "0")
+
+        cnt_dead_post = self.q1("SELECT count(*) FROM _tmerge_col_dead")
+        self.check_eq("colcompress fully-dead: table is empty after merge",
+                      cnt_dead_post, "0")
+
+        # error: non-colcompress table
+        self.exec("""
+            DROP TABLE IF EXISTS _tmerge_col_not;
+            CREATE TABLE _tmerge_col_not (id int) USING rowcompress;
+        """)
+        rc_err, _ = self.exec(
+            "CALL engine.colcompress_merge_incremental('_tmerge_col_not')"
+        )
+        self.check("colcompress_merge_incremental: error on non-colcompress table",
+                   rc_err != 0)
+
+        # error: max_stripes = 0
+        rc_err2, _ = self.exec(
+            "CALL engine.colcompress_merge_incremental('_tmerge_col', max_stripes => 0)"
+        )
+        self.check("colcompress_merge_incremental: error on max_stripes=0", rc_err2 != 0)
+
+    # ------------------------------------------------------------------ rowcompress_merge_incremental (Phase 3)
+
+    def test_rowcompress_merge_incremental(self) -> None:
+        self.section("Phase 3 — rowcompress_merge_incremental")
+
+        self.exec("""
+            DROP TABLE IF EXISTS _tmerge_row;
+            CREATE TABLE _tmerge_row (id int, val text) USING rowcompress;
+            INSERT INTO _tmerge_row SELECT i, repeat('row', 50) FROM generate_series(1,50000) i;
+        """)
+
+        cnt_before = self.q1("SELECT count(*) FROM _tmerge_row")
+        self.check_eq("rowcompress merge: 50000 rows before any delete", cnt_before, "50000")
+
+        # clean table: merge is a no-op
+        rc_noop, err_noop = self.exec("CALL engine.rowcompress_merge_incremental('_tmerge_row')")
+        self.check("rowcompress_merge_incremental on clean table: no error",
+                   rc_noop == 0, err_noop[:200] if err_noop else "")
+
+        dirty_clean = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_row'"
+        )
+        self.check_eq("rowcompress merge on clean: dirty_units = 0", dirty_clean, "0")
+
+        # delete rows to dirty batches
+        self.exec("DELETE FROM _tmerge_row WHERE id BETWEEN 1 AND 300")
+
+        dirty_pre = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_row'"
+        )
+        self.check("rowcompress after DELETE: has dirty_units before merge",
+                   dirty_pre.isdigit() and int(dirty_pre) > 0,
+                   f"got {dirty_pre!r}")
+
+        tomb_pre = self.q1(
+            "SELECT tombstone_rows FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_row'"
+        )
+        self.check("rowcompress after DELETE: tombstone_rows > 0 before merge",
+                   tomb_pre.isdigit() and int(tomb_pre) > 0,
+                   f"got {tomb_pre!r}")
+
+        # run merge
+        rc_merge, err_merge = self.exec(
+            "CALL engine.rowcompress_merge_incremental('_tmerge_row')"
+        )
+        self.check("rowcompress_merge_incremental: no error", rc_merge == 0,
+                   err_merge[:200] if err_merge else "")
+
+        # dirty_units = 0 after merge
+        dirty_post = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_row'"
+        )
+        self.check_eq("rowcompress after merge: dirty_units = 0", dirty_post, "0")
+
+        # live_rows preserved (300 deleted, 49700 remain)
+        cnt_after = self.q1("SELECT count(*) FROM _tmerge_row")
+        self.check_eq("rowcompress after merge: live_rows = 49700", cnt_after, "49700")
+
+        # data correctness: specific row readable
+        spot = self.q1("SELECT val FROM _tmerge_row WHERE id = 50000")
+        self.check_eq("rowcompress after merge: data correct (id=50000 readable)",
+                      spot, "row" * 50)
+
+        # deleted rows are gone
+        cnt_deleted = self.q1("SELECT count(*) FROM _tmerge_row WHERE id BETWEEN 1 AND 300")
+        self.check_eq("rowcompress after merge: deleted rows are gone", cnt_deleted, "0")
+
+        # idempotent
+        rc_idem, _ = self.exec("CALL engine.rowcompress_merge_incremental('_tmerge_row')")
+        self.check("rowcompress_merge_incremental: idempotent (no error on re-call)",
+                   rc_idem == 0)
+
+        dirty_idem = self.q1(
+            "SELECT dirty_units FROM engine.storage_health "
+            "WHERE table_name = '_tmerge_row'"
+        )
+        self.check_eq("rowcompress_merge_incremental: dirty_units=0 after idempotent call",
+                      dirty_idem, "0")
+
+        # MVCC correctness: merged batch should still return only live rows
+        cnt_live = self.q1(
+            "SELECT count(*) FROM _tmerge_row WHERE id BETWEEN 301 AND 50000"
+        )
+        self.check_eq("rowcompress after merge: MVCC — 49700 live rows accessible",
+                      cnt_live, "49700")
+
+        # error: non-rowcompress table
+        self.exec("""
+            DROP TABLE IF EXISTS _tmerge_row_not;
+            CREATE TABLE _tmerge_row_not (id int) USING colcompress;
+        """)
+        rc_err, _ = self.exec(
+            "CALL engine.rowcompress_merge_incremental('_tmerge_row_not')"
+        )
+        self.check("rowcompress_merge_incremental: error on non-rowcompress table",
+                   rc_err != 0)
+
+        # error: max_batches = 0
+        rc_err2, _ = self.exec(
+            "CALL engine.rowcompress_merge_incremental('_tmerge_row', max_batches => 0)"
+        )
+        self.check("rowcompress_merge_incremental: error on max_batches=0", rc_err2 != 0)
+
     # ------------------------------------------------------------------ upgrade path
 
     def test_upgrade_path(self) -> None:
@@ -1031,19 +1627,19 @@ class TestRunner:
             "SELECT max(version) FROM pg_available_extension_versions "
             "WHERE name = 'storage_engine'"
         )
-        self.check("latest available version = 1.3.4", ver == "1.3.4", f"got {ver!r}")
+        self.check("latest available version = 2.1.0", ver == "2.1.0", f"got {ver!r}")
 
-        # Complete upgrade path from 1.0 to 1.3.4 exists
+        # Complete upgrade path from 1.0 to 2.1.0 exists
         path = self.q1(
             "SELECT path FROM pg_extension_update_paths('storage_engine') "
-            "WHERE source = '1.0' AND target = '1.3.4'"
+            "WHERE source = '1.0' AND target = '2.1.0'"
         )
-        self.check("upgrade path 1.0 \u2192 1.3.4 exists", path != "", f"path={path!r}")
+        self.check("upgrade path 1.0 → 2.1.0 exists", path != "", f"path={path!r}")
 
         # Each individual upgrade step
         steps = [
-            ("1.0", "1.1"),
-            ("1.1", "1.2.0"),
+            ("1.0",   "1.1"),
+            ("1.1",   "1.2.0"),
             ("1.2.0", "1.2.1"),
             ("1.2.1", "1.2.2"),
             ("1.2.2", "1.2.3"),
@@ -1058,6 +1654,9 @@ class TestRunner:
             ("1.3.1", "1.3.2"),
             ("1.3.2", "1.3.3"),
             ("1.3.3", "1.3.4"),
+            ("1.3.4", "2.0.0"),
+            ("2.0.0", "2.0.1"),
+            ("2.0.1", "2.1.0"),
         ]
         for src, tgt in steps:
             p = self.q1(
@@ -1091,6 +1690,10 @@ class TestRunner:
         self.test_explain_plan()
         self.test_parallel_safety()
         self.test_vecgroupagg()
+        self.test_maintenance_api()
+        self.test_storage_health()
+        self.test_colcompress_merge_incremental()
+        self.test_rowcompress_merge_incremental()
         self.test_upgrade_path()
 
         self.teardown()
