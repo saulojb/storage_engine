@@ -903,6 +903,124 @@ class TestRunner:
                 f"vectorized={t_vec:.3f}ms native={t_nat:.3f}ms",
             )
 
+    # ------------------------------------------------------------------ VecGroupAgg
+
+    def test_vecgroupagg(self) -> None:
+        self.section("VecGroupAgg — GROUP BY correctness")
+
+        pfx_on  = ("SET storage_engine.enable_vectorization=on; "
+                   "SET storage_engine.enable_vectorized_groupagg=on; "
+                   "SET max_parallel_workers_per_gather=4; "
+                   "SET parallel_setup_cost=0; SET parallel_tuple_cost=0; "
+                   "SET min_parallel_table_scan_size=0; "
+                   "SET min_parallel_index_scan_size=0;")
+        pfx_off = ("SET storage_engine.enable_vectorization=off; "
+                   "SET storage_engine.enable_vectorized_groupagg=off; "
+                   "SET max_parallel_workers_per_gather=0;")
+
+        # --- setup ---
+        self.exec("""
+            DROP TABLE IF EXISTS _tgrp;
+            CREATE TABLE _tgrp (
+                country char(2),
+                cat     integer,
+                val     float8,
+                m       money
+            ) USING colcompress;
+            INSERT INTO _tgrp
+            SELECT
+                (ARRAY['BR','US','JP'])[1 + (i % 3)],
+                1 + (i % 5),
+                CASE WHEN i % 7  = 0 THEN NULL ELSE i * 1.5       END,
+                CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 0.99)::money END
+            FROM generate_series(1, 1500000) i;
+            ANALYZE _tgrp;
+
+            DROP TABLE IF EXISTS _tgrp2;
+            CREATE TABLE _tgrp2 (k1 integer, k2 integer, v bigint) USING colcompress;
+            INSERT INTO _tgrp2
+                SELECT i % 50, i % 20, i FROM generate_series(1, 2000000) i;
+            ANALYZE _tgrp2;
+        """)
+
+        # 1. Single-key GROUP BY — correctness VEC ON == VEC OFF
+        single_sql = ("SELECT country, count(*), count(val), "
+                      "min(val), max(val), round(sum(val)::numeric, 2), "
+                      "min(m), max(m), sum(m) "
+                      "FROM _tgrp GROUP BY country ORDER BY country")
+        r_off = self.q(f"{pfx_off} {single_sql}")
+        r_on  = self.q(f"{pfx_on}  {single_sql}")
+        self.check("single-key GROUP BY: VEC ON == VEC OFF", r_off == r_on,
+                   f"OFF={r_off[:200]!r}  ON={r_on[:200]!r}")
+
+        # 2. Single-key: EXPLAIN shows VecGroupAgg
+        # Force HashAgg: disable sort so planner can't pick GroupAggregate
+        plan = self.q(f"{pfx_on} SET enable_sort=off; EXPLAIN {single_sql}")
+        self.check("single-key GROUP BY: EXPLAIN shows StorageEngineVectorGroupAgg",
+                   "StorageEngineVectorGroupAgg" in plan, plan[:400])
+
+        # 3. COUNT(col) with NULLs — val has NULLs every 7th row
+        null_sql = ("SELECT country, count(*) AS cs, count(val) AS cv "
+                    "FROM _tgrp GROUP BY country ORDER BY country")
+        r_off2 = self.q(f"{pfx_off} {null_sql}")
+        r_on2  = self.q(f"{pfx_on}  {null_sql}")
+        self.check("COUNT(col) NULL-aware GROUP BY: VEC ON == VEC OFF",
+                   r_off2 == r_on2, f"OFF={r_off2!r}  ON={r_on2!r}")
+
+        # COUNT(*) > COUNT(col) because val has NULLs
+        r_diff = self.q(
+            f"{pfx_on} SELECT bool_and(cs > cv) FROM ({null_sql}) x"
+        )
+        self.check("COUNT(col) NULL-aware: count(*) > count(val) for all groups",
+                   r_diff.strip() == "t", f"got {r_diff!r}")
+
+        # 4. Composite GROUP BY (2 keys) — correctness
+        composite_sql = ("SELECT country, cat, count(*), count(val), "
+                         "round(sum(val)::numeric, 2), sum(m) "
+                         "FROM _tgrp GROUP BY country, cat ORDER BY country, cat")
+        r_off3 = self.q(f"{pfx_off} {composite_sql}")
+        r_on3  = self.q(f"{pfx_on}  {composite_sql}")
+        self.check("composite GROUP BY (2 keys): VEC ON == VEC OFF",
+                   r_off3 == r_on3, f"OFF={r_off3[:200]!r}  ON={r_on3[:200]!r}")
+
+        # 5. Composite GROUP BY: EXPLAIN shows VecGroupAgg
+        # Disable parallel to get a plain HashAggregate (not Finalize/Partial split)
+        # which the hook can intercept on all PG versions
+        plan2 = self.q(f"{pfx_on} SET max_parallel_workers_per_gather=0; EXPLAIN "
+                       "SELECT k1, k2, count(*), sum(v) FROM _tgrp2 GROUP BY k1, k2")
+        self.check("composite GROUP BY (2 int keys): EXPLAIN shows StorageEngineVectorGroupAgg",
+                   "StorageEngineVectorGroupAgg" in plan2, plan2[:400])
+
+        # 6. HAVING — must still produce correct results (applied by Finalize node)
+        having_sql = ("SELECT country, count(*) FROM _tgrp "
+                      "GROUP BY country HAVING count(*) > 50000 ORDER BY country")
+        r_off4 = self.q(f"{pfx_off} {having_sql}")
+        r_on4  = self.q(f"{pfx_on}  {having_sql}")
+        self.check("HAVING: VEC ON == VEC OFF (correct results)",
+                   r_off4 == r_on4, f"OFF={r_off4!r}  ON={r_on4!r}")
+
+        # HAVING must not be empty (all 3 groups have 100k rows > 50k)
+        rows = [ln for ln in r_on4.strip().split("\n") if ln]
+        self.check("HAVING: returns 3 groups (count > 50000)", len(rows) == 3,
+                   f"rows={rows!r}")
+
+        # 7. money (CASHOID) GROUP BY — correctness
+        money_sql = ("SELECT country, count(m), min(m), max(m), sum(m) "
+                     "FROM _tgrp GROUP BY country ORDER BY country")
+        r_off5 = self.q(f"{pfx_off} {money_sql}")
+        r_on5  = self.q(f"{pfx_on}  {money_sql}")
+        self.check("money (CASHOID) GROUP BY: VEC ON == VEC OFF",
+                   r_off5 == r_on5, f"OFF={r_off5[:200]!r}  ON={r_on5[:200]!r}")
+
+        # 8. Composite GROUP BY (3 keys)
+        three_key_sql = ("SELECT country, cat, val IS NULL AS vn, count(*) "
+                         "FROM _tgrp GROUP BY country, cat, val IS NULL "
+                         "ORDER BY country, cat, vn")
+        r_off6 = self.q(f"{pfx_off} {three_key_sql}")
+        r_on6  = self.q(f"{pfx_on}  {three_key_sql}")
+        self.check("composite GROUP BY (3 keys): VEC ON == VEC OFF",
+                   r_off6 == r_on6, f"OFF={r_off6[:200]!r}  ON={r_on6[:200]!r}")
+
     # ------------------------------------------------------------------ upgrade path
 
     def test_upgrade_path(self) -> None:
@@ -972,6 +1090,7 @@ class TestRunner:
         self.test_null_handling()
         self.test_explain_plan()
         self.test_parallel_safety()
+        self.test_vecgroupagg()
         self.test_upgrade_path()
 
         self.teardown()
@@ -1001,16 +1120,25 @@ def main() -> None:
                         help="Also run tests on the secondary PostgreSQL instance")
     parser.add_argument("--pg19-port", type=int, default=5433, dest="pg19_port",
                         help="Secondary PostgreSQL port (default: 5433)")
+    parser.add_argument("--ports",    type=str, default=None,
+                        help="Comma-separated list of PostgreSQL ports to test "
+                             "(overrides --port / --pg19, e.g. 5436,5434,5435,5432,5433)")
     args = parser.parse_args()
 
     all_ok = True
 
-    r1 = TestRunner(args.port, label=f"PG@{args.port}")
-    all_ok = r1.run_all() and all_ok
+    if args.ports:
+        ports = [int(p.strip()) for p in args.ports.split(",") if p.strip()]
+        for port in ports:
+            r = TestRunner(port, label=f"PG@{port}")
+            all_ok = r.run_all() and all_ok
+    else:
+        r1 = TestRunner(args.port, label=f"PG@{args.port}")
+        all_ok = r1.run_all() and all_ok
 
-    if args.pg19:
-        r2 = TestRunner(args.pg19_port, label=f"PG@{args.pg19_port}")
-        all_ok = r2.run_all() and all_ok
+        if args.pg19:
+            r2 = TestRunner(args.pg19_port, label=f"PG@{args.pg19_port}")
+            all_ok = r2.run_all() and all_ok
 
     sys.exit(0 if all_ok else 1)
 

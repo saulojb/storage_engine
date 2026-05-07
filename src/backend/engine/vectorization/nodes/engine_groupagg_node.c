@@ -34,6 +34,7 @@
 #include "utils/array.h"
 #include "utils/datum.h"
 #include "utils/hsearch.h"
+#include "common/hashfn.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/typcache.h"
@@ -92,91 +93,273 @@ type_oid_to_vectype(Oid typeoid)
 		case INT8OID:	return VECGAGG_TYPE_INT8;
 		case FLOAT4OID:	return VECGAGG_TYPE_FLOAT4;
 		case FLOAT8OID:	return VECGAGG_TYPE_FLOAT8;
+		case NUMERICOID:	return VECGAGG_TYPE_NUMERIC;
 		case BPCHAROID:	return VECGAGG_TYPE_BPCHAR;
 		case TEXTOID:	return VECGAGG_TYPE_TEXT;
+		case CASHOID:	return VECGAGG_TYPE_INT8;
 		default:		return -1;
 	}
 }
 
 static void
-build_group_key(VecGroupAggState *state, Datum key, bool isnull, VecGroupKey *hkey)
+ensure_numeric_fmgr(VecGroupAggState *state)
 {
-	MemSet(hkey, 0, sizeof(*hkey));
-	hkey->key_type = state->key_col_type;
-	hkey->isnull = isnull;
+	Oid numeric_add_oid;
+	Oid numeric_cmp_oid;
+	Oid numeric_avg_oid;
+	Oid numeric_sum_oid;
 
-	if (isnull)
+	if (state->numeric_fmgr_ready)
 		return;
 
-	switch (state->key_col_type)
+	numeric_add_oid = fmgr_internal_function("numeric_add");
+	numeric_cmp_oid = fmgr_internal_function("numeric_cmp");
+	numeric_avg_oid = fmgr_internal_function("numeric_avg");
+	numeric_sum_oid = fmgr_internal_function("numeric_sum");
+	if (!OidIsValid(numeric_add_oid) || !OidIsValid(numeric_cmp_oid) ||
+		!OidIsValid(numeric_avg_oid) || !OidIsValid(numeric_sum_oid))
+		elog(ERROR, "failed to resolve required numeric functions");
+
+	fmgr_info_cxt(numeric_add_oid, &state->numeric_add_fmgr, state->agg_context);
+	fmgr_info_cxt(numeric_cmp_oid, &state->numeric_cmp_fmgr, state->agg_context);
+	fmgr_info_cxt(fmgr_internal_function("numeric_avg_accum"),
+			  &state->numeric_avg_accum_fmgr,
+			  state->agg_context);
+	fmgr_info_cxt(fmgr_internal_function("numeric_avg_serialize"),
+			  &state->numeric_avg_serialize_fmgr,
+			  state->agg_context);
+	fmgr_info_cxt(numeric_avg_oid, &state->numeric_avg_fmgr, state->agg_context);
+	fmgr_info_cxt(numeric_sum_oid, &state->numeric_sum_fmgr, state->agg_context);
+
+	state->numeric_fmgr_ready = true;
+}
+
+static void
+ensure_int8_avg_serialize_fmgr(VecGroupAggState *state)
+{
+	Oid		fn_oid;
+
+	if (state->int8_avg_serialize_ready)
+		return;
+
+	fn_oid = fmgr_internal_function("int8_avg_serialize");
+	if (!OidIsValid(fn_oid))
+		elog(ERROR, "failed to resolve int8_avg_serialize");
+	fmgr_info_cxt(fn_oid, &state->int8_avg_serialize_fmgr, state->agg_context);
+
+	state->int8_avg_serialize_ready = true;
+}
+
+static Datum
+call_numeric_binary_fmgr(FmgrInfo *flinfo,
+				 Datum arg0,
+				 bool arg0isnull,
+				 Datum arg1,
+				 bool arg1isnull,
+				 Node *context)
+{
+	LOCAL_FCINFO(inner_fcinfo, 2);
+
+	InitFunctionCallInfoData(*inner_fcinfo, flinfo, 2,
+				 InvalidOid,
+				 context, NULL);
+	inner_fcinfo->args[0].value = arg0;
+	inner_fcinfo->args[0].isnull = arg0isnull;
+	inner_fcinfo->args[1].value = arg1;
+	inner_fcinfo->args[1].isnull = arg1isnull;
+
+	return FunctionCallInvoke(inner_fcinfo);
+}
+
+static Datum
+call_numeric_unary_fmgr(FmgrInfo *flinfo,
+				Datum arg0,
+				bool arg0isnull,
+				Node *context)
+{
+	LOCAL_FCINFO(inner_fcinfo, 1);
+
+	InitFunctionCallInfoData(*inner_fcinfo, flinfo, 1,
+				 InvalidOid,
+				 context, NULL);
+	inner_fcinfo->args[0].value = arg0;
+	inner_fcinfo->args[0].isnull = arg0isnull;
+
+	return FunctionCallInvoke(inner_fcinfo);
+}
+
+static Datum
+coerce_value_to_numeric(VecGroupAggTarget *tgt, Datum val)
+{
+	switch (tgt->col_type)
 	{
-		case VECGAGG_TYPE_BPCHAR:
-		case VECGAGG_TYPE_TEXT:
-		{
-			text   *txt = DatumGetTextPP(key);
-			int		len = VARSIZE_ANY_EXHDR(txt);
-
-			if (len > (int) sizeof(hkey->text_key))
-				ereport(ERROR,
-						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("VectorGroupAgg: textual GROUP BY key too long (%d > %zu)",
-								len, sizeof(hkey->text_key))));
-
-			hkey->text_len = (int16) len;
-			memcpy(hkey->text_key, VARDATA_ANY(txt), len);
-			break;
-		}
+		case VECGAGG_TYPE_INT4:
+			return DirectFunctionCall1(int8_numeric,
+							   Int64GetDatum((int64) DatumGetInt32(val)));
+		case VECGAGG_TYPE_INT8:
+			return DirectFunctionCall1(int8_numeric, Int64GetDatum(DatumGetInt64(val)));
+		case VECGAGG_TYPE_FLOAT4:
+			return DirectFunctionCall1(float8_numeric,
+							   Float8GetDatum((float8) DatumGetFloat4(val)));
+		case VECGAGG_TYPE_FLOAT8:
+			return DirectFunctionCall1(float8_numeric, Float8GetDatum(DatumGetFloat8(val)));
+		case VECGAGG_TYPE_NUMERIC:
+			return val;
 		default:
-			hkey->key = key;
-			break;
+			return (Datum) 0;
 	}
 }
 
 /*
- * Initialize per-group HTAB.
+ * Build a composite VecGroupKey from arrays of key values.
+ * text/bpchar keys are stored inline in text_key[ki]; all keys also store
+ * the original Datum in key[ki] for use by fill_and_store_slot.
+ */
+static void
+build_composite_key(VecGroupAggState *state, Datum keys[], bool isnulls[],
+					VecGroupKey *hkey)
+{
+	int ki;
+	MemSet(hkey, 0, sizeof(*hkey));
+	hkey->num_keys = state->num_keys;
+
+	for (ki = 0; ki < state->num_keys; ki++)
+	{
+		hkey->key_type[ki] = state->key_col_type[ki];
+		hkey->isnull[ki]   = isnulls[ki];
+
+		if (isnulls[ki])
+			continue;
+
+		hkey->key[ki] = keys[ki];	/* store original Datum for all types */
+
+		if (state->key_col_type[ki] == VECGAGG_TYPE_BPCHAR ||
+			state->key_col_type[ki] == VECGAGG_TYPE_TEXT)
+		{
+			text   *txt = DatumGetTextPP(keys[ki]);
+			int		len = VARSIZE_ANY_EXHDR(txt);
+
+			if (len > (int) sizeof(hkey->text_key[ki]))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("VectorGroupAgg: GROUP BY key too long (%d > %zu)",
+								len, sizeof(hkey->text_key[ki]))));
+			hkey->text_len[ki] = (int16) len;
+			memcpy(hkey->text_key[ki], VARDATA_ANY(txt), len);
+		}
+	}
+}
+
+/* ----------------------------------------------------------------
+ *  Custom HTAB hash and compare callbacks for composite keys
+ * ---------------------------------------------------------------- */
+
+static uint32
+vecgroupkey_hash(const void *key, Size keysize)
+{
+	const VecGroupKey *gk = (const VecGroupKey *) key;
+	uint32	hash = 0;
+	int		ki;
+
+	for (ki = 0; ki < gk->num_keys; ki++)
+	{
+		uint32 kh;
+
+		if (gk->isnull[ki])
+		{
+			kh = 0xdeadbeef;  /* NULLs hash to a fixed value */
+		}
+		else if (gk->key_type[ki] == VECGAGG_TYPE_BPCHAR ||
+				 gk->key_type[ki] == VECGAGG_TYPE_TEXT)
+		{
+			kh = hash_bytes((const unsigned char *) gk->text_key[ki],
+							(int) gk->text_len[ki]);
+		}
+		else
+		{
+			kh = hash_bytes((const unsigned char *) &gk->key[ki],
+							sizeof(Datum));
+		}
+		/* combine per standard hash mixing */
+		hash ^= kh + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+	}
+	return hash;
+}
+
+static int
+vecgroupkey_compare(const void *key1, const void *key2, Size keysize)
+{
+	const VecGroupKey *a = (const VecGroupKey *) key1;
+	const VecGroupKey *b = (const VecGroupKey *) key2;
+	int		ki;
+
+	if (a->num_keys != b->num_keys)
+		return a->num_keys - b->num_keys;
+
+	for (ki = 0; ki < a->num_keys; ki++)
+	{
+		if (a->isnull[ki] && b->isnull[ki])
+			continue;
+		if (a->isnull[ki] != b->isnull[ki])
+			return a->isnull[ki] ? 1 : -1;
+
+		if (a->key_type[ki] == VECGAGG_TYPE_BPCHAR ||
+			a->key_type[ki] == VECGAGG_TYPE_TEXT)
+		{
+			int minlen = (a->text_len[ki] < b->text_len[ki])
+						 ? a->text_len[ki] : b->text_len[ki];
+			int cmp = memcmp(a->text_key[ki], b->text_key[ki], minlen);
+			if (cmp != 0) return cmp;
+			if (a->text_len[ki] != b->text_len[ki])
+				return (a->text_len[ki] < b->text_len[ki]) ? -1 : 1;
+		}
+		else
+		{
+			/* by-value or by-ref (Datum comparison) */
+			if (a->key[ki] != b->key[ki])
+				return (a->key[ki] < b->key[ki]) ? -1 : 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Initialize per-group HTAB with custom hash+compare for composite keys.
  */
 static HTAB *
 create_group_htab(VecGroupAggState *state, MemoryContext ctx)
 {
 	HASHCTL		ctl;
 	MemSet(&ctl, 0, sizeof(ctl));
-	/*
-	 * For textual keys, hash on the inline (type,isnull,text_len,text_key)
-	 * portion only. Including Datum key would hash pointer identity and make
-	 * equal text values fail to match.
-	 */
-	if (state->key_col_type == VECGAGG_TYPE_BPCHAR ||
-		state->key_col_type == VECGAGG_TYPE_TEXT)
-		ctl.keysize = offsetof(VecGroupKey, key);
-	else
-		ctl.keysize = sizeof(VecGroupKey);
-	ctl.entrysize	= sizeof(VecGroupEntry);
-	ctl.hcxt		= ctx;
+	ctl.keysize	  = sizeof(VecGroupKey);
+	ctl.entrysize = sizeof(VecGroupEntry);
+	ctl.hcxt	  = ctx;
+	ctl.hash	  = vecgroupkey_hash;
+	ctl.match	  = vecgroupkey_compare;
 	return hash_create("VecGroupAgg groups",
 					   256,
 					   &ctl,
-					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+					   HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
 }
 
 /*
- * Lookup or create a group entry for the given key.
+ * Lookup or create a group entry for a composite key.
+ * hkey must already be filled by build_composite_key().
  */
 static VecGroupEntry *
-lookup_or_create_group(VecGroupAggState *state, Datum key, bool isnull)
+lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 {
-	VecGroupKey		hkey;
 	VecGroupEntry  *entry;
 	bool			found;
 
-	build_group_key(state, key, isnull, &hkey);
-
 	entry = (VecGroupEntry *) hash_search(state->group_htab,
-										  &hkey,
+										  hkey,
 										  HASH_ENTER,
 										  &found);
 	if (!found)
 	{
-		int i;
+		int			ki, i;
+		MemoryContext	oldctx;
 
 		if (state->num_groups >= VECGROUPAGG_MAX_GROUPS)
 			ereport(ERROR,
@@ -184,16 +367,39 @@ lookup_or_create_group(VecGroupAggState *state, Datum key, bool isnull)
 					 errmsg("VectorGroupAgg: too many distinct groups (limit %d)",
 							VECGROUPAGG_MAX_GROUPS)));
 
-		/* Initialize new entry — k.key/k.isnull serve as both the HTAB
-		 * lookup key AND the values we emit in fill_and_store_slot. */
-		entry->k.key     = isnull ? (Datum) 0 : datumCopy(key, state->key_typbyval, state->key_typlen);
-		entry->k.isnull  = isnull;
+		/*
+		 * For by-reference key types, make stable copies in agg_context.
+		 * For text/bpchar, also re-extract inline text from the stable copy
+		 * so the hash/compare inline bytes stay valid.
+		 */
+		oldctx = MemoryContextSwitchTo(state->agg_context);
+		for (ki = 0; ki < state->num_keys; ki++)
+		{
+			if (!hkey->isnull[ki] && !state->key_typbyval[ki])
+			{
+				entry->k.key[ki] = datumCopy(entry->k.key[ki],
+											 false,
+											 state->key_typlen[ki]);
+				if (hkey->key_type[ki] == VECGAGG_TYPE_BPCHAR ||
+					hkey->key_type[ki] == VECGAGG_TYPE_TEXT)
+				{
+					text *txt = DatumGetTextPP(entry->k.key[ki]);
+					int   len = VARSIZE_ANY_EXHDR(txt);
+					entry->k.text_len[ki] = (int16) len;
+					memcpy(entry->k.text_key[ki], VARDATA_ANY(txt), len);
+				}
+			}
+		}
+		MemoryContextSwitchTo(oldctx);
 
 		for (i = 0; i < state->num_targets; i++)
 		{
-			entry->int64_acc[i]		= 0;
-			entry->float8_acc[i]	= 0.0;
-			entry->acc_isnull[i]	= true;	/* NULL until first non-null input */
+			entry->int64_acc[i]			= 0;
+			entry->avg_count_acc[i]		= 0;
+			entry->float8_acc[i]		= 0.0;
+			entry->numeric_acc[i]		= (Datum) 0;
+			entry->numeric_state_acc[i]	= (Datum) 0;
+			entry->acc_isnull[i]		= true;
 		}
 
 		state->num_groups++;
@@ -206,7 +412,8 @@ lookup_or_create_group(VecGroupAggState *state, Datum key, bool isnull)
  * Accumulate one value into a group entry for aggregate target t.
  */
 static void
-accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
+accumulate_value(VecGroupAggState *state, VecGroupEntry *entry,
+			 int t_idx, VecGroupAggTarget *tgt,
 				 Datum val, bool isnull)
 {
 	if (tgt->agg_kind == VECGAGG_COUNT_STAR)
@@ -217,12 +424,43 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 		return;
 	}
 
+	if (tgt->agg_kind == VECGAGG_COUNT_COL)
+	{
+		/* count(col) counts only non-NULL rows */
+		if (!isnull)
+		{
+			entry->int64_acc[t_idx]++;
+			entry->acc_isnull[t_idx] = false;
+		}
+		return;
+	}
+
 	if (isnull)
 		return;		/* other aggregates skip NULLs */
 
 	switch (tgt->agg_kind)
 	{
 		case VECGAGG_SUM:
+			if (tgt->result_typeoid == NUMERICOID)
+			{
+				Datum numeric_val;
+				MemoryContext oldctx;
+
+				ensure_numeric_fmgr(state);
+				oldctx = MemoryContextSwitchTo(state->agg_context);
+				numeric_val = coerce_value_to_numeric(tgt, val);
+				entry->numeric_state_acc[t_idx] =
+					call_numeric_binary_fmgr(&state->numeric_avg_accum_fmgr,
+						entry->numeric_state_acc[t_idx],
+						entry->numeric_state_acc[t_idx] == (Datum) 0,
+						numeric_val,
+						false,
+						(Node *) &state->numeric_fake_aggstate);
+				entry->acc_isnull[t_idx] = false;
+				MemoryContextSwitchTo(oldctx);
+				break;
+			}
+
 			switch (tgt->col_type)
 			{
 				case VECGAGG_TYPE_INT4:
@@ -245,6 +483,46 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 			break;
 
 		case VECGAGG_AVG:
+			if (tgt->use_int8_avg_path)
+			{
+				/*
+				 * avg(int/bigint) partial: call the real aggtransfn resolved
+				 * from pg_aggregate at plan time.  The fmgr was pre-loaded in
+				 * BeginVecGroupAgg via avg_transfn_fmgr[t_idx].
+				 */
+				MemoryContext	oldctx;
+
+				oldctx = MemoryContextSwitchTo(state->agg_context);
+				entry->numeric_state_acc[t_idx] =
+					call_numeric_binary_fmgr(&state->avg_transfn_fmgr[t_idx],
+						entry->numeric_state_acc[t_idx],
+						entry->numeric_state_acc[t_idx] == (Datum) 0,
+						val, false,
+						(Node *) &state->numeric_fake_aggstate);
+				entry->acc_isnull[t_idx] = false;
+				MemoryContextSwitchTo(oldctx);
+				break;
+			}
+			if (tgt->result_typeoid == NUMERICOID)
+			{
+				Datum numeric_val;
+				MemoryContext oldctx;
+
+				ensure_numeric_fmgr(state);
+				oldctx = MemoryContextSwitchTo(state->agg_context);
+				numeric_val = coerce_value_to_numeric(tgt, val);
+				entry->numeric_state_acc[t_idx] =
+					call_numeric_binary_fmgr(&state->numeric_avg_accum_fmgr,
+						entry->numeric_state_acc[t_idx],
+						entry->numeric_state_acc[t_idx] == (Datum) 0,
+						numeric_val,
+						false,
+						(Node *) &state->numeric_fake_aggstate);
+				entry->acc_isnull[t_idx] = false;
+				MemoryContextSwitchTo(oldctx);
+				break;
+			}
+
 			switch (tgt->col_type)
 			{
 				case VECGAGG_TYPE_INT4:
@@ -256,9 +534,10 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 					entry->acc_isnull[t_idx] = false;
 					break;
 				case VECGAGG_TYPE_INT8:
-					if (!tgt->avg_input_as_float8)
-						break;
-					entry->float8_acc[t_idx] += (float8) DatumGetInt64(val);
+					if (tgt->avg_input_as_float8)
+						entry->float8_acc[t_idx] += (float8) DatumGetInt64(val);
+					else
+						entry->int64_acc[t_idx] += DatumGetInt64(val);
 					entry->avg_count_acc[t_idx]++;
 					entry->acc_isnull[t_idx] = false;
 					break;
@@ -278,6 +557,33 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 			break;
 
 		case VECGAGG_MIN:
+			if (tgt->result_typeoid == NUMERICOID)
+			{
+				Datum numeric_val;
+				MemoryContext oldctx;
+
+				ensure_numeric_fmgr(state);
+				oldctx = MemoryContextSwitchTo(state->agg_context);
+				numeric_val = coerce_value_to_numeric(tgt, val);
+				if (entry->acc_isnull[t_idx])
+				{
+					entry->numeric_acc[t_idx] = datumCopy(numeric_val, false, -1);
+					entry->acc_isnull[t_idx] = false;
+				}
+				else if (DatumGetInt32(call_numeric_binary_fmgr(
+						 &state->numeric_cmp_fmgr,
+						 entry->numeric_acc[t_idx],
+						 false,
+						 numeric_val,
+						 false,
+						 (Node *) &state->numeric_fake_aggstate)) > 0)
+				{
+					entry->numeric_acc[t_idx] = datumCopy(numeric_val, false, -1);
+				}
+				MemoryContextSwitchTo(oldctx);
+				break;
+			}
+
 			switch (tgt->col_type)
 			{
 				case VECGAGG_TYPE_INT4:
@@ -332,6 +638,33 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 			break;
 
 		case VECGAGG_MAX:
+			if (tgt->result_typeoid == NUMERICOID)
+			{
+				Datum numeric_val;
+				MemoryContext oldctx;
+
+				ensure_numeric_fmgr(state);
+				oldctx = MemoryContextSwitchTo(state->agg_context);
+				numeric_val = coerce_value_to_numeric(tgt, val);
+				if (entry->acc_isnull[t_idx])
+				{
+					entry->numeric_acc[t_idx] = datumCopy(numeric_val, false, -1);
+					entry->acc_isnull[t_idx] = false;
+				}
+				else if (DatumGetInt32(call_numeric_binary_fmgr(
+						 &state->numeric_cmp_fmgr,
+						 entry->numeric_acc[t_idx],
+						 false,
+						 numeric_val,
+						 false,
+						 (Node *) &state->numeric_fake_aggstate)) < 0)
+				{
+					entry->numeric_acc[t_idx] = datumCopy(numeric_val, false, -1);
+				}
+				MemoryContextSwitchTo(oldctx);
+				break;
+			}
+
 			switch (tgt->col_type)
 			{
 				case VECGAGG_TYPE_INT4:
@@ -388,10 +721,10 @@ accumulate_value(VecGroupEntry *entry, int t_idx, VecGroupAggTarget *tgt,
 }
 
 /*
- * Comparison context for qsort-based sorted emission.
- * We sort VecGroupEntry pointers by key value (NULLs last).
+ * Comparison context for qsort-based sorted emission (single-key only).
+ * Only used when sort_output=true and num_keys==1.
  */
-static int	g_key_col_type;	/* set before qsort call */
+static int	g_sort_key_type;	/* set before qsort call */
 
 static int
 vecgroup_entry_cmp(const void *a, const void *b)
@@ -400,48 +733,46 @@ vecgroup_entry_cmp(const void *a, const void *b)
 	const VecGroupEntry *eb = *(const VecGroupEntry **) b;
 
 	/* NULLs sort last */
-	if (ea->k.isnull && eb->k.isnull)
+	if (ea->k.isnull[0] && eb->k.isnull[0])
 		return 0;
-	if (ea->k.isnull)
+	if (ea->k.isnull[0])
 		return 1;
-	if (eb->k.isnull)
+	if (eb->k.isnull[0])
 		return -1;
 
-	switch (g_key_col_type)
+	switch (g_sort_key_type)
 	{
 		case VECGAGG_TYPE_INT4:
 		{
-			int64 va = DatumGetInt32(ea->k.key);
-			int64 vb = DatumGetInt32(eb->k.key);
+			int64 va = DatumGetInt32(ea->k.key[0]);
+			int64 vb = DatumGetInt32(eb->k.key[0]);
 			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
 		}
 		case VECGAGG_TYPE_INT8:
 		{
-			int64 va = DatumGetInt64(ea->k.key);
-			int64 vb = DatumGetInt64(eb->k.key);
+			int64 va = DatumGetInt64(ea->k.key[0]);
+			int64 vb = DatumGetInt64(eb->k.key[0]);
 			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
 		}
 		case VECGAGG_TYPE_FLOAT4:
 		{
-			float4 va = DatumGetFloat4(ea->k.key);
-			float4 vb = DatumGetFloat4(eb->k.key);
+			float4 va = DatumGetFloat4(ea->k.key[0]);
+			float4 vb = DatumGetFloat4(eb->k.key[0]);
 			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
 		}
 		case VECGAGG_TYPE_FLOAT8:
 		{
-			float8 va = DatumGetFloat8(ea->k.key);
-			float8 vb = DatumGetFloat8(eb->k.key);
+			float8 va = DatumGetFloat8(ea->k.key[0]);
+			float8 vb = DatumGetFloat8(eb->k.key[0]);
 			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
 		}
 		case VECGAGG_TYPE_BPCHAR:
 		case VECGAGG_TYPE_TEXT:
 		{
-			text   *ta = DatumGetTextPP(ea->k.key);
-			text   *tb = DatumGetTextPP(eb->k.key);
-			int		lena = VARSIZE_ANY_EXHDR(ta);
-			int		lenb = VARSIZE_ANY_EXHDR(tb);
-			int		minlen = (lena < lenb) ? lena : lenb;
-			int		cmp = memcmp(VARDATA_ANY(ta), VARDATA_ANY(tb), minlen);
+			int	 lena = ea->k.text_len[0];
+			int	 lenb = eb->k.text_len[0];
+			int	 minlen = (lena < lenb) ? lena : lenb;
+			int	 cmp = memcmp(ea->k.text_key[0], eb->k.text_key[0], minlen);
 
 			if (cmp != 0)
 				return cmp;
@@ -457,9 +788,9 @@ vecgroup_entry_cmp(const void *a, const void *b)
  * The slot has one VectorColumn per projected attribute.
  *
  * Attribute layout in the slot matches ColumnarReadNextVector output:
- *   key_attnum   → 0-based slot output position of the GROUP BY key
- *   col_attnum   → 0-based slot output position of the aggregate column
- *                  (-1 for count(*) which needs no column access)
+ *   key_attnum[ki]  - 0-based slot output position of the i-th GROUP BY key
+ *   col_attnum      - 0-based slot output position of the aggregate column
+ *                     (-1 for count(*) which needs no column access)
  */
 static void
 process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
@@ -467,52 +798,53 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 	VectorTupleTableSlot *vslot = (VectorTupleTableSlot *) slot;
 	uint32	dim = vslot->dimension;
 	uint32	i;
+	int		ki;
 
-	/* key_attnum is the 0-based slot output position (slot index) */
-	int		key_idx = state->key_attnum;
-	VectorColumn *key_col;
-
-	key_col = (state->key_is_const || key_idx < 0)
-		? NULL
-		: (VectorColumn *) slot->tts_values[key_idx];
+	/* Pre-fetch all key columns */
+	VectorColumn *key_cols[VECGROUPAGG_MAX_KEYS];
+	for (ki = 0; ki < state->num_keys; ki++)
+	{
+		int key_idx = state->key_attnum[ki];
+		key_cols[ki] = (state->key_is_const[ki] || key_idx < 0)
+			? NULL
+			: (VectorColumn *) slot->tts_values[key_idx];
+	}
 
 	for (i = 0; i < dim; i++)
 	{
-		/*
-		 * ColcompressScan keeps vector dimension fixed and marks rows that
-		 * survived quals in keep[]. Skip rows filtered out by quals.
-		 */
 		if (!vslot->keep[i])
 			continue;
 
-		/*
-		 * VectorColumn.value is a compact byte array where element i is at
-		 * byte offset (i * columnTypeLen), NOT at Datum pointer offset i*8.
-		 * Use fetch_att() to read correctly, matching ExtractTupleFromVectorSlot.
-		 */
-		Datum		key_val;
-		bool		key_null;
-		VecGroupEntry *entry;
-		int			t;
+		Datum			key_vals[VECGROUPAGG_MAX_KEYS];
+		bool			key_nulls[VECGROUPAGG_MAX_KEYS];
+		VecGroupKey		hkey;
+		VecGroupEntry  *entry;
+		int				t;
 
-		if (state->key_is_const)
+		for (ki = 0; ki < state->num_keys; ki++)
 		{
-			key_val = state->key_const;
-			key_null = state->key_const_isnull;
-		}
-		else if (key_col)
-		{
-			int8 *rawPtr = (int8 *) key_col->value + (int) key_col->columnTypeLen * i;
-			key_val  = fetch_att(rawPtr, key_col->columnIsVal, key_col->columnTypeLen);
-			key_null = key_col->isnull[i];
-		}
-		else
-		{
-			key_val  = (Datum) 0;
-			key_null = true;
+			if (state->key_is_const[ki])
+			{
+				key_vals[ki]  = state->key_const[ki];
+				key_nulls[ki] = state->key_const_isnull[ki];
+			}
+			else if (key_cols[ki])
+			{
+				int8 *rawPtr = (int8 *) key_cols[ki]->value +
+							  (int) key_cols[ki]->columnTypeLen * i;
+				key_vals[ki]  = fetch_att(rawPtr, key_cols[ki]->columnIsVal,
+										  key_cols[ki]->columnTypeLen);
+				key_nulls[ki] = key_cols[ki]->isnull[i];
+			}
+			else
+			{
+				key_vals[ki]  = (Datum) 0;
+				key_nulls[ki] = true;
+			}
 		}
 
-		entry = lookup_or_create_group(state, key_val, key_null);
+		build_composite_key(state, key_vals, key_nulls, &hkey);
+		entry = lookup_or_create_group(state, &hkey);
 
 		for (t = 0; t < state->num_targets; t++)
 		{
@@ -534,7 +866,7 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 				}
 			}
 
-			accumulate_value(entry, t, tgt, val, val_null);
+			accumulate_value(state, entry, t, tgt, val, val_null);
 		}
 	}
 }
@@ -556,9 +888,16 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 		slot->tts_isnull[i] = true;
 	}
 
-	/* Slot att key_result_attnum: group key */
-	slot->tts_values[state->key_result_attnum] = entry->k.key;
-	slot->tts_isnull[state->key_result_attnum] = entry->k.isnull;
+	/* Slot atts for all GROUP BY keys */
+	for (int ki = 0; ki < state->num_keys; ki++)
+	{
+		int kra = state->key_result_attnum[ki];
+		if (kra >= 0 && kra < natt)
+		{
+			slot->tts_values[kra] = entry->k.key[ki];
+			slot->tts_isnull[kra] = entry->k.isnull[ki];
+		}
+	}
 
 	/* Aggregate result atts */
 	for (t = 0; t < state->num_targets; t++)
@@ -581,11 +920,39 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 		switch (tgt->agg_kind)
 		{
 			case VECGAGG_COUNT_STAR:
+			case VECGAGG_COUNT_COL:
 				slot->tts_values[ra] = Int64GetDatum(entry->int64_acc[t]);
 				break;
 			case VECGAGG_SUM:
 			case VECGAGG_MIN:
 			case VECGAGG_MAX:
+					if (tgt->result_typeoid == NUMERICOID)
+					{
+						if (state->is_partial_serial && tgt->agg_kind == VECGAGG_SUM)
+						{
+							slot->tts_values[ra] =
+								call_numeric_unary_fmgr(
+									&state->numeric_avg_serialize_fmgr,
+									entry->numeric_state_acc[t],
+									entry->numeric_state_acc[t] == (Datum) 0,
+									(Node *) &state->numeric_fake_aggstate);
+						}
+						else if (tgt->agg_kind == VECGAGG_SUM)
+						{
+							slot->tts_values[ra] =
+								call_numeric_unary_fmgr(
+									&state->numeric_sum_fmgr,
+									entry->numeric_state_acc[t],
+									entry->numeric_state_acc[t] == (Datum) 0,
+									(Node *) &state->numeric_fake_aggstate);
+						}
+						else
+						{
+							slot->tts_values[ra] = entry->numeric_acc[t];
+						}
+						break;
+					}
+
 				switch (tgt->col_type)
 				{
 					case VECGAGG_TYPE_INT4:
@@ -616,15 +983,50 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 				}
 				break;
 			case VECGAGG_AVG:
+					if (tgt->result_typeoid == NUMERICOID)
+					{
+						if (tgt->use_int8_avg_path && state->is_partial_serial)
+						{
+							/* avg(int/bigint) partial: emit int8_avg_serialize bytea */
+							ensure_int8_avg_serialize_fmgr(state);
+							slot->tts_values[ra] =
+								call_numeric_unary_fmgr(
+									&state->int8_avg_serialize_fmgr,
+									entry->numeric_state_acc[t],
+									entry->numeric_state_acc[t] == (Datum) 0,
+									(Node *) &state->numeric_fake_aggstate);
+						}
+						else if (state->is_partial_serial)
+						{
+							slot->tts_values[ra] =
+								call_numeric_unary_fmgr(
+									&state->numeric_avg_serialize_fmgr,
+									entry->numeric_state_acc[t],
+									entry->numeric_state_acc[t] == (Datum) 0,
+									(Node *) &state->numeric_fake_aggstate);
+						}
+						else
+						{
+							slot->tts_values[ra] =
+								call_numeric_unary_fmgr(
+									&state->numeric_avg_fmgr,
+									entry->numeric_state_acc[t],
+									entry->numeric_state_acc[t] == (Datum) 0,
+									(Node *) &state->numeric_fake_aggstate);
+						}
+						break;
+					}
+
 				if (state->is_partial_serial)
 				{
-					if (tgt->col_type == VECGAGG_TYPE_INT4 &&
+					if ((tgt->col_type == VECGAGG_TYPE_INT4 ||
+						 tgt->col_type == VECGAGG_TYPE_INT8) &&
 						!tgt->avg_input_as_float8)
 					{
 						Datum elems[2];
 
 						/*
-						 * avg(int4) transition state is bigint[] with [count, sum].
+						 * avg(int4/int8) transition state is bigint[] with [count, sum].
 						 */
 						elems[0] = Int64GetDatum(entry->avg_count_acc[t]);
 						elems[1] = Int64GetDatum(entry->int64_acc[t]);
@@ -660,16 +1062,26 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 				}
 				else
 				{
-					if (tgt->col_type == VECGAGG_TYPE_INT4 &&
-						!tgt->avg_input_as_float8 &&
-						tgt->result_typeoid == NUMERICOID)
+					if (tgt->result_typeoid == NUMERICOID)
 					{
-						Datum sum_numeric =
-							DirectFunctionCall1(int8_numeric,
-											Int64GetDatum(entry->int64_acc[t]));
+						Datum sum_numeric;
 						Datum count_numeric =
 							DirectFunctionCall1(int8_numeric,
 											Int64GetDatum(entry->avg_count_acc[t]));
+
+						if (tgt->col_type == VECGAGG_TYPE_INT4 &&
+							!tgt->avg_input_as_float8)
+						{
+							sum_numeric =
+								DirectFunctionCall1(int8_numeric,
+												Int64GetDatum(entry->int64_acc[t]));
+						}
+						else
+						{
+							sum_numeric =
+								DirectFunctionCall1(float8_numeric,
+												Float8GetDatum(entry->float8_acc[t]));
+						}
 
 						slot->tts_values[ra] =
 							DirectFunctionCall2(numeric_div,
@@ -713,50 +1125,67 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 	elog(DEBUG1, "VecGroupAgg: BeginVecGroupAgg entered, eflags=%d", eflags);
 
 	/*
-	 * Unpack parameters from custom_private:
-	 *   [0] key_attnum   (Int)
-	 *   [1] key_typeoid  (Int)
-	 *   [2] key_is_const (Int)
-	 *   [3] num_targets  (Int)
-	 *   [4] key_result_att (Int) — 0-based position of GROUP BY key in output
-	 *   [5] sort_output   (Int) — 1 if output must be sorted by key (AGG_SORTED)
-	 *   [6] aggsplit mode (AggSplit enum as int)
-	 *   [7] key_const (Const, optional; present only when key_is_const=1)
-	 *   [N..] encoded targets: 6 Ints each
-	 *         (kind, col_type, col_attnum, result_attnum, avg_input_as_float8, result_typeoid)
+	 * Unpack parameters from custom_private (new multi-key format):
+	 *   [0]              num_keys
+	 *   [1..num_keys]    key_attnums[ki]
+	 *   [num_keys+1..2*num_keys]  key_typeoids[ki]
+	 *   [2*num_keys+1..3*num_keys] key_is_consts[ki]
+	 *   [3*num_keys+1..4*num_keys] key_result_atts[ki]
+	 *   [4*num_keys+1]  num_targets
+	 *   [4*num_keys+2]  sort_output
+	 *   [4*num_keys+3]  aggsplit_mode
+	 *   [Const nodes for ki where key_is_consts[ki]=true, in order]
+	 *   [8 Ints per target: kind, col_type, col_attnum, result_attnum,
+	 *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid]
 	 */
 	List   *priv = cscan->custom_private;
-	int	target_idx;
+	int		target_idx;
+	int		ki;
 
 	#define PRIV_INT(nodeptr) ((int) DatumGetInt32(((Const *) (nodeptr))->constvalue))
 
-	state->key_attnum = PRIV_INT(list_nth(priv, 0));
-	state->key_typeoid = (Oid) PRIV_INT(list_nth(priv, 1));
-	state->key_is_const = (bool) PRIV_INT(list_nth(priv, 2));
-	state->num_targets = PRIV_INT(list_nth(priv, 3));
-	state->key_result_attnum = PRIV_INT(list_nth(priv, 4));
-	state->sort_output = (bool) PRIV_INT(list_nth(priv, 5));
+	state->num_keys = PRIV_INT(list_nth(priv, 0));
+
+	for (ki = 0; ki < state->num_keys; ki++)
+		state->key_attnum[ki] = PRIV_INT(list_nth(priv, 1 + ki));
+	for (ki = 0; ki < state->num_keys; ki++)
+		state->key_typeoid[ki] = (Oid) PRIV_INT(list_nth(priv, state->num_keys + 1 + ki));
+	for (ki = 0; ki < state->num_keys; ki++)
+		state->key_is_const[ki] = (bool) PRIV_INT(list_nth(priv, 2 * state->num_keys + 1 + ki));
+	for (ki = 0; ki < state->num_keys; ki++)
+		state->key_result_attnum[ki] = PRIV_INT(list_nth(priv, 3 * state->num_keys + 1 + ki));
+
+	state->num_targets  = PRIV_INT(list_nth(priv, 4 * state->num_keys + 1));
+	state->sort_output  = (bool) PRIV_INT(list_nth(priv, 4 * state->num_keys + 2));
 	state->is_partial_serial =
-		(PRIV_INT(list_nth(priv, 6)) == (int) AGGSPLIT_INITIAL_SERIAL);
+		(PRIV_INT(list_nth(priv, 4 * state->num_keys + 3)) == (int) AGGSPLIT_INITIAL_SERIAL);
 
-	state->key_col_type = type_oid_to_vectype(state->key_typeoid);
-	get_typlenbyval(state->key_typeoid, &state->key_typlen, &state->key_typbyval);
-
-	state->key_const = (Datum) 0;
-	state->key_const_isnull = true;
-
-	if (state->key_is_const)
+	/* Initialize per-key type info */
+	for (ki = 0; ki < state->num_keys; ki++)
 	{
-		Const *kconst = (Const *) list_nth(priv, 7);
-
-		state->key_const_isnull = kconst->constisnull;
-		if (!kconst->constisnull)
-			state->key_const = datumCopy(kconst->constvalue,
-									 state->key_typbyval,
-									 state->key_typlen);
+		state->key_col_type[ki] = type_oid_to_vectype(state->key_typeoid[ki]);
+		get_typlenbyval(state->key_typeoid[ki],
+						&state->key_typlen[ki],
+						&state->key_typbyval[ki]);
+		state->key_const[ki] = (Datum) 0;
+		state->key_const_isnull[ki] = true;
 	}
 
-	target_idx = state->key_is_const ? 8 : 7;
+	/* Const key values (optional, one per const key in order) */
+	target_idx = 4 * state->num_keys + 4;	/* first slot after the 4 fixed ints */
+	for (ki = 0; ki < state->num_keys; ki++)
+	{
+		if (state->key_is_const[ki])
+		{
+			Const *kconst = (Const *) list_nth(priv, target_idx++);
+			state->key_const_isnull[ki] = kconst->constisnull;
+			if (!kconst->constisnull)
+				state->key_const[ki] = datumCopy(kconst->constvalue,
+												 state->key_typbyval[ki],
+												 state->key_typlen[ki]);
+		}
+	}
+
 	for (int tno = 0; tno < state->num_targets && tno < VECGROUPAGG_MAX_TARGETS; tno++)
 	{
 		state->targets[tno].agg_kind = PRIV_INT(list_nth(priv, target_idx++));
@@ -765,6 +1194,8 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 		state->targets[tno].result_attnum = PRIV_INT(list_nth(priv, target_idx++));
 		state->targets[tno].avg_input_as_float8 = (bool) PRIV_INT(list_nth(priv, target_idx++));
 		state->targets[tno].result_typeoid = (Oid) PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].use_int8_avg_path = (bool) PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].avg_transfn_oid = (Oid) PRIV_INT(list_nth(priv, target_idx++));
 	}
 
 	#undef PRIV_INT
@@ -773,6 +1204,26 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 	state->agg_context = AllocSetContextCreate(CurrentMemoryContext,
 											   "VecGroupAgg",
 											   ALLOCSET_DEFAULT_SIZES);
+	MemSet(&state->numeric_fake_aggstate, 0, sizeof(AggState));
+	MemSet(&state->numeric_fake_aggexpr, 0, sizeof(ExprContext));
+	state->numeric_fake_aggexpr.ecxt_per_tuple_memory = state->agg_context;
+	((Node *) &state->numeric_fake_aggstate)->type = T_AggState;
+	state->numeric_fake_aggstate.curaggcontext = &state->numeric_fake_aggexpr;
+	state->numeric_fmgr_ready = false;
+ 	ensure_numeric_fmgr(state);
+
+	/* Initialize per-target transition fmgrs for avg(int/bigint) partial path */
+	state->int8_avg_serialize_ready = false;
+	for (int tno = 0; tno < state->num_targets && tno < VECGROUPAGG_MAX_TARGETS; tno++)
+	{
+		if (state->targets[tno].use_int8_avg_path &&
+			OidIsValid(state->targets[tno].avg_transfn_oid))
+		{
+			fmgr_info_cxt(state->targets[tno].avg_transfn_oid,
+						  &state->avg_transfn_fmgr[tno],
+						  state->agg_context);
+		}
+	}
 
 	/* Initialize group hash table */
 	state->group_htab = create_group_htab(state, state->agg_context);
@@ -837,7 +1288,7 @@ ExecVecGroupAgg(CustomScanState *css)
 			Assert(n == state->num_groups);
 
 			/* Sort ascending by key */
-			g_key_col_type = state->key_col_type;
+			g_sort_key_type = state->key_col_type[0];
 			if (n > 1)
 				qsort(state->sorted_arr, n, sizeof(VecGroupEntry *),
 					  vecgroup_entry_cmp);
@@ -949,20 +1400,28 @@ ExplainVecGroupAgg(CustomScanState *css, List *ancestors, ExplainState *es)
 /*
  * engine_create_groupagg_node
  *
- * Build a CustomScan plan node for VectorGroupAgg.
- * The caller must have already built the child ColcompressScan plan
- * and added it to custom_plans.
+ * Build a CustomScan plan node for VectorGroupAgg (multi-key version).
  *
- * Parameters are packed into custom_private as a flat list of Int Consts:
- *   key_attnum, key_typeoid, num_targets,
- *   [kind, col_type, col_attnum, result_attnum, avg_input_as_float8, result_typeoid] × num_targets
+ * New custom_private format:
+ *   [0]              num_keys
+ *   [1..num_keys]    key_attnums[ki]
+ *   [num_keys+1..2*num_keys]  key_typeoids[ki]
+ *   [2*num_keys+1..3*num_keys] key_is_consts[ki]
+ *   [3*num_keys+1..4*num_keys] key_result_atts[ki]
+ *   [4*num_keys+1]  num_targets
+ *   [4*num_keys+2]  sort_output
+ *   [4*num_keys+3]  aggsplit_mode
+ *   [Const nodes for each ki where key_is_consts[ki]=true, in order]
+ *   [8 Ints per target: kind, col_type, col_attnum, result_attnum,
+ *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid]
  */
 CustomScan *
-engine_create_groupagg_node(int key_attnum,
-							Oid key_typeoid,
-							bool key_is_const,
-							Const *key_const,
-							int key_result_att,
+engine_create_groupagg_node(int num_keys,
+							int key_attnums[],
+							Oid key_typeoids[],
+							bool key_is_consts[],
+							Const *key_consts[],
+							int key_result_atts[],
 							bool sort_output,
 							int aggsplit_mode,
 							int num_targets,
@@ -971,6 +1430,7 @@ engine_create_groupagg_node(int key_attnum,
 	CustomScan *cscan = makeNode(CustomScan);
 	List	   *priv = NIL;
 	int			t;
+	int			ki;
 
 	cscan->methods = &VecGroupAggScanMethods;
 	cscan->flags   = 0;
@@ -987,16 +1447,21 @@ engine_create_groupagg_node(int key_attnum,
 		priv = lappend(priv, _c); \
 	} while (0)
 
-	MKINT(key_attnum);
-	MKINT((int) key_typeoid);
-	MKINT((int) key_is_const);
+	MKINT(num_keys);
+	for (ki = 0; ki < num_keys; ki++) MKINT(key_attnums[ki]);
+	for (ki = 0; ki < num_keys; ki++) MKINT((int) key_typeoids[ki]);
+	for (ki = 0; ki < num_keys; ki++) MKINT((int) key_is_consts[ki]);
+	for (ki = 0; ki < num_keys; ki++) MKINT(key_result_atts[ki]);
 	MKINT(num_targets);
-	MKINT(key_result_att);
 	MKINT((int) sort_output);
 	MKINT(aggsplit_mode);
 
-	if (key_is_const)
-		priv = lappend(priv, copyObject(key_const));
+	/* Const key values (in order, only for const keys) */
+	for (ki = 0; ki < num_keys; ki++)
+	{
+		if (key_is_consts[ki] && key_consts[ki] != NULL)
+			priv = lappend(priv, copyObject(key_consts[ki]));
+	}
 
 	for (t = 0; t < num_targets; t++)
 	{
@@ -1006,6 +1471,8 @@ engine_create_groupagg_node(int key_attnum,
 		MKINT(targets[t].result_attnum);
 		MKINT((int) targets[t].avg_input_as_float8);
 		MKINT((int) targets[t].result_typeoid);
+		MKINT((int) targets[t].use_int8_avg_path);
+		MKINT((int) targets[t].avg_transfn_oid);
 	}
 
 #undef MKINT
@@ -1045,7 +1512,15 @@ engine_is_groupagg_node(Plan *plan)
 void
 engine_groupagg_enable_sort_output(CustomScan *cscan)
 {
-	Const *c = (Const *) list_nth(cscan->custom_private, 5);
+	int		num_keys;
+	int		sort_output_idx;
+	Const  *c;
 
+	/* num_keys is at index 0 */
+	num_keys = (int) DatumGetInt32(
+				((Const *) list_nth(cscan->custom_private, 0))->constvalue);
+	/* sort_output is at index 4*num_keys+2 */
+	sort_output_idx = 4 * num_keys + 2;
+	c = (Const *) list_nth(cscan->custom_private, sort_output_idx);
 	c->constvalue = Int32GetDatum(1);
 }

@@ -25,4 +25,16 @@ PG19_FLAG  := $(if $(PG19),--pg19,)
 installcheck:
 	$(PYTHON3) $(SUITE) --port $(PG_PORT) $(PG19_FLAG)
 
-.PHONY: all install clean installcheck
+# Run the test suite against all installed PostgreSQL versions (15–19).
+# Installs the extension for each version before running the tests.
+installcheck-all:
+	for ver in 15 16 17 18 19; do \
+		if pg_lsclusters -h | awk '{print $$1}' | grep -qx "$$ver"; then \
+			echo "=== Installing for PG$$ver ==="; \
+			sudo -E $(MAKE) -C src/backend/engine install \
+				PG_CONFIG=/usr/lib/postgresql/$$ver/bin/pg_config TMPDIR=$(TMPDIR); \
+		fi; \
+	done
+	$(PYTHON3) $(SUITE) --ports 5436,5434,5435,5432,5433
+
+.PHONY: all install clean installcheck installcheck-all

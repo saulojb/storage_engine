@@ -556,6 +556,8 @@ TypeOidToVecGaggType(Oid typeoid)
 		case INT8OID:	return VECGAGG_TYPE_INT8;
 		case FLOAT4OID:	return VECGAGG_TYPE_FLOAT4;
 		case FLOAT8OID:	return VECGAGG_TYPE_FLOAT8;
+		case NUMERICOID:	return VECGAGG_TYPE_NUMERIC;
+		case CASHOID:	return VECGAGG_TYPE_INT8; /* money = int64 internally */
 		default:		return -1;
 	}
 }
@@ -574,6 +576,7 @@ KeyTypeOidToVecGaggType(Oid typeoid)
 		case INT8OID:	return VECGAGG_TYPE_INT8;
 		case FLOAT4OID:	return VECGAGG_TYPE_FLOAT4;
 		case FLOAT8OID:	return VECGAGG_TYPE_FLOAT8;
+		case CASHOID:	return VECGAGG_TYPE_INT8; /* money = int64 internally */
 		case BPCHAROID:	return VECGAGG_TYPE_BPCHAR;
 		case TEXTOID:	return VECGAGG_TYPE_TEXT;
 		default:		return -1;
@@ -771,6 +774,27 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 			 strcmp(fname, "int8_avg") == 0 ||
 			 strcmp(fname, "float8_avg") == 0)
 	{
+		/*
+		 * Determine the true final result type.  In AGGSPLIT_INITIAL_SERIAL,
+		 * aggref->aggtype is the serialized transition type (BYTEAOID), not
+		 * the final type.  Use get_func_rettype to always get the final type.
+		 */
+		Oid final_type = aggref->aggtype;
+		if (final_type != NUMERICOID)
+			final_type = get_func_rettype(aggref->aggfnoid);
+
+		if (final_type == NUMERICOID)
+		{
+			if (arg_cast_to_float8)
+				return false;
+			if (arg_typeoid != INT4OID && arg_typeoid != INT8OID &&
+				arg_typeoid != FLOAT4OID && arg_typeoid != FLOAT8OID &&
+				arg_typeoid != NUMERICOID)
+				return false;
+			*out_avg_input_as_float8 = false;
+		}
+		else
+		{
 		if (arg_cast_to_float8)
 		{
 			if (arg_expr_type != FLOAT8OID)
@@ -782,11 +806,20 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 		}
 		else
 		{
-			if (arg_typeoid != FLOAT4OID && arg_typeoid != FLOAT8OID && arg_typeoid != INT4OID)
+			if (arg_typeoid != FLOAT4OID && arg_typeoid != FLOAT8OID &&
+				arg_typeoid != INT4OID && arg_typeoid != NUMERICOID)
 				return false;
 			*out_avg_input_as_float8 = false;
 		}
+		}
 		*out_kind = VECGAGG_AVG;
+	}
+	else if (strcmp(fname, "count") == 0)
+	{
+		/* count(col): NULL-aware — only count non-null values */
+		if (arg_cast_to_float8)
+			return false;
+		*out_kind = VECGAGG_COUNT_COL;
 	}
 	else if (strcmp(fname, "min") == 0 || strcmp(fname, "int4smaller") == 0 ||
 			 strcmp(fname, "int8smaller") == 0 || strcmp(fname, "float8smaller") == 0)
@@ -964,37 +997,52 @@ PlanTreeMutator(Plan *node, void *context)
 			 * with VectorGroupAgg → ColcompressScan.
 			 *
 			 * Requirements:
-			 *   - Single GROUP BY key
-			 *   - Key type: int4/int8/float8
-			 *   - Aggregates: count(*), sum, min, max over int4/int8/float8
+			 *   - Up to VECGROUPAGG_MAX_KEYS GROUP BY columns
+			 *   - Key types: int4/int8/float4/float8/bpchar/text
+			 *   - Aggregates: count(*), count(col), sum, min, max, avg over
+			 *     int4/int8/float4/float8/numeric
 			 *   - Direct ColcompressScan child (no intermediate nodes)
+			 *   - No HAVING clause (plan.qual must be empty)
 			 */
 			if (engine_enable_vectorized_groupagg &&
 				(aggNode->aggstrategy == AGG_HASHED ||
 				 aggNode->aggstrategy == AGG_SORTED) &&
 				(aggNode->aggsplit == AGGSPLIT_SIMPLE ||
 				 aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL) &&
-				(aggNode->numCols == 1 || aggNode->numCols == 0) &&
+				(aggNode->numCols <= VECGROUPAGG_MAX_KEYS) &&
 				engine_enable_vectorization)
 			{
 				Plan		   *child_plan = node->lefttree;
 				Plan		   *scan_plan;  /* the actual ColcompressScan */
 				CustomScan	   *childScan;
 				const char	   *fallback_reason = "unspecified";
+				/* Multi-key support: up to VECGROUPAGG_MAX_KEYS GROUP BY columns */
+				int				num_keys = 0;
 				AttrNumber		scan_key_pos;
 				AttrNumber		key_table_attno;
-				int				key_slot_idx;
+				int				key_slot_idxs[VECGROUPAGG_MAX_KEYS];
 				TargetEntry	   *key_scan_te;
-				Oid				key_typeoid;
-				bool			key_is_const = false;
-				Const		   *key_const = NULL;
+				Oid				key_typeoids[VECGROUPAGG_MAX_KEYS];
+				bool			key_is_consts[VECGROUPAGG_MAX_KEYS];
+				Const		   *key_consts[VECGROUPAGG_MAX_KEYS];
+				int				key_result_atts[VECGROUPAGG_MAX_KEYS];
 				VecGroupAggTarget targets[VECGROUPAGG_MAX_TARGETS];
 				int				num_targets = 0;
 				bool			supported = true;
 				ListCell	   *lc;
 				int				result_att;
-				int				key_result_att = -1;
 				double			estimated_groups = 0.0;
+				int				ki;
+
+				/* Initialize key arrays */
+				for (ki = 0; ki < VECGROUPAGG_MAX_KEYS; ki++)
+				{
+					key_slot_idxs[ki] = -1;
+					key_typeoids[ki] = InvalidOid;
+					key_is_consts[ki] = false;
+					key_consts[ki] = NULL;
+					key_result_atts[ki] = -1;
+				}
 				/*
 				 * For AGG_SORTED the planner inserts a Sort node between
 				 * the Agg and the scan.  Strip it — VecGroupAgg uses a
@@ -1019,16 +1067,63 @@ PlanTreeMutator(Plan *node, void *context)
 					goto groupagg_fallback;
 				}
 
-				if (aggNode->numCols == 1)
+				/*
+				 * HAVING guard: plan.qual is the HAVING filter.
+				 * VecGroupAgg does not evaluate quals during emission,
+				 * so fall back to avoid returning wrong results.
+				 */
+				if (aggNode->plan.qual != NIL)
 				{
-					/* Get GROUP BY key info from the scan plan's targetlist */
-					scan_key_pos = aggNode->grpColIdx[0];
-					key_table_attno = ScanOutputPosToVarAttno(scan_plan, scan_key_pos);
-					if (key_table_attno == 0)
+					fallback_reason = "HAVING clause not supported by VecGroupAgg";
+					goto groupagg_fallback;
+				}
+
+				/*
+				 * Multi-key sorted output not supported: VecGroupAgg's
+				 * sorted-emission comparator handles only a single key.
+				 * For multi-column GROUP BY use hash strategy only.
+				 */
+				if (aggNode->numCols > 1 && aggNode->aggstrategy == AGG_SORTED)
+				{
+					fallback_reason = "multi-key sorted GROUP BY not supported";
+					goto groupagg_fallback;
+				}
+
+				if (aggNode->numCols >= 1)
+				{
+					/* Normal case: extract each GROUP BY key */
+					for (ki = 0; ki < aggNode->numCols; ki++)
 					{
-						fallback_reason = "failed to map GROUP BY key to table attno";
-						goto groupagg_fallback;
+						scan_key_pos = aggNode->grpColIdx[ki];
+						key_table_attno = ScanOutputPosToVarAttno(scan_plan, scan_key_pos);
+						if (key_table_attno == 0)
+						{
+							fallback_reason = "failed to map GROUP BY key to table attno";
+							goto groupagg_fallback;
+						}
+
+						key_scan_te = get_tle_by_resno(scan_plan->targetlist, scan_key_pos);
+						if (key_scan_te == NULL || !IsA(key_scan_te->expr, Var))
+						{
+							fallback_reason = "GROUP BY key target is not Var";
+							goto groupagg_fallback;
+						}
+						key_typeoids[ki] = ((Var *) key_scan_te->expr)->vartype;
+
+						if (KeyTypeOidToVecGaggType(key_typeoids[ki]) < 0)
+						{
+							fallback_reason = "GROUP BY key type unsupported";
+							goto groupagg_fallback;
+						}
+
+						key_slot_idxs[ki] = VarAttnoToSlotIdx(scan_plan, key_table_attno);
+						if (key_slot_idxs[ki] < 0)
+						{
+							fallback_reason = "failed to map GROUP BY key to vector slot";
+							goto groupagg_fallback;
+						}
 					}
+					num_keys = aggNode->numCols;
 				}
 				else
 				{
@@ -1068,8 +1163,8 @@ PlanTreeMutator(Plan *node, void *context)
 								if (const_key_attno == 0)
 								{
 									const_key_attno = v->varattno;
-									key_const = c;
-									key_typeoid = v->vartype;
+									key_consts[0] = c;
+									key_typeoids[0] = v->vartype;
 								}
 								else if (const_key_attno != v->varattno)
 								{
@@ -1080,25 +1175,38 @@ PlanTreeMutator(Plan *node, void *context)
 						}
 					}
 
-					if (const_key_attno == 0 || key_const == NULL)
+					if (const_key_attno == 0 || key_consts[0] == NULL)
 					{
 						fallback_reason = "numCols=0 without inferable Var=Const key";
 						goto groupagg_fallback;
 					}
 
-					key_table_attno = const_key_attno;
-					key_is_const = true;
-					scan_key_pos = 0;
+					key_is_consts[0] = true;
+					key_slot_idxs[0] = -1;
+					if (KeyTypeOidToVecGaggType(key_typeoids[0]) < 0)
+					{
+						fallback_reason = "GROUP BY const key type unsupported";
+						goto groupagg_fallback;
+					}
+					num_keys = 1;
 				}
 
 				estimated_groups = (aggNode->numGroups > 0.0)
 					? aggNode->numGroups
 					: aggNode->plan.plan_rows;
 
-				estimated_groups = EstimateGroupByDistinct(planTreeContext,
-											   scan_plan,
-											   key_table_attno,
-											   estimated_groups);
+				/* Use first key for group-count estimation */
+				if (num_keys >= 1 && !key_is_consts[0])
+				{
+					AttrNumber est_attno = ScanOutputPosToVarAttno(
+						scan_plan,
+						(aggNode->numCols >= 1) ? aggNode->grpColIdx[0] : 0);
+
+					estimated_groups = EstimateGroupByDistinct(planTreeContext,
+												   scan_plan,
+												   est_attno,
+												   estimated_groups);
+				}
 
 				/*
 				 * Bail out early if estimated distinct groups exceed VecGroupAgg
@@ -1107,41 +1215,6 @@ PlanTreeMutator(Plan *node, void *context)
 				if (estimated_groups > (double) (VECGROUPAGG_MAX_GROUPS * 3 / 4))
 				{
 					fallback_reason = "estimated groups exceed safety margin";
-					goto groupagg_fallback;
-				}
-
-				/*
-				 * Compute the 0-based slot output position for the GROUP BY key.
-				 * ColumnarReadNextVector stores columns at the rank of their
-				 * varattno in the sorted projected-attno list, NOT at varattno-1.
-				 */
-				if (!key_is_const)
-				{
-					key_slot_idx = VarAttnoToSlotIdx(scan_plan, key_table_attno);
-					if (key_slot_idx < 0)
-					{
-						fallback_reason = "failed to map GROUP BY key to vector slot";
-						goto groupagg_fallback;
-					}
-				}
-				else
-				{
-					key_slot_idx = -1;
-				}
-
-				if (!key_is_const)
-				{
-					key_scan_te = get_tle_by_resno(scan_plan->targetlist, scan_key_pos);
-					if (key_scan_te == NULL || !IsA(key_scan_te->expr, Var))
-					{
-						fallback_reason = "GROUP BY key target is not Var";
-						goto groupagg_fallback;
-					}
-					key_typeoid = ((Var *) key_scan_te->expr)->vartype;
-				}
-				if (KeyTypeOidToVecGaggType(key_typeoid) < 0)
-				{
-					fallback_reason = "GROUP BY key type unsupported";
 					goto groupagg_fallback;
 				}
 
@@ -1190,6 +1263,7 @@ PlanTreeMutator(Plan *node, void *context)
 					{
 						Var *v = (Var *) te->expr;
 						int idx;
+						int matched_key = -1;
 
 						for (idx = 0; idx < num_resjunk_aggs; idx++)
 						{
@@ -1204,23 +1278,37 @@ PlanTreeMutator(Plan *node, void *context)
 						{
 							/* Visible Var is a finalize wrapper over hidden Aggref */
 						}
-						else if (v->varattno == scan_key_pos)
+						else
 						{
-						/*
-						 * GROUP BY key column in output.  We already handle this
-						 * via VecGroupEntry.key; no extra target needed.
-						 * But we must account for result_att ordering.
-						 */
-							key_result_att = result_att;  /* record key's 0-based output position */
-							result_att++;
-							continue;
-						}
+							/* Check if this Var is one of the GROUP BY key columns */
+							for (ki = 0; ki < num_keys; ki++)
+							{
+								AttrNumber grp_pos = (aggNode->numCols > 0)
+									? aggNode->grpColIdx[ki]
+									: 0;
+								if (v->varattno == grp_pos)
+								{
+									matched_key = ki;
+									break;
+								}
+							}
+							if (matched_key >= 0)
+							{
+								/*
+								 * GROUP BY key column in output. We handle this
+								 * via VecGroupEntry.k.key[ki]; no extra target needed.
+								 */
+								key_result_atts[matched_key] = result_att;
+								result_att++;
+								continue;
+							}
 						else
 						{
 							fallback_reason = "non-key Var target not linked to aggregate";
 							supported = false;
 							break;
 						}
+					}
 					}
 					else if (!ExtractTargetAggref((Node *) te->expr, &aggref))
 					{
@@ -1278,31 +1366,91 @@ PlanTreeMutator(Plan *node, void *context)
 					targets[num_targets].col_type       = TypeOidToVecGaggType(col_typeoid);
 					targets[num_targets].result_attnum  = result_att;
 					targets[num_targets].avg_input_as_float8 = avg_input_as_float8;
-					targets[num_targets].result_typeoid = aggref->aggtype;
+					{
+						bool use_int8_path = (kind == VECGAGG_AVG &&
+											  aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL &&
+											  col_typeoid == INT8OID);  /* INT8 only: uses internal state + serialize */
+						targets[num_targets].use_int8_avg_path = use_int8_path;
+						if (use_int8_path)
+						{
+							/*
+							 * Look up the real aggtransfn OID from pg_aggregate
+							 * so the executor uses the correct function variant
+							 * (internal-transtype vs bigint[]-transtype), which
+							 * differ by C function but may share the same SQL name.
+							 */
+							HeapTuple	agg_tup;
+							Form_pg_aggregate agg_form;
+
+							agg_tup = SearchSysCache1(AGGFNOID,
+													  ObjectIdGetDatum(aggref->aggfnoid));
+							if (!HeapTupleIsValid(agg_tup))
+								elog(ERROR, "cache lookup failed for aggregate %u",
+									 aggref->aggfnoid);
+							agg_form = (Form_pg_aggregate) GETSTRUCT(agg_tup);
+							targets[num_targets].avg_transfn_oid = agg_form->aggtransfn;
+							ReleaseSysCache(agg_tup);
+						}
+						else
+							targets[num_targets].avg_transfn_oid = InvalidOid;
+					}
+					/*
+					 * In AGGSPLIT_INITIAL_SERIAL, aggref->aggtype is the
+					 * actual transition state type emitted to the Finalize
+					 * node.  For aggregates with a serialize function
+					 * (e.g. numeric_avg), aggref->aggtype = BYTEAOID; in
+					 * that case we use get_func_rettype to obtain NUMERICOID
+					 * for executor routing.  For aggregates without a
+					 * serialize function (avg(int4/int8) → INT8ARRAYOID,
+					 * avg(float8) → FLOAT8ARRAYOID), aggref->aggtype IS the
+					 * transition format; use it directly so the executor
+					 * emits int8[]/{count,sum} or float8[]/{N,sum,0} as
+					 * expected by the Finalize GroupAggregate.
+					 */
+					targets[num_targets].result_typeoid =
+						(aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL)
+						? (aggref->aggtype == BYTEAOID
+						   ? get_func_rettype(aggref->aggfnoid)  /* numeric_avg → NUMERICOID */
+						   : aggref->aggtype)                    /* int8[], float8[], etc. */
+						: aggref->aggtype;
 					num_targets++;
 					result_att++;
 				}
 
-				if (!supported || num_targets == 0 || key_result_att < 0)
 				{
-					if (num_targets == 0 && strcmp(fallback_reason, "unspecified") == 0)
-						fallback_reason = "no vectorizable aggregate targets";
-					else if (key_result_att < 0)
-						fallback_reason = "group key not present in output targetlist";
-					else if (supported == false && strcmp(fallback_reason, "unspecified") == 0)
-						fallback_reason = "targetlist shape incompatible with VecGroupAgg";
-					goto groupagg_fallback;
+					/* Validate: all key result positions must have been found */
+					bool keys_ok = true;
+					for (ki = 0; ki < num_keys; ki++)
+					{
+						if (key_result_atts[ki] < 0)
+						{
+							keys_ok = false;
+							break;
+						}
+					}
+
+					if (!supported || num_targets == 0 || !keys_ok)
+					{
+						if (num_targets == 0 && strcmp(fallback_reason, "unspecified") == 0)
+							fallback_reason = "no vectorizable aggregate targets";
+						else if (!keys_ok)
+							fallback_reason = "group key not present in output targetlist";
+						else if (supported == false && strcmp(fallback_reason, "unspecified") == 0)
+							fallback_reason = "targetlist shape incompatible with VecGroupAgg";
+						goto groupagg_fallback;
+					}
 				}
 
 				{
 					/* Build VectorGroupAgg plan node */
 					CustomScan *vgaNode = engine_create_groupagg_node(
-						key_slot_idx,
-						key_typeoid,
-						key_is_const,
-						key_const,
-						key_result_att,
-						(aggNode->aggstrategy == AGG_SORTED), /* sort_output */
+						num_keys,
+						key_slot_idxs,
+						key_typeoids,
+						key_is_consts,
+						key_consts,
+						key_result_atts,
+						(aggNode->aggstrategy == AGG_SORTED && num_keys == 1), /* sort_output */
 						(int) aggNode->aggsplit,
 						num_targets,
 						targets);
