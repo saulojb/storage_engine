@@ -1,5 +1,30 @@
 # CHANGELOG
 
+## 2.0.1
+
+* **fix:** eliminate compiler warnings reported against commit `671a9a2`
+  (issue [#19](https://github.com/saulojb/storage_engine/issues/19), reported by @okbob).
+
+  * `engine_planner_hook.c` — nested `PG_TRY()` blocks inside
+    `ColumnarPlannerHook` produced four `-Wshadow=compatible-local` warnings
+    from the internal macro variables (`_save_exception_stack`,
+    `_save_context_stack`, `_local_sigjmp_buf`, `_do_rethrow`).
+    Fix: the inner `PG_TRY` block was extracted into a static helper function
+    `TryVectorizeSerialPlan()`, removing the nesting entirely.
+
+  * `engine_aggregator_node.c` — three variables (`arg_attno`, `arg_type`,
+    `arg_column`) in `advance_transition_function` were written but never read
+    — leftover scaffolding from an earlier development iteration.
+    The entire dead block was removed, eliminating the
+    `-Wunused-but-set-variable` warnings.
+
+  * `safeclib/strpbrk_s.c` — vendored third-party code, not modified.
+
+  No catalog changes.  No functional changes.  Upgrade with:
+  ```sql
+  ALTER EXTENSION storage_engine UPDATE TO '2.0.1';
+  ```
+
 ## 2.0.0
 
 * **BREAKING:** minimum PostgreSQL version is now **15**.

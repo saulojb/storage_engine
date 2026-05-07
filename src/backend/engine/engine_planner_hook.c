@@ -75,6 +75,10 @@ static bool PlanHasColumnarCustomScan(Plan *plan);
 static bool PlanHasPathologicalSortedColumnarAgg(Plan *plan);
 static bool PlanHasHashColumnarAgg(Plan *plan);
 static void MutatePlannedStmt(PlannedStmt *stmt);
+static bool TryVectorizeSerialPlan(PlannedStmt *stmt_serial,
+								   MemoryContext saved_context,
+								   Plan **savedPlanTree,
+								   List **savedSubplan);
 static void CollectProjectedAttnos(Plan *scan_plan, AttrNumber *attnos, int *count);
 
 typedef struct PlanTreeMutatorContext
@@ -1634,6 +1638,49 @@ MutatePlannedStmt(PlannedStmt *stmt)
 
 	stmt->subplans = subplans;
 }
+
+/*
+ * TryVectorizeSerialPlan
+ *
+ * Attempt to vectorize stmt_serial in-place.  Returns true on success.
+ * On failure, restores stmt_serial to its original state and returns false.
+ *
+ * This helper exists to avoid nesting PG_TRY() blocks inside
+ * ColumnarPlannerHook(), which causes -Wshadow=compatible-local warnings
+ * from the PG_TRY macro internals.
+ */
+static bool
+TryVectorizeSerialPlan(PlannedStmt *stmt_serial,
+					   MemoryContext saved_context,
+					   Plan **savedPlanTree,
+					   List **savedSubplan)
+{
+	bool success = false;
+
+	PG_TRY();
+	{
+		MutatePlannedStmt(stmt_serial);
+		success = true;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(saved_context);
+		edata = CopyErrorData();
+		FlushErrorState();
+		ereport(DEBUG1,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("Serial plan can't be vectorized. Falling back to native serial execution."),
+				 errdetail("%s", edata->message)));
+		stmt_serial->planTree = *savedPlanTree;
+		stmt_serial->subplans = *savedSubplan;
+		success = false;
+	}
+	PG_END_TRY();
+
+	return success;
+}
 #endif
 
 static PlannedStmt *
@@ -1879,29 +1926,8 @@ ColumnarPlannerHook(Query *parse,
 			saved_context = CurrentMemoryContext;
 
 			if (engine_enable_vectorization)
-			{
-				PG_TRY();
-				{
-					MutatePlannedStmt(stmt_serial);
-					pass2Vectorized = true;
-				}
-				PG_CATCH();
-				{
-					ErrorData  *edata;
-
-					MemoryContextSwitchTo(saved_context);
-					edata = CopyErrorData();
-					FlushErrorState();
-					ereport(DEBUG1,
-							(errcode(ERRCODE_INTERNAL_ERROR),
-							 errmsg("Serial plan can't be vectorized. Falling back to native serial execution."),
-							 errdetail("%s", edata->message)));
-					stmt_serial->planTree = savedPlanTree;
-					stmt_serial->subplans = savedSubplan;
-					pass2Vectorized = false;
-				}
-				PG_END_TRY();
-			}
+				pass2Vectorized = TryVectorizeSerialPlan(stmt_serial, saved_context,
+														 &savedPlanTree, &savedSubplan);
 
 			/*
 			 * If Pass 1 was vectorized successfully, keep that plan whenever it

@@ -1033,28 +1033,6 @@ advance_transition_function(AggState *aggstate,
 
 	/* set up aggstate->curpertrans for AggGetAggref() */
 	aggstate->curpertrans = pertrans;
-	if (aggstate->numaggs > 1)
-	{
-		AttrNumber	arg_attno = 0;
-		Oid			arg_type = InvalidOid;
-		VectorColumn *arg_column = NULL;
-
-		if (pertrans->aggref != NULL && list_length(pertrans->aggref->args) == 1)
-		{
-			TargetEntry *arg_te = (TargetEntry *) linitial(pertrans->aggref->args);
-
-			if (arg_te != NULL && IsA(arg_te->expr, Var))
-			{
-				Var *arg_var = (Var *) arg_te->expr;
-
-				arg_attno = arg_var->varattno;
-				arg_type = arg_var->vartype;
-			}
-		}
-
-		if (!fcinfo->args[1].isnull)
-			arg_column = (VectorColumn *) DatumGetPointer(fcinfo->args[1].value);
-	}
 
 	/*
 	 * OK to call the transition function
