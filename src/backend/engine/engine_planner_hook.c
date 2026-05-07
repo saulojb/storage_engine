@@ -865,10 +865,6 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 	if (out_filter_const)     *out_filter_const     = NULL;
 	if (out_filter_typeoid)   *out_filter_typeoid   = InvalidOid;
 
-	/* DISTINCT aggregates are not vectorizable (e.g. COUNT(DISTINCT col)) */
-	if (aggref->aggdistinct != NIL)
-		return false;
-
 	/* FILTER clause not supported */
 	if (aggref->aggfilter != NULL)
 		return false;
@@ -987,7 +983,10 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 		/* CASE WHEN filter is not meaningful for COUNT — fall back */
 		if (has_case)
 			return false;
-		*out_kind = VECGAGG_COUNT_COL;
+		if (aggref->aggdistinct != NIL)
+			*out_kind = VECGAGG_COUNT_DISTINCT;
+		else
+			*out_kind = VECGAGG_COUNT_COL;
 	}
 	else if (strcmp(fname, "min") == 0 || strcmp(fname, "int4smaller") == 0 ||
 			 strcmp(fname, "int8smaller") == 0 || strcmp(fname, "float8smaller") == 0)

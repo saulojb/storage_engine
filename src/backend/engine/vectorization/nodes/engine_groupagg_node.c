@@ -401,6 +401,36 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 			entry->numeric_acc[i]		= (Datum) 0;
 			entry->numeric_state_acc[i]	= (Datum) 0;
 			entry->acc_isnull[i]		= true;
+			entry->distinct_htab[i]		= NULL;
+
+			/* For COUNT(DISTINCT col), create a per-group hash set */
+			if (state->targets[i].agg_kind == VECGAGG_COUNT_DISTINCT)
+			{
+				HASHCTL		ctl;
+				char		htab_name[64];
+				int			col_type = state->targets[i].col_type;
+				Size		key_size;
+
+				/*
+				 * Key size depends on the column type.
+				 * For text/bpchar we store a fixed-width hash of the bytes
+				 * to avoid pointer lifetime issues — use uint64 hash key.
+				 * For by-value types we store the raw Datum (always 8 bytes).
+				 */
+				if (col_type == VECGAGG_TYPE_TEXT || col_type == VECGAGG_TYPE_BPCHAR)
+					key_size = sizeof(uint64);	/* hash of the text bytes */
+				else
+					key_size = sizeof(int64);	/* raw int64/float8/etc Datum */
+
+				memset(&ctl, 0, sizeof(ctl));
+				ctl.keysize   = key_size;
+				ctl.entrysize = key_size;
+				ctl.hcxt      = state->agg_context;
+				snprintf(htab_name, sizeof(htab_name), "distinct_set_t%d_g%d",
+						 i, state->num_groups);
+				entry->distinct_htab[i] = hash_create(htab_name, 64, &ctl,
+										  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+			}
 		}
 
 		state->num_groups++;
@@ -431,6 +461,37 @@ accumulate_value(VecGroupAggState *state, VecGroupEntry *entry,
 		if (!isnull)
 		{
 			entry->int64_acc[t_idx]++;
+			entry->acc_isnull[t_idx] = false;
+		}
+		return;
+	}
+
+	if (tgt->agg_kind == VECGAGG_COUNT_DISTINCT)
+	{
+		/*
+		 * count(distinct col): insert the value into the per-group hash set.
+		 * NULL values are ignored (SQL semantics).
+		 * For text/bpchar we hash the bytes to uint64 so the key is always
+		 * fixed-width and has no pointer lifetime issue.
+		 * For numeric types we store the raw int64 Datum.
+		 */
+		if (!isnull && entry->distinct_htab[t_idx] != NULL)
+		{
+			bool found;
+			if (tgt->col_type == VECGAGG_TYPE_TEXT ||
+				tgt->col_type == VECGAGG_TYPE_BPCHAR)
+			{
+				text	*tv  = DatumGetTextPP(val);
+				uint64	 hv  = hash_any_extended(
+								(const unsigned char *) VARDATA_ANY(tv),
+								VARSIZE_ANY_EXHDR(tv), 0);
+				hash_search(entry->distinct_htab[t_idx], &hv, HASH_ENTER, &found);
+			}
+			else
+			{
+				int64	 kv = DatumGetInt64(val);	/* float/int all fit */
+				hash_search(entry->distinct_htab[t_idx], &kv, HASH_ENTER, &found);
+			}
 			entry->acc_isnull[t_idx] = false;
 		}
 		return;
@@ -972,6 +1033,16 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 			case VECGAGG_COUNT_STAR:
 			case VECGAGG_COUNT_COL:
 				slot->tts_values[ra] = Int64GetDatum(entry->int64_acc[t]);
+				break;
+			case VECGAGG_COUNT_DISTINCT:
+				/*
+				 * Count the number of unique keys in the per-group hash set.
+				 * hash_get_num_entries returns the current fill count.
+				 */
+				slot->tts_values[ra] = Int64GetDatum(
+					entry->distinct_htab[t] != NULL
+					? (int64) hash_get_num_entries(entry->distinct_htab[t])
+					: 0);
 				break;
 			case VECGAGG_SUM:
 			case VECGAGG_MIN:

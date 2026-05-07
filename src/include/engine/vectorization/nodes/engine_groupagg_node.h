@@ -32,7 +32,8 @@
 #define VECGAGG_MIN         3   /* min(col) */
 #define VECGAGG_MAX         4   /* max(col) */
 #define VECGAGG_AVG         5   /* avg(col) */
-#define VECGAGG_COUNT_COL   6   /* count(col) — NULL-aware */
+#define VECGAGG_COUNT_COL      6   /* count(col) — NULL-aware */
+#define VECGAGG_COUNT_DISTINCT 7   /* count(distinct col) */
 
 /*
  * Column type codes used in VecGroupAggTarget.
@@ -109,6 +110,8 @@ typedef struct VecGroupEntry
 	Datum		numeric_acc[VECGROUPAGG_MAX_TARGETS];
 	Datum		numeric_state_acc[VECGROUPAGG_MAX_TARGETS];
 	bool		acc_isnull[VECGROUPAGG_MAX_TARGETS]; /* NULL if no non-null input */
+	/* per-target distinct value sets (non-NULL only for COUNT_DISTINCT targets) */
+	HTAB	   *distinct_htab[VECGROUPAGG_MAX_TARGETS];
 } VecGroupEntry;
 
 /*

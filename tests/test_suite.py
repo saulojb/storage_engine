@@ -1085,6 +1085,62 @@ class TestRunner:
         self.check("composite GROUP BY (3 keys): VEC ON == VEC OFF",
                    r_off6 == r_on6, f"OFF={r_off6[:200]!r}  ON={r_on6[:200]!r}")
 
+        # 9. CASE WHEN filter — SUM(CASE WHEN cat=1 THEN val END)
+        self.exec("""
+            DROP TABLE IF EXISTS _tgrp3;
+            CREATE TABLE _tgrp3 (
+                grp   text,
+                cat   integer,
+                val   float8
+            ) USING colcompress;
+            INSERT INTO _tgrp3
+            SELECT
+                (ARRAY['A','B','C'])[1 + (i % 3)],
+                1 + (i % 4),
+                i * 1.0
+            FROM generate_series(1, 300000) i;
+            ANALYZE _tgrp3;
+        """)
+        case_sql = ("SELECT grp, "
+                    "SUM(CASE WHEN cat=1 THEN val END) AS s1, "
+                    "SUM(CASE WHEN cat=2 THEN val END) AS s2 "
+                    "FROM _tgrp3 GROUP BY grp ORDER BY grp")
+        r_off7 = self.q(f"{pfx_off} {case_sql}")
+        r_on7  = self.q(f"{pfx_on} SET max_parallel_workers_per_gather=0; {case_sql}")
+        self.check("CASE WHEN filter SUM: VEC ON == VEC OFF",
+                   r_off7 == r_on7, f"OFF={r_off7!r}  ON={r_on7!r}")
+
+        # 10. COUNT(DISTINCT col) — integer key
+        self.exec("""
+            DROP TABLE IF EXISTS _tgrp4;
+            CREATE TABLE _tgrp4 (
+                grp   integer,
+                uid   integer,
+                tag   text
+            ) USING colcompress;
+            INSERT INTO _tgrp4
+            SELECT
+                i % 5,
+                (i % 200),
+                (ARRAY['x','y','z'])[1 + (i % 3)]
+            FROM generate_series(1, 300000) i;
+            ANALYZE _tgrp4;
+        """)
+        cdist_int_sql = ("SELECT grp, COUNT(DISTINCT uid) AS dc "
+                         "FROM _tgrp4 GROUP BY grp ORDER BY grp")
+        r_off8 = self.q(f"{pfx_off} {cdist_int_sql}")
+        r_on8  = self.q(f"{pfx_on} SET max_parallel_workers_per_gather=0; {cdist_int_sql}")
+        self.check("COUNT(DISTINCT int): VEC ON == VEC OFF",
+                   r_off8 == r_on8, f"OFF={r_off8!r}  ON={r_on8!r}")
+
+        # 11. COUNT(DISTINCT col) — text key
+        cdist_txt_sql = ("SELECT grp, COUNT(DISTINCT tag) AS dt "
+                         "FROM _tgrp4 GROUP BY grp ORDER BY grp")
+        r_off9 = self.q(f"{pfx_off} {cdist_txt_sql}")
+        r_on9  = self.q(f"{pfx_on} SET max_parallel_workers_per_gather=0; {cdist_txt_sql}")
+        self.check("COUNT(DISTINCT text): VEC ON == VEC OFF",
+                   r_off9 == r_on9, f"OFF={r_off9!r}  ON={r_on9!r}")
+
     # ------------------------------------------------------------------ maintenance API (Phase 1)
 
     def test_maintenance_api(self) -> None:
