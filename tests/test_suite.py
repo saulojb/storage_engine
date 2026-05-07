@@ -1141,6 +1141,52 @@ class TestRunner:
         self.check("COUNT(DISTINCT text): VEC ON == VEC OFF",
                    r_off9 == r_on9, f"OFF={r_off9!r}  ON={r_on9!r}")
 
+        # 12. SUM(arithmetic expression) — SUM(price * qty)
+        self.exec("""
+            DROP TABLE IF EXISTS _tgrp5;
+            CREATE TABLE _tgrp5 (
+                grp   integer,
+                price float8,
+                qty   integer
+            ) USING colcompress;
+            INSERT INTO _tgrp5
+            SELECT
+                i % 5,
+                (random() * 100)::float8,
+                (random() * 10)::integer
+            FROM generate_series(1, 100000) i;
+            ANALYZE _tgrp5;
+        """)
+        expr_sql = ("SELECT grp, SUM(price * qty) AS revenue "
+                    "FROM _tgrp5 GROUP BY grp ORDER BY grp")
+        r_off10 = self.q(f"{pfx_off} {expr_sql}")
+        r_on10  = self.q(f"{pfx_on} SET max_parallel_workers_per_gather=0; {expr_sql}")
+        self.check("SUM(price*qty): VEC ON == VEC OFF",
+                   r_off10 == r_on10, f"OFF={r_off10!r}  ON={r_on10!r}")
+
+        # 13. SUM(arithmetic expression) — SUM(a + b) integer columns
+        self.exec("""
+            DROP TABLE IF EXISTS _tgrp6;
+            CREATE TABLE _tgrp6 (
+                grp  integer,
+                a    integer,
+                b    integer
+            ) USING colcompress;
+            INSERT INTO _tgrp6
+            SELECT
+                i % 4,
+                (random() * 1000)::integer,
+                (random() * 500)::integer
+            FROM generate_series(1, 100000) i;
+            ANALYZE _tgrp6;
+        """)
+        expr2_sql = ("SELECT grp, SUM(a + b) AS total "
+                     "FROM _tgrp6 GROUP BY grp ORDER BY grp")
+        r_off11 = self.q(f"{pfx_off} {expr2_sql}")
+        r_on11  = self.q(f"{pfx_on} SET max_parallel_workers_per_gather=0; {expr2_sql}")
+        self.check("SUM(a+b): VEC ON == VEC OFF",
+                   r_off11 == r_on11, f"OFF={r_off11!r}  ON={r_on11!r}")
+
     # ------------------------------------------------------------------ maintenance API (Phase 1)
 
     def test_maintenance_api(self) -> None:

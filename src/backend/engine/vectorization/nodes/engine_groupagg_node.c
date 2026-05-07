@@ -59,6 +59,8 @@ static void   EndVecGroupAgg(CustomScanState *node);
 static void   ReScanVecGroupAgg(CustomScanState *node);
 static void   ExplainVecGroupAgg(CustomScanState *node, List *ancestors,
 								 ExplainState *es);
+static Datum  eval_vec_expr_node(VecExprNode *nodes, VecExprNode *cur,
+								  TupleTableSlot *batch_slot, int row_i, bool *isnull);
 
 static CustomScanMethods VecGroupAggScanMethods = {
 	"StorageEngineVectorGroupAgg",
@@ -440,6 +442,74 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 }
 
 /*
+ * Recursively evaluate an inline VecExprNode expression tree against
+ * a single row (row_i) of a VectorTupleTableSlot batch.
+ *
+ * Returns the result Datum and sets *isnull.  Any NULL input propagates
+ * as NULL output (SQL 3-valued logic).
+ */
+static Datum
+eval_vec_expr_node(VecExprNode *nodes, VecExprNode *cur,
+				   TupleTableSlot *batch_slot, int row_i, bool *isnull)
+{
+	if (cur->is_var)
+	{
+		VectorColumn *col = (VectorColumn *) batch_slot->tts_values[cur->slot_idx];
+
+		if (col == NULL)
+		{
+			*isnull = true;
+			return (Datum) 0;
+		}
+		*isnull = col->isnull[row_i];
+		if (*isnull)
+			return (Datum) 0;
+
+		{
+			int8 *rawptr = (int8 *) col->value +
+						   (int) col->columnTypeLen * row_i;
+			return fetch_att(rawptr, col->columnIsVal, col->columnTypeLen);
+		}
+	}
+	else
+	{
+		bool	lnull;
+		Datum	lval;
+
+		lval = eval_vec_expr_node(nodes, &nodes[cur->left],
+								  batch_slot, row_i, &lnull);
+		if (lnull)
+		{
+			*isnull = true;
+			return (Datum) 0;
+		}
+
+		if (cur->right >= 0)
+		{
+			/* Binary operator */
+			bool	rnull;
+			Datum	rval;
+
+			rval = eval_vec_expr_node(nodes, &nodes[cur->right],
+									  batch_slot, row_i, &rnull);
+			if (rnull)
+			{
+				*isnull = true;
+				return (Datum) 0;
+			}
+			*isnull = false;
+			return FunctionCall2(&cur->opfmgr, lval, rval);
+		}
+		else
+		{
+			/* Unary operator (type cast) */
+			*isnull = false;
+			return FunctionCall1(&cur->opfmgr, lval);
+		}
+	}
+}
+
+/*
  * Accumulate one value into a group entry for aggregate target t.
  */
 static void
@@ -502,6 +572,7 @@ accumulate_value(VecGroupAggState *state, VecGroupEntry *entry,
 
 	switch (tgt->agg_kind)
 	{
+		case VECGAGG_SUM_EXPR:	/* fall through: val was pre-evaluated from expr */
 		case VECGAGG_SUM:
 			if (tgt->result_typeoid == NUMERICOID)
 			{
@@ -914,7 +985,17 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 			Datum	val = (Datum) 0;
 			bool	val_null = true;
 
-			if (tgt->agg_kind != VECGAGG_COUNT_STAR && tgt->col_attnum >= 0)
+			if (tgt->agg_kind == VECGAGG_SUM_EXPR && tgt->expr_num_nodes > 0)
+			{
+				/*
+				 * VECGAGG_SUM_EXPR: evaluate the arithmetic expression tree
+				 * row-by-row against the VectorColumn batch.
+				 */
+				val = eval_vec_expr_node(tgt->expr_nodes,
+										 &tgt->expr_nodes[tgt->expr_root_idx],
+										 slot, i, &val_null);
+			}
+			else if (tgt->agg_kind != VECGAGG_COUNT_STAR && tgt->col_attnum >= 0)
 			{
 				int val_idx = tgt->col_attnum;
 				VectorColumn *val_col = (VectorColumn *) slot->tts_values[val_idx];
@@ -1045,11 +1126,13 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 					: 0);
 				break;
 			case VECGAGG_SUM:
+			case VECGAGG_SUM_EXPR:
 			case VECGAGG_MIN:
 			case VECGAGG_MAX:
 					if (tgt->result_typeoid == NUMERICOID)
 					{
-						if (state->is_partial_serial && tgt->agg_kind == VECGAGG_SUM)
+						if (state->is_partial_serial &&
+							(tgt->agg_kind == VECGAGG_SUM || tgt->agg_kind == VECGAGG_SUM_EXPR))
 						{
 							slot->tts_values[ra] =
 								call_numeric_unary_fmgr(
@@ -1058,7 +1141,8 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 									entry->numeric_state_acc[t] == (Datum) 0,
 									(Node *) &state->numeric_fake_aggstate);
 						}
-						else if (tgt->agg_kind == VECGAGG_SUM)
+						else if (tgt->agg_kind == VECGAGG_SUM ||
+								 tgt->agg_kind == VECGAGG_SUM_EXPR)
 						{
 							slot->tts_values[ra] =
 								call_numeric_unary_fmgr(
@@ -1343,6 +1427,30 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 				state->targets[tno].filter_typbyval   = true;
 				state->targets[tno].filter_eq_value   = (Datum) 0;
 			}
+		}
+
+		/* VECGAGG_SUM_EXPR: inline expression tree */
+		state->targets[tno].expr_num_nodes = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].expr_root_idx  = PRIV_INT(list_nth(priv, target_idx++));
+		for (int en = 0; en < state->targets[tno].expr_num_nodes; en++)
+		{
+			VecExprNode *n = &state->targets[tno].expr_nodes[en];
+
+			n->is_var    = (bool) PRIV_INT(list_nth(priv, target_idx++));
+			n->slot_idx  = PRIV_INT(list_nth(priv, target_idx++));
+			n->col_type  = PRIV_INT(list_nth(priv, target_idx++));
+			n->left      = PRIV_INT(list_nth(priv, target_idx++));
+			n->right     = PRIV_INT(list_nth(priv, target_idx++));
+			n->opfuncid  = (Oid) PRIV_INT(list_nth(priv, target_idx++));
+			n->rettype   = (Oid) PRIV_INT(list_nth(priv, target_idx++));
+
+			/* Load runtime function info for operator nodes */
+			if (!n->is_var && OidIsValid(n->opfuncid))
+				fmgr_info_cxt(n->opfuncid, &n->opfmgr, state->agg_context);
+
+			/* Load type info for the node's return type */
+			if (OidIsValid(n->rettype))
+				get_typlenbyval(n->rettype, &n->rettyplen, &n->retbyval);
 		}
 	}
 
@@ -1631,6 +1739,21 @@ engine_create_groupagg_node(int num_keys,
 			priv = lappend(priv, copyObject(targets[t].filter_const_plan));
 		else
 			priv = lappend(priv, makeNullConst(INT4OID, -1, InvalidOid));
+
+		/* VECGAGG_SUM_EXPR: inline expression tree (2 ints + 7 ints per node) */
+		MKINT(targets[t].expr_num_nodes);
+		MKINT(targets[t].expr_root_idx);
+		for (int en = 0; en < targets[t].expr_num_nodes; en++)
+		{
+			const VecExprNode *n = &targets[t].expr_nodes[en];
+			MKINT((int) n->is_var);
+			MKINT(n->slot_idx);
+			MKINT(n->col_type);
+			MKINT(n->left);
+			MKINT(n->right);
+			MKINT((int) n->opfuncid);
+			MKINT((int) n->rettype);
+		}
 	}
 
 #undef MKINT

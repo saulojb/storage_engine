@@ -34,6 +34,7 @@
 #define VECGAGG_AVG         5   /* avg(col) */
 #define VECGAGG_COUNT_COL      6   /* count(col) — NULL-aware */
 #define VECGAGG_COUNT_DISTINCT 7   /* count(distinct col) */
+#define VECGAGG_SUM_EXPR       8   /* sum(arithmetic expr with 2+ vars) */
 
 /*
  * Column type codes used in VecGroupAggTarget.
@@ -45,6 +46,33 @@
 #define VECGAGG_TYPE_NUMERIC 5
 #define VECGAGG_TYPE_BPCHAR 6
 #define VECGAGG_TYPE_TEXT   7
+
+/*
+ * Inline expression tree node for VECGAGG_SUM_EXPR.
+ * Represents one node of an arithmetic expression over scan columns.
+ * Supports Var leaves (is_var=true) and binary/unary operators (is_var=false).
+ *
+ * Plan-time fields: opfuncid, rettype, slot_idx, col_type, left, right.
+ * Runtime fields (loaded in BeginVecGroupAgg): opfmgr, retbyval, rettyplen.
+ */
+#define VECGAGG_EXPR_MAX_NODES 12
+
+typedef struct VecExprNode
+{
+	bool	is_var;		/* true = Var leaf, false = operator */
+	/* Var leaf */
+	int		slot_idx;	/* 0-based batch slot index (-1 for op nodes) */
+	int		col_type;	/* VECGAGG_TYPE_* of this node's result */
+	/* Operator node */
+	int		left;		/* index of left child (-1 for Var nodes) */
+	int		right;		/* index of right child (-1 for Var/unary nodes) */
+	Oid		opfuncid;	/* C function OID for the operator (0 for Var) */
+	Oid		rettype;	/* return type OID of this node */
+	/* Runtime only (loaded in BeginVecGroupAgg, not serialized) */
+	FmgrInfo opfmgr;	/* pre-loaded operator function info */
+	bool	retbyval;
+	int16	rettyplen;
+} VecExprNode;
 
 /*
  * Describes one aggregate target in the GROUP BY query.
@@ -75,6 +103,15 @@ typedef struct VecGroupAggTarget
 	bool	filter_typbyval;      /* by-value type? */
 	/* Plan-time only: Const node used during serialization. NULL at runtime. */
 	struct Const *filter_const_plan;
+
+	/*
+	 * VECGAGG_SUM_EXPR: inline arithmetic expression tree.
+	 * Built by the planner from OpExpr/FuncExpr/Var nodes.
+	 * expr_num_nodes=0 for all non-EXPR aggregate kinds.
+	 */
+	int			expr_num_nodes;					/* 0 = no expression */
+	int			expr_root_idx;					/* index of root in expr_nodes[] */
+	VecExprNode	expr_nodes[VECGAGG_EXPR_MAX_NODES];
 } VecGroupAggTarget;
 
 /* Maximum composite GROUP BY keys */
@@ -98,7 +135,7 @@ typedef struct VecGroupKey
  * Per-group accumulator entry stored in the HTAB.
  * Supports up to 8 aggregate targets per query.
  */
-#define VECGROUPAGG_MAX_TARGETS 8
+#define VECGROUPAGG_MAX_TARGETS 16
 
 typedef struct VecGroupEntry
 {

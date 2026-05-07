@@ -778,6 +778,153 @@ ExtractAggInputVar(Node *expr, Var **out_var, Oid *out_expr_type,
 }
 
 /*
+ * Recursively build an inline VecExprNode tree from an arithmetic expression.
+ *
+ * Accepted node types:
+ *   Var           — scan column reference (leaf)
+ *   RelabelType   — lossless relabel (peeled, transparent)
+ *   OpExpr        — binary arithmetic operator (both args recursive)
+ *   FuncExpr      — unary numeric cast (single arg recursive)
+ *
+ * All column types and operator/function return types must be supported
+ * (TypeOidToVecGaggType returns ≥ 0).
+ *
+ * Returns the index of the new root node in nodes[], or -1 on failure.
+ */
+static int
+ExtractArithExprNode(Node *expr, Plan *child_plan,
+					 VecExprNode *nodes, int *num_nodes, int max_nodes)
+{
+	if (expr == NULL)
+		return -1;
+
+	/* Peel lossless relabels */
+	while (IsA(expr, RelabelType))
+		expr = (Node *) ((RelabelType *) expr)->arg;
+
+	if (IsA(expr, Var))
+	{
+		Var		   *v = (Var *) expr;
+		AttrNumber	table_attno;
+		int			slot_idx;
+		int			col_type;
+
+		if (v->varattno <= 0)
+			return -1;
+
+		table_attno = ScanOutputPosToVarAttno(child_plan, v->varattno);
+		if (table_attno == 0)
+			return -1;
+
+		slot_idx = VarAttnoToSlotIdx(child_plan, table_attno);
+		if (slot_idx < 0)
+			return -1;
+
+		col_type = TypeOidToVecGaggType(v->vartype);
+		if (col_type < 0)
+			return -1;
+
+		if (*num_nodes >= max_nodes)
+			return -1;
+
+		{
+			int			idx = (*num_nodes)++;
+			VecExprNode *n  = &nodes[idx];
+
+			n->is_var   = true;
+			n->slot_idx = slot_idx;
+			n->col_type = col_type;
+			n->left     = -1;
+			n->right    = -1;
+			n->opfuncid = InvalidOid;
+			n->rettype  = v->vartype;
+			return idx;
+		}
+	}
+
+	if (IsA(expr, OpExpr))
+	{
+		OpExpr *op = (OpExpr *) expr;
+		int		ret_type;
+		int		left_idx, right_idx;
+
+		if (list_length(op->args) != 2)
+			return -1;
+		if (!OidIsValid(op->opfuncid))
+			return -1;
+
+		ret_type = TypeOidToVecGaggType(op->opresulttype);
+		if (ret_type < 0)
+			return -1;
+
+		left_idx = ExtractArithExprNode((Node *) linitial(op->args),
+										child_plan, nodes, num_nodes, max_nodes);
+		if (left_idx < 0)
+			return -1;
+
+		right_idx = ExtractArithExprNode((Node *) lsecond(op->args),
+										 child_plan, nodes, num_nodes, max_nodes);
+		if (right_idx < 0)
+			return -1;
+
+		if (*num_nodes >= max_nodes)
+			return -1;
+
+		{
+			int			idx = (*num_nodes)++;
+			VecExprNode *n  = &nodes[idx];
+
+			n->is_var   = false;
+			n->slot_idx = -1;
+			n->col_type = ret_type;
+			n->left     = left_idx;
+			n->right    = right_idx;
+			n->opfuncid = op->opfuncid;
+			n->rettype  = op->opresulttype;
+			return idx;
+		}
+	}
+
+	if (IsA(expr, FuncExpr))
+	{
+		FuncExpr   *f = (FuncExpr *) expr;
+		int			ret_type;
+		int			child_idx;
+
+		if (list_length(f->args) != 1)
+			return -1;
+
+		ret_type = TypeOidToVecGaggType(f->funcresulttype);
+		if (ret_type < 0)
+			return -1;
+
+		child_idx = ExtractArithExprNode((Node *) linitial(f->args),
+										 child_plan, nodes, num_nodes, max_nodes);
+		if (child_idx < 0)
+			return -1;
+
+		if (*num_nodes >= max_nodes)
+			return -1;
+
+		{
+			int			idx = (*num_nodes)++;
+			VecExprNode *n  = &nodes[idx];
+
+			n->is_var   = false;
+			n->slot_idx = -1;
+			n->col_type = ret_type;
+			n->left     = child_idx;
+			n->right    = -1;		/* unary */
+			n->opfuncid = f->funcid;
+			n->rettype  = f->funcresulttype;
+			return idx;
+		}
+	}
+
+	return -1;	/* unsupported node type */
+}
+
+/*
  * Extract an Aggref from a target expression that may be wrapped by
  * single-argument coercion/finalize nodes.
  */
@@ -839,6 +986,11 @@ ExtractTargetAggref(Node *expr, Aggref **out_aggref)
  *   out_filter_const      — Const node for the equality constant
  *   out_filter_typeoid    — type OID of the filter column
  *
+ * Optional EXPR output params (pass NULL to disable EXPR classification):
+ *   out_expr_nodes        — pre-allocated VecExprNode array (VECGAGG_EXPR_MAX_NODES)
+ *   out_expr_num_nodes    — number of nodes filled in out_expr_nodes
+ *   out_expr_root_idx     — index of root node in out_expr_nodes
+ *
  * Returns false if the aggregate is not supported.
  */
 static bool
@@ -848,7 +1000,10 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 			   bool *out_has_case_filter,
 			   AttrNumber *out_filter_scan_pos,
 			   Const **out_filter_const,
-			   Oid *out_filter_typeoid)
+			   Oid *out_filter_typeoid,
+			   VecExprNode *out_expr_nodes,
+			   int *out_expr_num_nodes,
+			   int *out_expr_root_idx)
 {
 	const char *fname;
 	Var		   *arg_var = NULL;
@@ -864,6 +1019,8 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 	if (out_filter_scan_pos)  *out_filter_scan_pos  = 0;
 	if (out_filter_const)     *out_filter_const     = NULL;
 	if (out_filter_typeoid)   *out_filter_typeoid   = InvalidOid;
+	if (out_expr_num_nodes)   *out_expr_num_nodes   = 0;
+	if (out_expr_root_idx)    *out_expr_root_idx    = -1;
 
 	/* FILTER clause not supported */
 	if (aggref->aggfilter != NULL)
@@ -900,7 +1057,50 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 								   &case_filter_scan_pos,
 								   &case_filter_const,
 								   &case_filter_typeoid))
+		{
+			/*
+			 * Not CASE WHEN either — try arithmetic expression for SUM.
+			 * Handles SUM(price * quantity), SUM(a + b), SUM(a * b + c), etc.
+			 * Only SUM is supported for expressions (not AVG/MIN/MAX).
+			 */
+			if (out_expr_nodes != NULL && out_expr_num_nodes != NULL &&
+				out_expr_root_idx != NULL)
+			{
+				const char *expr_fname = get_func_name(aggref->aggfnoid);
+
+				if (expr_fname != NULL &&
+					(strcmp(expr_fname, "sum") == 0 ||
+					 strcmp(expr_fname, "int4_sum") == 0 ||
+					 strcmp(expr_fname, "int8_sum") == 0 ||
+					 strcmp(expr_fname, "float8pl") == 0))
+				{
+					int		expr_num = 0;
+					int		expr_root = -1;
+
+					expr_root = ExtractArithExprNode(
+						(Node *) arg_te->expr, child_plan,
+						out_expr_nodes, &expr_num, VECGAGG_EXPR_MAX_NODES);
+
+					if (expr_root >= 0 && expr_num >= 2)
+					{
+						Oid root_rettype = out_expr_nodes[expr_root].rettype;
+						int root_col_type = TypeOidToVecGaggType(root_rettype);
+
+						if (root_col_type >= 0)
+						{
+							*out_expr_num_nodes       = expr_num;
+							*out_expr_root_idx        = expr_root;
+							*out_kind                 = VECGAGG_SUM_EXPR;
+							*out_col_varattno         = 0;
+							*out_col_typeoid          = root_rettype;
+							*out_avg_input_as_float8  = false;
+							return true;
+						}
+					}
+				}
+			}
 			return false;
+		}
 
 		arg_var            = case_value_var;
 		arg_expr_type      = arg_var->vartype;
@@ -1088,6 +1288,7 @@ PlanTreeMutator(Plan *node, void *context)
 
 			if (!engine_enable_vectorization)
 				return node;
+
 			if (aggNode->plan.lefttree->type == T_CustomScan)
 			{
 				/*
@@ -1228,10 +1429,22 @@ PlanTreeMutator(Plan *node, void *context)
 				 * For AGG_SORTED the planner inserts a Sort node between
 				 * the Agg and the scan.  Strip it — VecGroupAgg uses a
 				 * hash table and does not need sorted input.
+				 *
+				 * When the planner uses parallel workers it wraps the scan in
+				 * Gather / GatherMerge.  VecGroupAgg has its own internal
+				 * parallel scan mechanism, so strip through those nodes too.
 				 */
 				scan_plan = child_plan;
 				if (scan_plan->type == T_Sort)
 					scan_plan = ((Sort *) scan_plan)->plan.lefttree;
+
+				/* Strip Gather / GatherMerge inserted for parallel workers */
+				if (scan_plan->type == T_Gather || scan_plan->type == T_GatherMerge)
+				{
+					scan_plan = scan_plan->lefttree;
+					if (scan_plan->type == T_Sort)
+						scan_plan = ((Sort *) scan_plan)->plan.lefttree;
+				}
 
 				/* Child must be our ColcompressScan */
 				if (scan_plan->type != T_CustomScan)
@@ -1260,15 +1473,13 @@ PlanTreeMutator(Plan *node, void *context)
 				}
 
 				/*
-				 * Multi-key sorted output not supported: VecGroupAgg's
-				 * sorted-emission comparator handles only a single key.
-				 * For multi-column GROUP BY use hash strategy only.
+				 * Multi-key sorted strategy: VecGroupAgg uses a hash table
+				 * internally and does not need sorted input. The sort_output
+				 * flag is already false for multi-key (only single-key AGG_SORTED
+				 * emits sorted output). Any required output ordering is handled
+				 * by the outer Sort node left intact in the plan.
+				 * Therefore this case is safe to vectorize.
 				 */
-				if (aggNode->numCols > 1 && aggNode->aggstrategy == AGG_SORTED)
-				{
-					fallback_reason = "multi-key sorted GROUP BY not supported";
-					goto groupagg_fallback;
-				}
 
 				if (aggNode->numCols >= 1)
 				{
@@ -1501,8 +1712,7 @@ PlanTreeMutator(Plan *node, void *context)
 
 					if (num_targets >= VECGROUPAGG_MAX_TARGETS)
 					{
-						supported = false;
-						break;
+							fallback_reason = psprintf("too many aggregate targets (max %d)", VECGROUPAGG_MAX_TARGETS);
 					}
 
 					{
@@ -1510,6 +1720,9 @@ PlanTreeMutator(Plan *node, void *context)
 						AttrNumber  agg_filter_spos  = 0;
 						Const      *agg_filter_const = NULL;
 						Oid         agg_filter_toid  = InvalidOid;
+						VecExprNode	expr_nodes_tmp[VECGAGG_EXPR_MAX_NODES];
+						int			expr_num_tmp  = 0;
+						int			expr_root_tmp = -1;
 
 						if (!ClassifyAggref(aggref, scan_plan,
 												&kind, &col_varattno, &col_typeoid,
@@ -1517,7 +1730,10 @@ PlanTreeMutator(Plan *node, void *context)
 												&agg_has_case,
 												&agg_filter_spos,
 												&agg_filter_const,
-												&agg_filter_toid))
+												&agg_filter_toid,
+												expr_nodes_tmp,
+												&expr_num_tmp,
+												&expr_root_tmp))
 						{
 							fallback_reason = psprintf("aggregate target unsupported: %s",
 											   get_func_name(aggref->aggfnoid));
@@ -1557,6 +1773,20 @@ PlanTreeMutator(Plan *node, void *context)
 							targets[num_targets].filter_col_attnum = -1;
 							targets[num_targets].filter_col_type   = -1;
 						}
+
+						/* Copy expression tree for VECGAGG_SUM_EXPR targets */
+						if (kind == VECGAGG_SUM_EXPR && expr_num_tmp > 0)
+						{
+							memcpy(targets[num_targets].expr_nodes, expr_nodes_tmp,
+								   sizeof(VecExprNode) * expr_num_tmp);
+							targets[num_targets].expr_num_nodes = expr_num_tmp;
+							targets[num_targets].expr_root_idx  = expr_root_tmp;
+						}
+						else
+						{
+							targets[num_targets].expr_num_nodes = 0;
+							targets[num_targets].expr_root_idx  = -1;
+						}
 					}
 
 					/*
@@ -1572,8 +1802,8 @@ PlanTreeMutator(Plan *node, void *context)
 					 */
 					{
 						int col_slot_idx;
-						if (kind == VECGAGG_COUNT_STAR)
-							col_slot_idx = -1;
+						if (kind == VECGAGG_COUNT_STAR || kind == VECGAGG_SUM_EXPR)
+							col_slot_idx = -1;  /* no single column for these kinds */
 						else
 						{
 							col_slot_idx = VarAttnoToSlotIdx(scan_plan, col_varattno);
