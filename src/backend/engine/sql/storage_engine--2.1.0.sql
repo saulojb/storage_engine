@@ -2806,3 +2806,346 @@ COMMENT ON FUNCTION engine.storage_maintenance_stats(regclass)
     IS 'returns maintenance statistics for a single colcompress or rowcompress table (subset of engine.storage_health)';
 
 GRANT EXECUTE ON FUNCTION engine.storage_maintenance_stats(regclass) TO PUBLIC;
+
+
+-- ============================================================
+-- Phase 3: Incremental Merge
+-- ============================================================
+
+-- engine.colcompress_merge_incremental — rewrite only dirty stripes
+-- ============================================================
+--
+-- Selects the N dirtiest stripes (pruning_valid=false, ordered by dirty_rows
+-- descending) and rewrites each one: live rows are buffered into a temp heap,
+-- the stripe is deleted, rows re-inserted as a new fully-packed stripe with
+-- fresh min/max metadata, then the old (now fully-dead) stripe's catalog
+-- entry is reset (pruning_valid=true, dirty_rows=0).
+--
+-- One COMMIT per stripe — crash-safe; re-run CALL to resume.
+--
+-- Parameters:
+--   table_name  — regclass of the colcompress table
+--   max_stripes — maximum number of dirty stripes to process (default 128)
+--
+-- Usage:
+--   CALL engine.colcompress_merge_incremental('mytable');
+--   CALL engine.colcompress_merge_incremental('mytable', max_stripes => 32);
+
+CREATE OR REPLACE PROCEDURE engine.colcompress_merge_incremental(
+    IN table_name  regclass,
+    IN max_stripes int DEFAULT 128
+)
+LANGUAGE plpgsql
+AS $procedure$
+DECLARE
+    _nspname     text;
+    _relname     text;
+    _qualname    text;
+    _collist     text;
+    _storage_id  bigint;
+    _stripe_num  bigint;
+    _first_rn    bigint;
+    _last_rn     bigint;
+    _row_count   bigint;
+    _dirty_rows  bigint;
+    _tid_min     tid;
+    _tid_max     tid;
+    _live_rows   bigint;
+    _n_ins       bigint;
+    _total_ins   bigint := 0;
+    _n_merged    int    := 0;
+    _n_cleaned   int    := 0;
+BEGIN
+    SELECT n.nspname, c.relname
+      INTO _nspname, _relname
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid = table_name;
+
+    _qualname := quote_ident(_nspname) || '.' || quote_ident(_relname);
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_am a ON a.oid = c.relam
+        WHERE c.oid = table_name AND a.amname = 'colcompress'
+    ) THEN
+        RAISE EXCEPTION 'colcompress_merge_incremental: % is not a colcompress table', _qualname;
+    END IF;
+
+    IF max_stripes < 1 THEN
+        RAISE EXCEPTION 'colcompress_merge_incremental: max_stripes must be >= 1 (got %)', max_stripes;
+    END IF;
+
+    RAISE NOTICE 'merge_incremental: starting on % (max_stripes=%)', _qualname, max_stripes;
+
+    PERFORM set_config('statement_timeout', '0', false);
+    PERFORM set_config('lock_timeout',      '0', false);
+
+    _storage_id := engine.colcompress_relation_storageid(table_name);
+
+    SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum)
+      INTO _collist
+      FROM pg_attribute
+     WHERE attrelid = table_name AND attnum > 0 AND NOT attisdropped;
+
+    -- Iterate over dirty stripes, most-dirty first, up to max_stripes.
+    -- PL/pgSQL materialises the FOR cursor before the first COMMIT so the
+    -- result set is stable across transaction boundaries inside the loop.
+    FOR _stripe_num, _first_rn, _last_rn, _row_count, _dirty_rows IN
+        SELECT stripe_num,
+               first_row_number,
+               first_row_number + row_count - 1,
+               row_count,
+               dirty_rows
+          FROM engine.stripe
+         WHERE storage_id = _storage_id
+           AND NOT pruning_valid
+         ORDER BY dirty_rows DESC
+         LIMIT max_stripes
+    LOOP
+        PERFORM set_config('statement_timeout', '0', false);
+        PERFORM set_config('lock_timeout',      '0', false);
+
+        _tid_min := engine.row_number_to_tid(_first_rn);
+        _tid_max := engine.row_number_to_tid(_last_rn);
+
+        -- Count live rows in this stripe
+        EXECUTE format(
+            'SELECT count(*) FROM %s WHERE ctid BETWEEN $1 AND $2',
+            _qualname
+        ) USING _tid_min, _tid_max
+          INTO _live_rows;
+
+        IF _live_rows = 0 THEN
+            -- Fully dead stripe — only metadata cleanup needed
+            UPDATE engine.stripe
+               SET pruning_valid = true, dirty_rows = 0
+             WHERE storage_id = _storage_id AND stripe_num = _stripe_num;
+            COMMIT;
+            _n_cleaned := _n_cleaned + 1;
+            RAISE NOTICE 'merge_incremental: stripe % — fully dead, metadata cleaned', _stripe_num;
+            CONTINUE;
+        END IF;
+
+        -- a. Buffer live rows (ON COMMIT DROP ensures cleanup on crash)
+        EXECUTE format(
+            'CREATE TEMP TABLE _se_incmerge_tmp ON COMMIT DROP AS'
+            ' SELECT %s FROM %s WHERE ctid BETWEEN $1 AND $2',
+            _collist, _qualname
+        ) USING _tid_min, _tid_max;
+
+        -- b. Delete live rows from this stripe (marks deleted_mask bits)
+        EXECUTE format(
+            'DELETE FROM %s WHERE ctid BETWEEN $1 AND $2',
+            _qualname
+        ) USING _tid_min, _tid_max;
+
+        -- c. Re-insert as a new, fully-packed stripe with fresh min/max stats
+        EXECUTE format(
+            'INSERT INTO %s (%s) SELECT %s FROM _se_incmerge_tmp',
+            _qualname, _collist, _collist
+        );
+        GET DIAGNOSTICS _n_ins = ROW_COUNT;
+
+        -- COMMIT: flushes row_mask write state (C triggers MarkStripePruningInvalid
+        -- for the rows just deleted, re-marking old stripe dirty — cleaned below).
+        -- ON COMMIT DROP destroys _se_incmerge_tmp atomically.
+        COMMIT;
+
+        -- d. Reset the now fully-dead old stripe's metadata.
+        --    No new deletions can touch it (all rows are masked); safe to reset.
+        PERFORM set_config('statement_timeout', '0', false);
+        PERFORM set_config('lock_timeout',      '0', false);
+        UPDATE engine.stripe
+           SET pruning_valid = true, dirty_rows = 0
+         WHERE storage_id = _storage_id AND stripe_num = _stripe_num;
+        COMMIT;
+
+        _total_ins := _total_ins + _n_ins;
+        _n_merged  := _n_merged + 1;
+
+        RAISE NOTICE 'merge_incremental: stripe % — % live rows rewritten (dirty_rows was %)',
+            _stripe_num, _n_ins, _dirty_rows;
+    END LOOP;
+
+    COMMIT;
+
+    RAISE NOTICE
+        E'merge_incremental: complete — % stripe(s) rewritten (% rows moved), % fully-dead stripe(s) cleaned.\n'
+        'If B-tree indexes exist on %, run:\n'
+        '  REINDEX TABLE CONCURRENTLY %;',
+        _n_merged, _total_ins, _n_cleaned, _qualname, _qualname;
+END;
+$procedure$;
+
+COMMENT ON PROCEDURE engine.colcompress_merge_incremental(regclass, int)
+    IS 'Incremental maintenance for colcompress tables. Selects up to max_stripes dirty stripes (pruning_valid=false), ordered by dirty_rows descending, and rewrites each one: live rows are buffered into a temp heap, the stripe is deleted, rows are re-inserted as a new fully-packed stripe with fresh min/max metadata, and the old stripe catalog entry is reset. One COMMIT per stripe; crash-safe (re-run CALL to resume). Run REINDEX TABLE CONCURRENTLY after completion if indexes exist.';
+
+GRANT EXECUTE ON PROCEDURE engine.colcompress_merge_incremental(regclass, int) TO PUBLIC;
+
+
+-- engine.rowcompress_merge_incremental — rewrite only dirty batches
+-- ============================================================
+--
+-- Selects the N dirtiest batches (pruning_valid=false, ordered by
+-- deleted_count descending) and rewrites each one: live rows are buffered
+-- into a temp heap, the batch is deleted, rows re-inserted as a new clean
+-- batch with fresh metadata, then the old (fully-dead) batch's pruning_valid
+-- is reset to true.
+--
+-- One COMMIT per batch — crash-safe; re-run CALL to resume.
+--
+-- Parameters:
+--   table_name  — regclass of the rowcompress table
+--   max_batches — maximum number of dirty batches to process (default 256)
+--
+-- Usage:
+--   CALL engine.rowcompress_merge_incremental('mytable');
+--   CALL engine.rowcompress_merge_incremental('mytable', max_batches => 64);
+
+CREATE OR REPLACE PROCEDURE engine.rowcompress_merge_incremental(
+    IN table_name  regclass,
+    IN max_batches int DEFAULT 256
+)
+LANGUAGE plpgsql
+AS $procedure$
+DECLARE
+    _nspname       text;
+    _relname       text;
+    _qualname      text;
+    _collist       text;
+    _storage_id    bigint;
+    _batch_num     bigint;
+    _first_rn      bigint;
+    _last_rn       bigint;
+    _row_count     int;
+    _deleted_count int;
+    _tid_min       tid;
+    _tid_max       tid;
+    _live_rows     bigint;
+    _n_ins         bigint;
+    _total_ins     bigint := 0;
+    _n_merged      int    := 0;
+    _n_cleaned     int    := 0;
+BEGIN
+    SELECT n.nspname, c.relname
+      INTO _nspname, _relname
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid = table_name;
+
+    _qualname := quote_ident(_nspname) || '.' || quote_ident(_relname);
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_am a ON a.oid = c.relam
+        WHERE c.oid = table_name AND a.amname = 'rowcompress'
+    ) THEN
+        RAISE EXCEPTION 'rowcompress_merge_incremental: % is not a rowcompress table', _qualname;
+    END IF;
+
+    IF max_batches < 1 THEN
+        RAISE EXCEPTION 'rowcompress_merge_incremental: max_batches must be >= 1 (got %)', max_batches;
+    END IF;
+
+    RAISE NOTICE 'merge_incremental: starting on % (max_batches=%)', _qualname, max_batches;
+
+    PERFORM set_config('statement_timeout', '0', false);
+    PERFORM set_config('lock_timeout',      '0', false);
+
+    _storage_id := engine.rowcompress_relation_storageid(table_name);
+
+    SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum)
+      INTO _collist
+      FROM pg_attribute
+     WHERE attrelid = table_name AND attnum > 0 AND NOT attisdropped;
+
+    -- Iterate over dirty batches, most-deleted first, up to max_batches.
+    FOR _batch_num, _first_rn, _last_rn, _row_count, _deleted_count IN
+        SELECT batch_num,
+               first_row_number,
+               first_row_number + row_count - 1,
+               row_count,
+               deleted_count
+          FROM engine.row_batch
+         WHERE storage_id = _storage_id
+           AND NOT pruning_valid
+         ORDER BY deleted_count DESC
+         LIMIT max_batches
+    LOOP
+        PERFORM set_config('statement_timeout', '0', false);
+        PERFORM set_config('lock_timeout',      '0', false);
+
+        _tid_min := engine.row_number_to_tid(_first_rn);
+        _tid_max := engine.row_number_to_tid(_last_rn);
+
+        -- Count live rows in this batch
+        EXECUTE format(
+            'SELECT count(*) FROM %s WHERE ctid BETWEEN $1 AND $2',
+            _qualname
+        ) USING _tid_min, _tid_max
+          INTO _live_rows;
+
+        IF _live_rows = 0 THEN
+            -- Fully dead batch — only reset pruning_valid (leave deleted_mask intact)
+            UPDATE engine.row_batch
+               SET pruning_valid = true
+             WHERE storage_id = _storage_id AND batch_num = _batch_num;
+            COMMIT;
+            _n_cleaned := _n_cleaned + 1;
+            RAISE NOTICE 'merge_incremental: batch % — fully dead, metadata cleaned', _batch_num;
+            CONTINUE;
+        END IF;
+
+        -- a. Buffer live rows (ON COMMIT DROP ensures cleanup on crash)
+        EXECUTE format(
+            'CREATE TEMP TABLE _se_incmerge_tmp ON COMMIT DROP AS'
+            ' SELECT %s FROM %s WHERE ctid BETWEEN $1 AND $2',
+            _collist, _qualname
+        ) USING _tid_min, _tid_max;
+
+        -- b. Delete live rows (C code updates deleted_mask/deleted_count in row_batch)
+        EXECUTE format(
+            'DELETE FROM %s WHERE ctid BETWEEN $1 AND $2',
+            _qualname
+        ) USING _tid_min, _tid_max;
+
+        -- c. Re-insert as a new clean batch with fresh metadata
+        EXECUTE format(
+            'INSERT INTO %s (%s) SELECT %s FROM _se_incmerge_tmp',
+            _qualname, _collist, _collist
+        );
+        GET DIAGNOSTICS _n_ins = ROW_COUNT;
+
+        -- COMMIT: ON COMMIT DROP destroys _se_incmerge_tmp atomically.
+        COMMIT;
+
+        -- d. Reset old (fully-dead) batch pruning_valid to remove it from
+        --    storage_health.dirty_units.  deleted_mask/deleted_count are left
+        --    intact (MVCC correctness); they no longer affect pruning decisions.
+        PERFORM set_config('statement_timeout', '0', false);
+        PERFORM set_config('lock_timeout',      '0', false);
+        UPDATE engine.row_batch
+           SET pruning_valid = true
+         WHERE storage_id = _storage_id AND batch_num = _batch_num;
+        COMMIT;
+
+        _total_ins := _total_ins + _n_ins;
+        _n_merged  := _n_merged + 1;
+
+        RAISE NOTICE 'merge_incremental: batch % — % live rows rewritten (deleted_count was %)',
+            _batch_num, _n_ins, _deleted_count;
+    END LOOP;
+
+    COMMIT;
+
+    RAISE NOTICE
+        'merge_incremental: complete — % batch(es) rewritten (% rows moved), % fully-dead batch(es) cleaned.',
+        _n_merged, _total_ins, _n_cleaned;
+END;
+$procedure$;
+
+COMMENT ON PROCEDURE engine.rowcompress_merge_incremental(regclass, int)
+    IS 'Incremental maintenance for rowcompress tables. Selects up to max_batches dirty batches (pruning_valid=false), ordered by deleted_count descending, and rewrites each one: live rows are buffered into a temp heap, the batch is deleted, rows are re-inserted as a new clean batch with fresh metadata, and the old batch pruning_valid is reset. deleted_mask/deleted_count are preserved for MVCC correctness. One COMMIT per batch; crash-safe (re-run CALL to resume).';
+
+GRANT EXECUTE ON PROCEDURE engine.rowcompress_merge_incremental(regclass, int) TO PUBLIC;
