@@ -277,6 +277,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/tlist.h"
 #include "parser/parse_agg.h"
 #include "parser/parse_coerce.h"
 #include "utils/acl.h"
@@ -465,6 +466,11 @@ static void finalize_aggregate(AggState *aggstate,
 							   AggStatePerAgg peragg,
 							   AggStatePerGroup pergroupstate,
 							   Datum *resultVal, bool *resultIsNull);
+
+static Datum CloneFinalAggregateState(AggState *aggstate,
+						   AggStatePerTrans pertrans,
+						   Datum transValue,
+						   bool *transValueIsNull);
 static void finalize_partialaggregate(AggState *aggstate,
 									  AggStatePerAgg peragg,
 									  AggStatePerGroup pergroupstate,
@@ -550,6 +556,147 @@ static void build_pertrans_for_aggref(AggStatePerTrans pertrans,
 									  int numArguments);
 #endif
 static AggState * VExecInitAgg(Agg *node, EState *estate, int eflags);
+
+static bool
+GetVectorizedAggregateTransfn(Oid aggregateOid, Oid *transfnOid)
+{
+	Oid			vectorizedAggOid = InvalidOid;
+	HeapTuple	aggTuple;
+	Form_pg_aggregate aggform;
+
+	if (!GetVectorizedProcedureOid(aggregateOid, &vectorizedAggOid))
+		return false;
+
+	aggTuple = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(vectorizedAggOid));
+	if (!HeapTupleIsValid(aggTuple))
+		elog(ERROR, "cache lookup failed for vectorized aggregate %u",
+			 vectorizedAggOid);
+
+	aggform = (Form_pg_aggregate) GETSTRUCT(aggTuple);
+	*transfnOid = aggform->aggtransfn;
+	ReleaseSysCache(aggTuple);
+
+	return OidIsValid(*transfnOid);
+}
+
+typedef struct
+{
+	AttrNumber *attnos;
+	int		   *count;
+} VectorAggAttnoCollectorCtx;
+
+static bool
+VectorAggCollectVarAttnosWalker(Node *node, void *context)
+{
+	VectorAggAttnoCollectorCtx *ctx = (VectorAggAttnoCollectorCtx *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Var *var = (Var *) node;
+		int j;
+
+		if (var->varattno <= 0)
+			return false;
+
+		for (j = 0; j < *ctx->count; j++)
+			if (ctx->attnos[j] == var->varattno)
+				return false;
+
+		ctx->attnos[(*ctx->count)++] = var->varattno;
+		return false;
+	}
+
+	return expression_tree_walker(node, VectorAggCollectVarAttnosWalker, context);
+}
+
+static void
+VectorAggCollectProjectedAttnos(Plan *scan_plan, AttrNumber *attnos, int *count)
+{
+	ListCell *lc;
+	VectorAggAttnoCollectorCtx ctx;
+
+	ctx.attnos = attnos;
+	ctx.count = count;
+
+	foreach(lc, scan_plan->targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		if (te->resjunk || !IsA(te->expr, Var))
+			continue;
+
+		(void) VectorAggCollectVarAttnosWalker((Node *) te->expr, &ctx);
+	}
+
+	(void) VectorAggCollectVarAttnosWalker((Node *) scan_plan->qual, &ctx);
+
+	if (IsA(scan_plan, CustomScan))
+	{
+		CustomScan *customScan = (CustomScan *) scan_plan;
+
+		(void) VectorAggCollectVarAttnosWalker((Node *) customScan->custom_exprs, &ctx);
+		(void) VectorAggCollectVarAttnosWalker((Node *) customScan->custom_private, &ctx);
+	}
+}
+
+static int
+VectorAggVarAttnoToSlotIdx(Plan *scan_plan, AttrNumber table_attno)
+{
+	int			n = 0;
+	int			i;
+	AttrNumber	attnos[MaxTupleAttributeNumber];
+
+	VectorAggCollectProjectedAttnos(scan_plan, attnos, &n);
+
+	for (i = 1; i < n; i++)
+	{
+		AttrNumber	key = attnos[i];
+		int			j = i - 1;
+
+		while (j >= 0 && attnos[j] > key)
+		{
+			attnos[j + 1] = attnos[j];
+			j--;
+		}
+		attnos[j + 1] = key;
+	}
+
+	for (i = 0; i < n; i++)
+		if (attnos[i] == table_attno)
+			return i;
+
+	return -1;
+}
+
+static TargetEntry *
+VectorAggGetTleByResno(List *targetlist, AttrNumber resno)
+{
+	ListCell *lc;
+
+	foreach(lc, targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		if (te->resno == resno)
+			return te;
+	}
+
+	return NULL;
+}
+
+static AttrNumber
+VectorAggScanOutputPosToVarAttno(Plan *scan_plan, AttrNumber scan_pos)
+{
+	TargetEntry *te = VectorAggGetTleByResno(scan_plan->targetlist, scan_pos);
+
+	if (te == NULL || !IsA(te->expr, Var))
+		return 0;
+
+	return ((Var *) te->expr)->varattno;
+}
 
 /*
  * Select the current grouping set; affects current_set and
@@ -826,6 +973,14 @@ advance_transition_function(AggState *aggstate,
 	FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
 	MemoryContext oldContext;
 	Datum		newVal;
+	const char *transfn_name = NULL;
+	bool vectorized_transfn = false;
+
+	if (OidIsValid(pertrans->transfn_oid))
+	{
+		transfn_name = get_func_name(pertrans->transfn_oid);
+		vectorized_transfn = (transfn_name != NULL && transfn_name[0] == 'v');
+	}
 
 	if (pertrans->transfn.fn_strict)
 	{
@@ -841,7 +996,7 @@ advance_transition_function(AggState *aggstate,
 			if (fcinfo->args[i].isnull)
 				return;
 		}
-		if (pergroupstate->noTransValue)
+		if (pergroupstate->noTransValue && !vectorized_transfn)
 		{
 			/*
 			 * transValue has not been initialized. This is the first non-NULL
@@ -878,6 +1033,28 @@ advance_transition_function(AggState *aggstate,
 
 	/* set up aggstate->curpertrans for AggGetAggref() */
 	aggstate->curpertrans = pertrans;
+	if (aggstate->numaggs > 1)
+	{
+		AttrNumber	arg_attno = 0;
+		Oid			arg_type = InvalidOid;
+		VectorColumn *arg_column = NULL;
+
+		if (pertrans->aggref != NULL && list_length(pertrans->aggref->args) == 1)
+		{
+			TargetEntry *arg_te = (TargetEntry *) linitial(pertrans->aggref->args);
+
+			if (arg_te != NULL && IsA(arg_te->expr, Var))
+			{
+				Var *arg_var = (Var *) arg_te->expr;
+
+				arg_attno = arg_var->varattno;
+				arg_type = arg_var->vartype;
+			}
+		}
+
+		if (!fcinfo->args[1].isnull)
+			arg_column = (VectorColumn *) DatumGetPointer(fcinfo->args[1].value);
+	}
 
 	/*
 	 * OK to call the transition function
@@ -1174,8 +1351,13 @@ finalize_aggregate(AggState *aggstate,
 	int			i;
 	ListCell   *lc;
 	AggStatePerTrans pertrans = &aggstate->pertrans[peragg->transno];
+	Datum		finalTransValue = pergroupstate->transValue;
+	bool		finalTransValueIsNull = pergroupstate->transValueIsNull;
 
 	oldContext = MemoryContextSwitchTo(aggstate->ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
+	finalTransValue = CloneFinalAggregateState(aggstate, pertrans,
+									   finalTransValue,
+									   &finalTransValueIsNull);
 
 	/*
 	 * Evaluate any direct arguments.  We do this even if there's no finalfn
@@ -1212,11 +1394,11 @@ finalize_aggregate(AggState *aggstate,
 
 		/* Fill in the transition state value */
 		fcinfo->args[0].value =
-			MakeExpandedObjectReadOnly(pergroupstate->transValue,
-									   pergroupstate->transValueIsNull,
+			MakeExpandedObjectReadOnly(finalTransValue,
+									   finalTransValueIsNull,
 									   pertrans->transtypeLen);
-		fcinfo->args[0].isnull = pergroupstate->transValueIsNull;
-		anynull |= pergroupstate->transValueIsNull;
+		fcinfo->args[0].isnull = finalTransValueIsNull;
+		anynull |= finalTransValueIsNull;
 
 		/* Fill any remaining argument positions with nulls */
 		for (; i < numFinalArgs; i++)
@@ -1234,8 +1416,13 @@ finalize_aggregate(AggState *aggstate,
 		}
 		else
 		{
-			*resultVal = FunctionCallInvoke(fcinfo);
+			Datum		result;
+
+			result = FunctionCallInvoke(fcinfo);
 			*resultIsNull = fcinfo->isnull;
+			*resultVal = MakeExpandedObjectReadOnly(result,
+									   fcinfo->isnull,
+									   peragg->resulttypeLen);
 		}
 		aggstate->curperagg = NULL;
 	}
@@ -1243,14 +1430,14 @@ finalize_aggregate(AggState *aggstate,
 	{
 #if PG_VERSION_NUM >= PG_VERSION_16
 		*resultVal =
-			MakeExpandedObjectReadOnly(pergroupstate->transValue,
-									   pergroupstate->transValueIsNull,
+			MakeExpandedObjectReadOnly(finalTransValue,
+									   finalTransValueIsNull,
 									   pertrans->transtypeLen);
-		*resultIsNull = pergroupstate->transValueIsNull;
+		*resultIsNull = finalTransValueIsNull;
 #else
 		/* Don't need MakeExpandedObjectReadOnly; datumCopy will copy it */
-		*resultVal = pergroupstate->transValue;
-		*resultIsNull = pergroupstate->transValueIsNull;
+		*resultVal = finalTransValue;
+		*resultIsNull = finalTransValueIsNull;
 #endif
 	}
 
@@ -1267,6 +1454,50 @@ finalize_aggregate(AggState *aggstate,
 #endif
 
 	MemoryContextSwitchTo(oldContext);
+}
+
+static Datum
+CloneFinalAggregateState(AggState *aggstate,
+						 AggStatePerTrans pertrans,
+						 Datum transValue,
+						 bool *transValueIsNull)
+{
+	FunctionCallInfo serialFcinfo;
+	FunctionCallInfo deserialFcinfo;
+	Datum		serializedState;
+	Datum		clonedState;
+
+	if (*transValueIsNull ||
+		pertrans->aggtranstype != INTERNALOID ||
+		!OidIsValid(pertrans->serialfn_oid) ||
+		!OidIsValid(pertrans->deserialfn_oid))
+		return transValue;
+
+	serialFcinfo = pertrans->serialfn_fcinfo;
+	serialFcinfo->args[0].value =
+		MakeExpandedObjectReadOnly(transValue,
+							   *transValueIsNull,
+							   pertrans->transtypeLen);
+	serialFcinfo->args[0].isnull = *transValueIsNull;
+	serialFcinfo->isnull = false;
+	serializedState = FunctionCallInvoke(serialFcinfo);
+	if (serialFcinfo->isnull)
+	{
+		*transValueIsNull = true;
+		return (Datum) 0;
+	}
+
+	deserialFcinfo = pertrans->deserialfn_fcinfo;
+	deserialFcinfo->args[0].value = serializedState;
+	deserialFcinfo->args[0].isnull = false;
+	deserialFcinfo->args[1].value = PointerGetDatum(NULL);
+	deserialFcinfo->args[1].isnull = false;
+	deserialFcinfo->isnull = false;
+
+	clonedState = FunctionCallInvoke(deserialFcinfo);
+	*transValueIsNull = deserialFcinfo->isnull;
+
+	return clonedState;
 }
 
 /*
@@ -2571,8 +2802,24 @@ agg_retrieve_direct(VectorAggState *vectoraggstate)
 					/*
 					 * Make a copy of the first input tuple; we will use this
 					 * for comparisons (in group mode) and for projection.
+					 *
+					 * VectorTupleTableSlot: ExecCopySlotHeapTuple crashes for
+					 * tables with varlena columns (VectorColumn.dimension=0 is
+					 * read as varlena header → VARSIZE_ANY_EXHDR = -4 →
+					 * memcpy(~4GB) → SIGSEGV).  Form an all-NULL dummy tuple
+					 * instead — firstSlot is only used as ecxt_outertuple for
+					 * plain-aggregate finalization where no raw Var refs exist.
 					 */
-					aggstate->grp_firstTuple = ExecCopySlotHeapTuple(outerslot);
+					{
+						TupleDesc tdesc = outerslot->tts_tupleDescriptor;
+						int		  natts = tdesc->natts;
+						Datum	 *dvalues = (Datum *) palloc0(natts * sizeof(Datum));
+						bool	 *dnulls  = (bool *)  palloc(natts * sizeof(bool));
+						memset(dnulls, true, natts * sizeof(bool));
+						aggstate->grp_firstTuple = heap_form_tuple(tdesc, dvalues, dnulls);
+						pfree(dvalues);
+						pfree(dnulls);
+					}
 				}
 				else
 				{
@@ -2626,11 +2873,6 @@ agg_retrieve_direct(VectorAggState *vectoraggstate)
 
 			if (aggstate->grp_firstTuple != NULL)
 			{
-				/*
-				 * Store the copied first input tuple in the tuple table slot
-				 * reserved for it.  The tuple will be deleted when it is
-				 * cleared from the slot.
-				 */
 				ExecForceStoreHeapTuple(aggstate->grp_firstTuple,
 										firstSlot, true);
 				aggstate->grp_firstTuple = NULL;	/* don't keep two pointers */
@@ -2638,26 +2880,13 @@ agg_retrieve_direct(VectorAggState *vectoraggstate)
 				/* set up for first advance_aggregates call */
 				tmpcontext->ecxt_outertuple = outerslot;
 
-				/*
-				 * Process each outer-plan tuple, and then fetch the next one,
-				 * until we exhaust the outer plan or cross a group boundary.
-				 */
 				for (;;)
 				{
-					/*
-					 * During phase 1 only of a mixed agg, we need to update
-					 * hashtables as well in advance_aggregates.
-					 */
 					if (aggstate->aggstrategy == AGG_MIXED &&
 						aggstate->current_phase == 1)
 					{
 						lookup_hash_entries(aggstate);
 					}
-
-					/* Advance the aggregates (or combine functions) */
-					advance_aggregates(aggstate);
-
-					int	transno;
 
 					currentSet = aggstate->projected_set;
 
@@ -2665,18 +2894,101 @@ agg_retrieve_direct(VectorAggState *vectoraggstate)
 
 					select_current_set(aggstate, currentSet, false);
 
-					for (transno = 0; transno < aggstate->numtrans; transno++)
+					/*
+					 * Vectorized aggregate inner loop.
+					 *
+					 * We bypass ExecEvalExprSwitchContext entirely.
+					 * The EEOP expression evaluator crashes on
+					 * VectorTupleTableSlots because its opcode dispatch
+					 * does not understand batch-column Datums.
+					 *
+					 * Instead we call the vectorized transition functions
+					 * directly via advance_transition_function(), feeding
+					 * them the VectorColumn* they expect.
+					 *
+					 * count(*) is handled without any function call: we
+					 * just add the batch dimension to the running count.
+					 */
 					{
-						AggStatePerTrans pertrans = &aggstate->pertrans[transno];
-						AggStatePerGroup pergroupstate;
-
-						pergroupstate = &pergroups[currentSet][transno];
-
-						// Should handle COUNT(*)
-						if (pertrans->aggref->aggstar)
+						int	transno;
+						for (transno = 0; transno < aggstate->numtrans; transno++)
 						{
-							int slotDim = ((VectorTupleTableSlot *)outerslot)->dimension;
-							pergroupstate->transValue += slotDim;
+							AggStatePerTrans  pertrans      = &aggstate->pertrans[transno];
+							AggStatePerGroup  pergroupstate = &pergroups[currentSet][transno];
+
+							if (pertrans->aggref->aggstar)
+							{
+								/* count(*) — add entire batch size */
+								int slotDim = ((VectorTupleTableSlot *) outerslot)->dimension;
+								pergroupstate->transValue += slotDim;
+							}
+							else if (pertrans->aggref->args != NIL)
+							{
+								/*
+								 * All other vectorized aggregates: set arg[1]
+								 * to the VectorColumn* for the input column,
+								 * then call advance_transition_function which
+								 * handles state initialisation, NULL checks,
+								 * and memory context management.
+								 *
+								 * VecAggVarAttnoMutator already remapped
+								 * varattno → output_pos+1, so
+								 * varattno-1 is the correct 0-based slot index.
+								 */
+								TargetEntry	   *arg_te;
+								Var			   *inputVar;
+								AttrNumber		tableAttno;
+								int				colIdx;
+								VectorColumn   *vc;
+								FunctionCallInfo fcinfo;
+								Plan		   *outer_plan;
+
+								Assert(pertrans->numTransInputs == 1);
+								arg_te   = (TargetEntry *) linitial(pertrans->aggref->args);
+								inputVar = (Var *) arg_te->expr;
+								outer_plan = outerPlanState(aggstate)->plan;
+								tableAttno = VectorAggScanOutputPosToVarAttno(outer_plan,
+																	inputVar->varattno);
+								if (tableAttno <= 0)
+									tableAttno = inputVar->varattno;
+
+								colIdx = VectorAggVarAttnoToSlotIdx(outer_plan, tableAttno);
+								if (colIdx < 0)
+									colIdx = inputVar->varattno - 1; /* fallback */
+
+								if (colIdx < 0 || colIdx >= outerslot->tts_nvalid)
+								{
+									int mappedColIdx;
+
+									mappedColIdx = VectorAggVarAttnoToSlotIdx(outer_plan,
+																 tableAttno);
+									if (mappedColIdx >= 0)
+										colIdx = mappedColIdx;
+								}
+
+								Assert(colIdx >= 0 && colIdx < outerslot->tts_nvalid);
+								vc = (VectorColumn *) outerslot->tts_values[colIdx];
+
+								if (vc->dimension == 0)
+								{
+									int mappedColIdx;
+
+									mappedColIdx = VectorAggVarAttnoToSlotIdx(outer_plan,
+																 tableAttno);
+									if (mappedColIdx >= 0)
+									{
+										colIdx = mappedColIdx;
+										vc = (VectorColumn *) outerslot->tts_values[colIdx];
+									}
+								}
+
+								fcinfo = pertrans->transfn_fcinfo;
+								fcinfo->args[1].value  = PointerGetDatum(vc);
+								fcinfo->args[1].isnull = false;
+
+								advance_transition_function(aggstate, pertrans,
+													pergroupstate);
+							}
 						}
 					}
 
@@ -2825,10 +3137,10 @@ agg_refill_hash_table(AggState *aggstate)
 	HashAggSpill spill;
 #if PG_VERSION_NUM < PG_VERSION_15
 	HashTapeInfo *tapeinfo = aggstate->hash_tapeinfo;
-#else
+	#else
 	LogicalTapeSet *tapeset = aggstate->hash_tapeset;
-#endif
-	bool		spill_initialized = false;
+	#endif
+	bool			spill_initialized = false;
 
 	if (aggstate->hash_batches == NIL)
 		return false;
@@ -3989,7 +4301,7 @@ VExecInitAgg(Agg *node, EState *estate, int eflags)
 		for (i = 0; i < numGroupingSets; i++)
 		{
 			pergroups[i] = (AggStatePerGroup) palloc0(sizeof(AggStatePerGroupData)
-													  * numaggs);
+													  * numtrans);
 		}
 
 		aggstate->pergroups = pergroups;
@@ -4307,7 +4619,10 @@ VExecInitAgg(Agg *node, EState *estate, int eflags)
 					elog(ERROR, "combinefn not set for aggregate function");
 			}
 			else
-				transfn_oid = aggform->aggtransfn;
+			{
+				if (!GetVectorizedAggregateTransfn(aggref->aggfnoid, &transfn_oid))
+					elog(ERROR, "Vectorized aggregate not found.");
+			}
 
 #if PG_VERSION_NUM < PG_VERSION_15
 			aclresult = pg_proc_aclcheck(transfn_oid, aggOwner,
@@ -5070,7 +5385,7 @@ ExecReScanAgg(AggState *node)
 		for (setno = 0; setno < numGroupingSets; setno++)
 		{
 			MemSet(node->pergroups[setno], 0,
-				   sizeof(AggStatePerGroupData) * node->numaggs);
+				   sizeof(AggStatePerGroupData) * node->numtrans);
 		}
 
 		/* reset to phase 1 */
@@ -5388,7 +5703,8 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 static TupleTableSlot *
 ExecVectorAgg(CustomScanState *node)
 {
-	return ExecAgg((PlanState *)node);
+	VectorAggState *vas = (VectorAggState *) node;
+	return ExecAgg((PlanState *)vas);
 }
 
 

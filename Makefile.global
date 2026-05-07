@@ -11,6 +11,8 @@ citus_abs_top_srcdir := $(abspath $(citus_top_builddir))
 citus_abs_srcdir     := $(citus_abs_top_srcdir)/$(citus_subdir)
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
+PG_INCLUDEDIR_SERVER := $(shell $(PG_CONFIG) --includedir-server)
+PG_INCLUDEDIR_INTERNAL := $(patsubst %/server,%/internal,$(PG_INCLUDEDIR_SERVER))
 
 vpath_build      := no
 citus_top_srcdir := $(citus_top_builddir)
@@ -18,7 +20,7 @@ citus_top_srcdir := $(citus_top_builddir)
 USE_PGXS = 1
 include $(PGXS)
 
-override CPPFLAGS := -I'$(citus_abs_top_srcdir)/src/include' $(CPPFLAGS)
+override CPPFLAGS := -I'$(PG_INCLUDEDIR_SERVER)' -I'$(PG_INCLUDEDIR_INTERNAL)' -I'$(citus_abs_top_srcdir)/src/include' $(CPPFLAGS)
 override CFLAGS  += -Wno-declaration-after-statement
 
 # ---------------------------------------------------------------------------

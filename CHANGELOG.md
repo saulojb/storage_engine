@@ -1,6 +1,113 @@
 # CHANGELOG
 
-## 1.4.0
+## 2.0.0
+
+* **BREAKING:** minimum PostgreSQL version is now **15**.
+  PostgreSQL 12, 13, and 14 are no longer supported. The last release
+  compatible with those versions is `1.3.4`.
+
+* **BREAKING:** branch `release/1.4.0` was renamed to `release/2.0.0`
+  before merge. No functional changes relative to the `1.4.0` development
+  line — the major version bump reflects the dropped PG 12–14 compatibility
+  and the addition of PG 15 to the official support matrix.
+
+* decision: **keep `storage_engine.enable_automatic_plan` (default: `on`)**
+
+  Bench validation for the grouped `avg` shape on `bench_am_30m`
+  (`country_code in ('BR','US')`, `GROUP BY country_code`, `ORDER BY avg(price)`)
+  showed no stable downside for keeping automatic planning enabled.
+
+  Observed behavior during repeated PG18 runs:
+
+  - final plan shape remained stable between `on` and `off` for this query;
+  - serial latency deltas were small and noisy (no consistent winner);
+  - parallel runs tended to be slightly better with `on` on median and tail.
+
+  Policy for 1.4.x:
+
+  - keep `storage_engine.enable_automatic_plan = on` as the recommended default;
+  - keep `off` as an operational/diagnostic escape hatch for targeted troubleshooting
+    and benchmark comparisons.
+
+* feature: **VectorGroupAgg parallel partial mode expanded and hardened**
+
+  The `StorageEngineVectorGroupAgg` planner path now supports
+  `AGGSPLIT_INITIAL_SERIAL` for low-cardinality `GROUP BY` plans with
+  `count(*)`, `sum(...)`, `min(...)`, and `max(...)` targets, allowing the
+  vectorized group aggregate node to run inside parallel workers and feed the
+  native `Finalize GroupAggregate` combine step.
+
+  This line also adds incremental `avg(int4)` support in both:
+
+  - parallel partial path (`AGGSPLIT_INITIAL_SERIAL`), where the vectorized
+    node emits the transition state expected by PostgreSQL finalize
+    (`bigint[]` `[count,sum]`);
+  - simple/serial path (`AGGSPLIT_SIMPLE`), where VecGroupAgg now emits
+    numeric-compatible `avg(int4)` results directly.
+
+  Unsupported `avg` shapes still fall back safely.
+
+  Additional planner coverage in this cycle:
+
+  - `avg(var::float8)` now vectorizes in `StorageEngineVectorGroupAgg` for
+    supported base types (`int4`, `int8`, `float4`, `float8`) by tracking
+    casted-input semantics per target and emitting the correct transition/output
+    representation.
+
+  In addition to the aggregate coverage expansion, this release includes
+  correctness and stability fixes found during PG18 validation:
+
+  - constant-key grouped plans (`numCols=0`, e.g. inferred `Var = Const`) are
+    now handled end-to-end in planner + executor;
+  - vector batch processing now respects `VectorTupleTableSlot.keep[]` so
+    filtered-out rows are not accumulated;
+  - textual group keys use the correct hash key layout (excluding pointer-like
+    `Datum` bytes) to avoid duplicate-group mismatches;
+  - planner fallback diagnostics were added via
+    `storage_engine.debug_vectorized_groupagg_fallback` (`DEBUG1` reasons);
+  - non-essential EXPLAIN telemetry was reduced while keeping debug logging.
+
+  Validation status for this change set:
+
+  - PG18 (`5432`) regression suite: **ALL 164 TESTS PASSED**;
+  - real plans on `bench_am_30m` show
+    `Parallel Custom Scan (StorageEngineVectorGroupAgg)` for
+    `count/sum/min/max` grouped shapes;
+  - unsupported partial-state shapes still fall back safely to native
+    PostgreSQL aggregate nodes.
+
+* note: **compatibility policy update**
+
+  `1.3.4` is now treated as the legacy line for older PostgreSQL releases.
+  The active support matrix for the current code line remains PostgreSQL 16,
+  17, 18, and 19. PostgreSQL 15 is the next compatibility target under
+  evaluation for a future major release, but it should not be advertised as
+  officially supported until its build and regression matrix are green.
+  PostgreSQL 12, 13, and 14 should be documented as historical compatibility
+  via `1.3.4`, not as active support for `1.4.x` and later.
+
+* fix: **stabilized vectorized aggregate fallback for mixed `numeric` + `money` plans**
+
+  Plain aggregate lists that mix `numeric` and `money` inputs are now kept on
+  PostgreSQL's native `Agg` executor instead of being rewritten to
+  `StorageEngineVectorAgg`.  The vectorized functions for `numeric` and
+  `money` remain available and still run for supported non-mixed shapes, but
+  this specific mixed plan shape was crashing the backend inside
+  `numeric_avg_accum` on recent PostgreSQL builds.
+
+  The fallback is intentionally planner-level rather than per-aggregate inside
+  the custom node: an attempted `Aggref`-level scalar fallback still reproduced
+  the same crash, so the safe boundary is to leave the whole plain aggregate on
+  the native executor for now.
+
+  Regression coverage was added for:
+
+  - `EXPLAIN` on mixed `numeric` + `money` aggregates with vectorization enabled
+  - result equality between `enable_vectorization=off` and `on`
+  - successful execution of the mixed query without backend termination
+
+  The updated regression suite completed with `ALL 155 TESTS PASSED` on both
+  PG 18 (`5432`) and PG 15 (`5436`) during validation.
 
 * feature: **VectorGroupAgg — vectorized GROUP BY aggregation for `colcompress` tables**
 
@@ -73,6 +180,58 @@
 
   Fixed by tracking `result_typeoid` in `VecGroupAggTarget` and converting
   via `DirectFunctionCall1(int8_numeric, …)` when `result_typeoid == NUMERICOID`.
+
+* fix: **cross-version vectorized aggregate correctness on PostgreSQL 16, 17, 18 and 19**
+
+  The `StorageEngineVectorAgg` wrapper and its inner `Agg` node could diverge
+  after plan mutation: the wrapper received the mutated `ColcompressScan`
+  child, but `newAgg->plan.lefttree/righttree` could still point at the
+  original child plan.  Since execution initializes the inner `Agg`, some
+  multi-column vectorized aggregates on PG 17 and PG 19 ran with mismatched
+  flags and returned wrong results.
+
+  Fixed by synchronizing the mutated child plan into both the wrapper node and
+  the inner `Agg` plan.
+
+* fix: **packed-slot qual evaluation and varattno mapping in vectorized scans**
+
+  Vectorized `colcompress` scans were evaluating scalar quals against a packed
+  slot layout while filter Vars still referenced the original table attnos.
+  This could misread non-leading attributes and crash on varlena quals such as
+  `LIKE` and array operators.
+
+  Fixed by preserving full-width slot layout for qual evaluation, rebuilding
+  packed aggregate slots only after the batch passes the filter, and resolving
+  packed descriptors against the relation tuple descriptor instead of the
+  projected scan slot.
+
+* fix: **PostgreSQL API compatibility for PG16/17 bitmap scans and PG19 slot creation**
+
+  PG 16/17 still expose exact-page TIDBitmap offsets via
+  `TBMIterateResult->ntuples` and embedded `offsets[]`, while PG 18+ use
+  `tbm_extract_page_tuple()`.  PG 19 also required keeping the local
+  `MakeSingleTupleTableSlot()` call site as a two-argument invocation.
+
+  Version-specific guards now keep `colcompress` and `rowcompress` builds and
+  runtime behavior aligned across PG 16, 17, 18 and 19.
+
+* validation: **full correctness matrix is green on PG16–PG19**
+
+  After clean per-version rebuilds, installs and cluster restarts,
+  `python3 tests/test_suite.py` completed with `ALL 152 TESTS PASSED` on
+  PostgreSQL 16, 17, 18 and 19.
+
+* benchmark: **no-citus benchmark matrix rerun on PG16–PG19**
+
+  Serial and parallel benchmark matrices were rerun without `citus` using the
+  same workload on PostgreSQL 16, 17, 18 and 19.  `colcompress` remained the
+  best engine for most analytical queries, especially in parallel mode.
+
+  Against the historical PG 18 no-citus baseline, the new PG 18 parallel
+  results stayed close overall and improved `colcompress` on key grouped/GIN
+  paths such as `Q7 JSONB key + GROUP BY` (`103.477 ms -> 72.506 ms`), while
+  the serial PG 18 run regressed more broadly and should be treated as a known
+  planner/per-version benchmark shift rather than a correctness issue.
 
 ---
 

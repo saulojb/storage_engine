@@ -2463,8 +2463,7 @@ ReadStripeNextVector(StripeReadState *stripeReadState, Datum *columnValues,
 		return false;
 	}
 
-	int32 *columnValueOffset = palloc(sizeof(int32) * stripeReadState->tupleDescriptor->natts);
-	memset(columnValueOffset, 0, sizeof(int32) * stripeReadState->tupleDescriptor->natts);
+	int32 *columnValueOffset = palloc0(sizeof(int32) * list_length(stripeReadState->projectedColumnList));
 
 	while (true)
 	{
@@ -2568,7 +2567,28 @@ ReadChunkGroupNextVector(ChunkGroupReadState *chunkGroupReadState, Datum *column
 	/*
 	 * Initialize to all-NULL. Only non-NULL projected attributes will be set.
 	 */
-	memset(columnNulls, true, sizeof(bool) * chunkGroupReadState->columnCount);
+	{
+		int nproj = list_length(chunkGroupReadState->projectedColumnList);
+
+		memset(columnNulls, true, sizeof(bool) * nproj);
+	}
+
+	/*
+	 * For vectorized aggregate execution, the PG expression evaluator reads
+	 * tts_isnull[] to decide whether a Var is NULL.  A VectorTupleTableSlot
+	 * stores VectorColumn* pointers in tts_values[output_idx]; the slot-level
+	 * tts_isnull flag must be FALSE for projected columns so that
+	 * EEOP_OUTERVAR hands the VectorColumn* (not a zero Datum) to the
+	 * transition function.  Per-element nulls are tracked inside
+	 * VectorColumn.isnull[] and are checked by the transition functions
+	 * themselves (e.g. se_vanycount).
+	 */
+	{
+		int pidx;
+		int nproj = list_length(chunkGroupReadState->projectedColumnList);
+		for (pidx = 0; pidx < nproj; pidx++)
+			columnNulls[pidx] = false;
+	}
 
 	int i;
 	int rowNumberIndex = 0;
@@ -2594,20 +2614,26 @@ ReadChunkGroupNextVector(ChunkGroupReadState *chunkGroupReadState, Datum *column
 		}
 
 		int attno;
+		int output_index = 0;
 		foreach_int(attno, chunkGroupReadState->projectedColumnList)
 		{
 			const ChunkData *chunkGroupData = chunkGroupReadState->chunkGroupData;
 			const int rowIndex = chunkGroupReadState->currentRow;
 
-			/* attno is 1-indexed; existsArray is 0-indexed */
+			/* attno is 1-indexed; existsArray is 0-indexed by table column.
+			 * columnValues and columnValueOffset are indexed by output position
+			 * (0-based position in projectedColumnList), NOT by attno-1.
+			 * This ensures we never access tts_values[attno-1] out-of-bounds
+			 * when the projected column is not the first column in the table.
+			 */
 			const uint32 columnIndex = attno - 1;
 
-			VectorColumn* vectorColumn = (VectorColumn*) columnValues[columnIndex];
+			VectorColumn* vectorColumn = (VectorColumn*) columnValues[output_index];
 
 			if (chunkGroupData->existsArray[columnIndex][rowIndex])
 			{
 				int8 *writeColumnRowPosition = 
-					(int8 *) vectorColumn->value + columnValueOffset[columnIndex];
+					(int8 *) vectorColumn->value + columnValueOffset[output_index];
 
 
 				/* 
@@ -2631,7 +2657,8 @@ ReadChunkGroupNextVector(ChunkGroupReadState *chunkGroupReadState, Datum *column
 			}
 
 			vectorColumn->dimension++;
-			columnValueOffset[columnIndex] += vectorColumn->columnTypeLen;
+			columnValueOffset[output_index] += vectorColumn->columnTypeLen;
+			output_index++;
 		}
 
 		(*chunkReadRows)++;

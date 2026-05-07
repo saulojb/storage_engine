@@ -25,6 +25,8 @@ Usage:
 """
 
 import argparse
+import json
+import re
 import subprocess
 import sys
 
@@ -59,7 +61,7 @@ class TestRunner:
         db   = dbname or self.dbname
         flag = ["-Atc"] if tuples_only else ["-v", "ON_ERROR_STOP=1", "-c"]
         cmd  = ["sudo", "-u", "postgres", "psql",
-                "-p", str(self.port), "-d", db] + flag + [sql]
+            "-p", str(self.port), "-d", db, "--no-psqlrc"] + flag + [sql]
         r    = subprocess.run(cmd, capture_output=True, text=True)
         # Use rstrip('\n') not strip(): preserves the empty line that represents
         # a NULL value in tuples-only mode (strip() would destroy it).
@@ -68,7 +70,7 @@ class TestRunner:
     def q(self, sql: str, dbname: str | None = None) -> str:
         """Return all output rows joined by newline."""
         out, _rc, _err = self._run(sql, dbname=dbname)
-        return out
+        return "\n".join(line for line in out.split("\n") if line != "SET")
 
     def q1(self, sql: str, dbname: str | None = None) -> str:
         """Return first column of LAST row (empty string for NULL).
@@ -87,6 +89,34 @@ class TestRunner:
         """Execute DDL/DML. Returns (returncode, stderr)."""
         _out, rc, err = self._run(sql, dbname=dbname, tuples_only=False)
         return rc, err
+
+    def _execution_time_ms(self, explain_output: str) -> float | None:
+        """Extract execution time in ms from EXPLAIN ANALYZE output."""
+        # Prefer JSON plans for locale-independent parsing.
+        lines = [ln for ln in explain_output.splitlines() if ln and ln != "SET"]
+        if lines:
+            raw = "\n".join(lines)
+            try:
+                payload = json.loads(raw)
+                if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                    t = payload[0].get("Execution Time")
+                    if isinstance(t, (int, float)):
+                        return float(t)
+            except Exception:
+                pass
+
+        patterns = [
+            r"Execution Time:\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*ms",
+            r"Execution time:\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*ms",
+            r"Total runtime:\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*ms",
+            r"Tempo de Execu(?:c|ç)[aã]o:\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*ms",
+            r"Tempo de execu(?:c|ç)[aã]o:\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*ms",
+        ]
+        for pat in patterns:
+            m = re.search(pat, explain_output)
+            if m:
+                return float(m.group(1).replace(",", "."))
+        return None
 
     # ------------------------------------------------------------------ assertions
 
@@ -638,6 +668,40 @@ class TestRunner:
         self.check("EXPLAIN SELECT (filter): no crash, returns plan",
                    len(plan_filter) > 0, plan_filter[:200])
 
+        self.exec("""
+            DROP TABLE IF EXISTS _texpl_mixed;
+            CREATE TABLE _texpl_mixed (
+                i4  integer,
+                num numeric(12, 4),
+                m   money
+            ) USING colcompress;
+            INSERT INTO _texpl_mixed
+                SELECT
+                    i,
+                    (i * 0.01)::numeric(12, 4),
+                    (i * 0.01)::numeric::money
+                FROM generate_series(1, 100000) i;
+        """)
+
+        plan_mixed = self.q(
+            "SET storage_engine.enable_vectorization=on; "
+            "SET max_parallel_workers_per_gather=0; "
+            "EXPLAIN SELECT sum(i4), round(avg(num), 6), sum(m) FROM _texpl_mixed"
+        )
+        self.check("mixed numeric+money: EXPLAIN falls back to regular Agg",
+                   "StorageEngineVectorAgg" not in plan_mixed, plan_mixed[:400])
+
+        self.agg_ok("mixed numeric+money: VEC ON falls back without changing result",
+                    "SELECT sum(i4), round(avg(num), 6), sum(m) FROM _texpl_mixed")
+
+        out, rc, err = self._run(
+            "SET storage_engine.enable_vectorization=on; "
+            "SET max_parallel_workers_per_gather=0; "
+            "SELECT sum(i4), round(avg(num), 6), sum(m) FROM _texpl_mixed"
+        )
+        self.check("mixed numeric+money: VEC ON query runs without crash",
+                   rc == 0, err[:200] if err else out[:200])
+
     # ------------------------------------------------------------------ parallel safety
 
     def test_parallel_safety(self) -> None:
@@ -685,6 +749,277 @@ class TestRunner:
         r_p = self.q(f"{pfx_parallel} {typed_sql}")
         self.check("parallel=4 float8+numeric+money: result equals serial",
                    r_s == r_p, f"serial={r_s!r} parallel={r_p!r}")
+
+        # --------------------------------------------------------------
+        # Plan-shape gates for real vectorized parallel execution.
+        # --------------------------------------------------------------
+        self.exec("""
+            DROP TABLE IF EXISTS _tpar_group;
+            CREATE TABLE _tpar_group (
+                grp integer,
+                v   integer,
+                vn  numeric(12,2)
+            ) USING colcompress;
+            INSERT INTO _tpar_group
+                SELECT i % 16, i, (i * 0.01)::numeric(12,2)
+                FROM generate_series(1, 500000) i;
+        """)
+
+        pfx_parallel_vec = (
+            "SET storage_engine.enable_vectorization=on; "
+            "SET storage_engine.enable_vectorized_groupagg=on; "
+            "SET max_parallel_workers_per_gather=4; "
+            "SET parallel_setup_cost=0; "
+            "SET parallel_tuple_cost=0; "
+            "SET min_parallel_table_scan_size=0; "
+            "SET min_parallel_index_scan_size=0;"
+        )
+        pfx_parallel_native = (
+            "SET storage_engine.enable_vectorization=off; "
+            "SET storage_engine.enable_vectorized_groupagg=off; "
+            "SET max_parallel_workers_per_gather=4; "
+            "SET parallel_setup_cost=0; "
+            "SET parallel_tuple_cost=0; "
+            "SET min_parallel_table_scan_size=0; "
+            "SET min_parallel_index_scan_size=0;"
+        )
+
+        vec_group_sql = (
+            "SELECT grp, count(*), sum(v), min(v), max(v) "
+            "FROM _tpar_group GROUP BY grp ORDER BY grp"
+        )
+
+        plan_vec = self.q(f"{pfx_parallel_vec} EXPLAIN {vec_group_sql}")
+        self.check(
+            "parallel grouped count/sum/min/max: EXPLAIN shows StorageEngineVectorGroupAgg",
+            "StorageEngineVectorGroupAgg" in plan_vec,
+            plan_vec[:500],
+        )
+        self.check(
+            "parallel grouped count/sum/min/max: EXPLAIN is parallel",
+            "Parallel" in plan_vec,
+            plan_vec[:500],
+        )
+
+        avg_group_sql = "SELECT grp, avg(v::float8) FROM _tpar_group GROUP BY grp"
+        plan_avg = self.q(f"{pfx_parallel_vec} EXPLAIN {avg_group_sql}")
+        server_version_num = self.q1("SHOW server_version_num")
+        avg_groupagg_expected = (
+            server_version_num and
+            (int(server_version_num) < 200000)
+        )
+        if avg_groupagg_expected:
+            self.check(
+                "parallel grouped avg(v::float8): EXPLAIN shows StorageEngineVectorGroupAgg",
+                "StorageEngineVectorGroupAgg" in plan_avg,
+                plan_avg[:500],
+            )
+        else:
+            self.check(
+                "parallel grouped avg(v::float8): EXPLAIN falls back (version-limited)",
+                "StorageEngineVectorGroupAgg" not in plan_avg,
+                plan_avg[:500],
+            )
+
+        avg_group_int4_sql = "SELECT grp, avg(v) FROM _tpar_group GROUP BY grp"
+        plan_avg_int4 = self.q(f"{pfx_parallel_vec} EXPLAIN {avg_group_int4_sql}")
+        if avg_groupagg_expected:
+            self.check(
+                "parallel grouped avg(int4): EXPLAIN shows StorageEngineVectorGroupAgg",
+                "StorageEngineVectorGroupAgg" in plan_avg_int4,
+                plan_avg_int4[:500],
+            )
+        else:
+            self.check(
+                "parallel grouped avg(int4): EXPLAIN falls back (version-limited)",
+                "StorageEngineVectorGroupAgg" not in plan_avg_int4,
+                plan_avg_int4[:500],
+            )
+
+        plan_avg_int4_serial = self.q(
+            "SET storage_engine.enable_vectorization=on; "
+            "SET storage_engine.enable_vectorized_groupagg=on; "
+            "SET max_parallel_workers_per_gather=0; "
+            "EXPLAIN SELECT grp, avg(v) FROM _tpar_group GROUP BY grp"
+        )
+        if avg_groupagg_expected:
+            self.check(
+                "serial grouped avg(int4): EXPLAIN shows StorageEngineVectorGroupAgg",
+                "StorageEngineVectorGroupAgg" in plan_avg_int4_serial,
+                plan_avg_int4_serial[:500],
+            )
+        else:
+            self.check(
+                "serial grouped avg(int4): EXPLAIN falls back (version-limited)",
+                "StorageEngineVectorGroupAgg" not in plan_avg_int4_serial,
+                plan_avg_int4_serial[:500],
+            )
+
+        # PG15-only safety gate: numeric plain aggregate must fallback.
+        server_version_num = self.q1("SHOW server_version_num")
+        if server_version_num and int(server_version_num) < 160000:
+            self.exec("""
+                DROP TABLE IF EXISTS _tpar_num_plain;
+                CREATE TABLE _tpar_num_plain (val numeric(14,4)) USING colcompress;
+                INSERT INTO _tpar_num_plain
+                    SELECT (1000 + (i % 9000))::numeric(14,4) / 100
+                    FROM generate_series(1, 100000) i;
+            """)
+            plan_num_pg15 = self.q(
+                "SET storage_engine.enable_vectorization=on; "
+                "SET max_parallel_workers_per_gather=0; "
+                "EXPLAIN SELECT count(val) FROM _tpar_num_plain"
+            )
+            self.check(
+                "PG15 numeric plain aggregate: EXPLAIN falls back (no StorageEngineVectorAgg)",
+                "StorageEngineVectorAgg" not in plan_num_pg15,
+                plan_num_pg15[:500],
+            )
+
+        # Performance sanity gate (wide threshold to catch catastrophic regressions only).
+        out_vec, rc_vec, err_vec = self._run(
+            f"{pfx_parallel_vec} "
+            f"EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY ON, FORMAT JSON) {vec_group_sql}"
+        )
+        out_nat, rc_nat, err_nat = self._run(
+            f"{pfx_parallel_native} "
+            f"EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY ON, FORMAT JSON) {vec_group_sql}"
+        )
+
+        self.check("parallel perf sanity: vectorized EXPLAIN ANALYZE executes", rc_vec == 0,
+                   err_vec[:200] if err_vec else "")
+        self.check("parallel perf sanity: native EXPLAIN ANALYZE executes", rc_nat == 0,
+                   err_nat[:200] if err_nat else "")
+
+        t_vec = self._execution_time_ms(out_vec) if rc_vec == 0 else None
+        t_nat = self._execution_time_ms(out_nat) if rc_nat == 0 else None
+        self.check("parallel perf sanity: execution times parsed",
+                   t_vec is not None and t_nat is not None,
+                   f"vec={t_vec!r} native={t_nat!r}")
+        if t_vec is not None and t_nat is not None:
+            self.check(
+                "parallel perf sanity: vectorized <= 5x native",
+                t_vec <= (t_nat * 5.0),
+                f"vectorized={t_vec:.3f}ms native={t_nat:.3f}ms",
+            )
+
+    # ------------------------------------------------------------------ VecGroupAgg
+
+    def test_vecgroupagg(self) -> None:
+        self.section("VecGroupAgg — GROUP BY correctness")
+
+        pfx_on  = ("SET storage_engine.enable_vectorization=on; "
+                   "SET storage_engine.enable_vectorized_groupagg=on; "
+                   "SET max_parallel_workers_per_gather=4; "
+                   "SET parallel_setup_cost=0; SET parallel_tuple_cost=0; "
+                   "SET min_parallel_table_scan_size=0; "
+                   "SET min_parallel_index_scan_size=0;")
+        pfx_off = ("SET storage_engine.enable_vectorization=off; "
+                   "SET storage_engine.enable_vectorized_groupagg=off; "
+                   "SET max_parallel_workers_per_gather=0;")
+
+        # --- setup ---
+        self.exec("""
+            DROP TABLE IF EXISTS _tgrp;
+            CREATE TABLE _tgrp (
+                country char(2),
+                cat     integer,
+                val     float8,
+                m       money
+            ) USING colcompress;
+            INSERT INTO _tgrp
+            SELECT
+                (ARRAY['BR','US','JP'])[1 + (i % 3)],
+                1 + (i % 5),
+                CASE WHEN i % 7  = 0 THEN NULL ELSE i * 1.5       END,
+                CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 0.99)::money END
+            FROM generate_series(1, 1500000) i;
+            ANALYZE _tgrp;
+
+            DROP TABLE IF EXISTS _tgrp2;
+            CREATE TABLE _tgrp2 (k1 integer, k2 integer, v bigint) USING colcompress;
+            INSERT INTO _tgrp2
+                SELECT i % 50, i % 20, i FROM generate_series(1, 2000000) i;
+            ANALYZE _tgrp2;
+        """)
+
+        # 1. Single-key GROUP BY — correctness VEC ON == VEC OFF
+        single_sql = ("SELECT country, count(*), count(val), "
+                      "min(val), max(val), round(sum(val)::numeric, 2), "
+                      "min(m), max(m), sum(m) "
+                      "FROM _tgrp GROUP BY country ORDER BY country")
+        r_off = self.q(f"{pfx_off} {single_sql}")
+        r_on  = self.q(f"{pfx_on}  {single_sql}")
+        self.check("single-key GROUP BY: VEC ON == VEC OFF", r_off == r_on,
+                   f"OFF={r_off[:200]!r}  ON={r_on[:200]!r}")
+
+        # 2. Single-key: EXPLAIN shows VecGroupAgg
+        # Force HashAgg: disable sort so planner can't pick GroupAggregate
+        plan = self.q(f"{pfx_on} SET enable_sort=off; EXPLAIN {single_sql}")
+        self.check("single-key GROUP BY: EXPLAIN shows StorageEngineVectorGroupAgg",
+                   "StorageEngineVectorGroupAgg" in plan, plan[:400])
+
+        # 3. COUNT(col) with NULLs — val has NULLs every 7th row
+        null_sql = ("SELECT country, count(*) AS cs, count(val) AS cv "
+                    "FROM _tgrp GROUP BY country ORDER BY country")
+        r_off2 = self.q(f"{pfx_off} {null_sql}")
+        r_on2  = self.q(f"{pfx_on}  {null_sql}")
+        self.check("COUNT(col) NULL-aware GROUP BY: VEC ON == VEC OFF",
+                   r_off2 == r_on2, f"OFF={r_off2!r}  ON={r_on2!r}")
+
+        # COUNT(*) > COUNT(col) because val has NULLs
+        r_diff = self.q(
+            f"{pfx_on} SELECT bool_and(cs > cv) FROM ({null_sql}) x"
+        )
+        self.check("COUNT(col) NULL-aware: count(*) > count(val) for all groups",
+                   r_diff.strip() == "t", f"got {r_diff!r}")
+
+        # 4. Composite GROUP BY (2 keys) — correctness
+        composite_sql = ("SELECT country, cat, count(*), count(val), "
+                         "round(sum(val)::numeric, 2), sum(m) "
+                         "FROM _tgrp GROUP BY country, cat ORDER BY country, cat")
+        r_off3 = self.q(f"{pfx_off} {composite_sql}")
+        r_on3  = self.q(f"{pfx_on}  {composite_sql}")
+        self.check("composite GROUP BY (2 keys): VEC ON == VEC OFF",
+                   r_off3 == r_on3, f"OFF={r_off3[:200]!r}  ON={r_on3[:200]!r}")
+
+        # 5. Composite GROUP BY: EXPLAIN shows VecGroupAgg
+        # Disable parallel to get a plain HashAggregate (not Finalize/Partial split)
+        # which the hook can intercept on all PG versions
+        plan2 = self.q(f"{pfx_on} SET max_parallel_workers_per_gather=0; EXPLAIN "
+                       "SELECT k1, k2, count(*), sum(v) FROM _tgrp2 GROUP BY k1, k2")
+        self.check("composite GROUP BY (2 int keys): EXPLAIN shows StorageEngineVectorGroupAgg",
+                   "StorageEngineVectorGroupAgg" in plan2, plan2[:400])
+
+        # 6. HAVING — must still produce correct results (applied by Finalize node)
+        having_sql = ("SELECT country, count(*) FROM _tgrp "
+                      "GROUP BY country HAVING count(*) > 50000 ORDER BY country")
+        r_off4 = self.q(f"{pfx_off} {having_sql}")
+        r_on4  = self.q(f"{pfx_on}  {having_sql}")
+        self.check("HAVING: VEC ON == VEC OFF (correct results)",
+                   r_off4 == r_on4, f"OFF={r_off4!r}  ON={r_on4!r}")
+
+        # HAVING must not be empty (all 3 groups have 100k rows > 50k)
+        rows = [ln for ln in r_on4.strip().split("\n") if ln]
+        self.check("HAVING: returns 3 groups (count > 50000)", len(rows) == 3,
+                   f"rows={rows!r}")
+
+        # 7. money (CASHOID) GROUP BY — correctness
+        money_sql = ("SELECT country, count(m), min(m), max(m), sum(m) "
+                     "FROM _tgrp GROUP BY country ORDER BY country")
+        r_off5 = self.q(f"{pfx_off} {money_sql}")
+        r_on5  = self.q(f"{pfx_on}  {money_sql}")
+        self.check("money (CASHOID) GROUP BY: VEC ON == VEC OFF",
+                   r_off5 == r_on5, f"OFF={r_off5[:200]!r}  ON={r_on5[:200]!r}")
+
+        # 8. Composite GROUP BY (3 keys)
+        three_key_sql = ("SELECT country, cat, val IS NULL AS vn, count(*) "
+                         "FROM _tgrp GROUP BY country, cat, val IS NULL "
+                         "ORDER BY country, cat, vn")
+        r_off6 = self.q(f"{pfx_off} {three_key_sql}")
+        r_on6  = self.q(f"{pfx_on}  {three_key_sql}")
+        self.check("composite GROUP BY (3 keys): VEC ON == VEC OFF",
+                   r_off6 == r_on6, f"OFF={r_off6[:200]!r}  ON={r_on6[:200]!r}")
 
     # ------------------------------------------------------------------ upgrade path
 
@@ -755,6 +1090,7 @@ class TestRunner:
         self.test_null_handling()
         self.test_explain_plan()
         self.test_parallel_safety()
+        self.test_vecgroupagg()
         self.test_upgrade_path()
 
         self.teardown()
@@ -784,16 +1120,25 @@ def main() -> None:
                         help="Also run tests on the secondary PostgreSQL instance")
     parser.add_argument("--pg19-port", type=int, default=5433, dest="pg19_port",
                         help="Secondary PostgreSQL port (default: 5433)")
+    parser.add_argument("--ports",    type=str, default=None,
+                        help="Comma-separated list of PostgreSQL ports to test "
+                             "(overrides --port / --pg19, e.g. 5436,5434,5435,5432,5433)")
     args = parser.parse_args()
 
     all_ok = True
 
-    r1 = TestRunner(args.port, label=f"PG@{args.port}")
-    all_ok = r1.run_all() and all_ok
+    if args.ports:
+        ports = [int(p.strip()) for p in args.ports.split(",") if p.strip()]
+        for port in ports:
+            r = TestRunner(port, label=f"PG@{port}")
+            all_ok = r.run_all() and all_ok
+    else:
+        r1 = TestRunner(args.port, label=f"PG@{args.port}")
+        all_ok = r1.run_all() and all_ok
 
-    if args.pg19:
-        r2 = TestRunner(args.pg19_port, label=f"PG@{args.pg19_port}")
-        all_ok = r2.run_all() and all_ok
+        if args.pg19:
+            r2 = TestRunner(args.pg19_port, label=f"PG@{args.pg19_port}")
+            all_ok = r2.run_all() and all_ok
 
     sys.exit(0 if all_ok else 1)
 

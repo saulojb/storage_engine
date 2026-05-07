@@ -85,8 +85,14 @@ CREATE TABLE events_col (
 -- index_scan=false avoids random-access stripe reads that bypass stripe pruning.
 -- orderby ensures data is physically sorted by event_date so date-range
 -- queries (Q5) hit only the relevant stripe(s).
-ALTER TABLE events_col SET (index_scan = false);
-ALTER TABLE events_col SET (orderby = 'event_date ASC');
+DO $$
+BEGIN
+    IF current_setting('server_version_num')::int >= 160000 THEN
+        EXECUTE 'ALTER TABLE events_col SET (index_scan = false)';
+        EXECUTE 'ALTER TABLE events_col SET (orderby = ''event_date ASC'')';
+    END IF;
+END
+$$;
 
 -- ── rowcompress (storage_engine row-level compressed) ────────
 CREATE TABLE events_row (

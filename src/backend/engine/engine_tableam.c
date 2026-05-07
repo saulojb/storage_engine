@@ -424,8 +424,12 @@ engine_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot 
 	if (scan->cs_readState == NULL)
 	{
 		bool randomAccess = false;
+		TupleDesc readTupleDesc = scan->returnVectorizedTuple ?
+			RelationGetDescr(scan->cs_base.rs_rd) :
+			slot->tts_tupleDescriptor;
+
 		scan->cs_readState =
-			init_engine_read_state(scan->cs_base.rs_rd, slot->tts_tupleDescriptor,
+			init_engine_read_state(scan->cs_base.rs_rd, readTupleDesc,
 									 scan->attr_needed, scan->scanQual,
 									 scan->scanContext, scan->cs_base.rs_snapshot,
 									 randomAccess,
@@ -2332,14 +2336,25 @@ ConditionalLockRelationWithTimeout(Relation rel, LOCKMODE lockMode, int timeout,
 static bool
 engine_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
 {
-	/*
-	 * Columnar tables have no heap pages. Treat the entire table as a single
-	 * logical block: return true exactly once, then false to terminate
-	 * acquire_sample_rows outer loop after next_tuple exhausts all rows.
-	 */
+	Buffer buf;
 	ColumnarScanDesc cscan = (ColumnarScanDesc) scan;
+
+	/*
+	 * PG17+ ANALYZE accounts pages visited through the ReadStream.  Our tuple
+	 * callback reads columnar rows directly and does not naturally consume heap
+	 * buffers, so drain the stream once up front to keep ANALYZE's scaling in
+	 * sync with the physical relation size reported by relation_estimate_size.
+	 *
+	 * This callback is still invoked only once for the columnar scan; the tuple
+	 * callback then exhausts the scan.  The important part is that pages_visited
+	 * reflects the same physical storage baseline as total_pages.
+	 */
 	if (cscan->cs_analyze_block_done)
 		return false;
+
+	while (BufferIsValid(buf = read_stream_next_buffer(stream, NULL)))
+		ReleaseBuffer(buf);
+
 	cscan->cs_analyze_block_done = true;
 	return true;
 }
@@ -2387,6 +2402,15 @@ engine_scan_analyze_next_tuple(TableScanDesc scan,
 	{
 		cscan->cs_analyze_initialized = true;
 
+#if PG_VERSION_NUM >= PG_VERSION_17
+		/*
+		 * PG17+ uses ReadStream-backed block accounting during ANALYZE.  Our
+		 * chunk-group CPU sampling is not wired into that block accounting yet,
+		 * so keep full-table sampling here to preserve correct ndistinct and row
+		 * extrapolation on newer PostgreSQL releases.
+		 */
+		cscan->cs_analyze_cg_stride = 0;
+#else
 		uint64 totalRows = ColumnarTableRowCount(scan->rs_rd);
 		const int targrows = 30000; /* 300 * default default_statistics_target */
 
@@ -2396,6 +2420,7 @@ engine_scan_analyze_next_tuple(TableScanDesc scan,
 			cscan->cs_analyze_cg_stride = Max(2, stride);
 		}
 		/* else: cs_analyze_cg_stride stays 0 — read everything */
+#endif
 	}
 
 	if (engine_getnextslot(scan, ForwardScanDirection, slot))
@@ -3044,10 +3069,17 @@ engine_scan_bitmap_next_tuple(TableScanDesc sscan,
 			else
 			{
 				/* Exact block: extract the specific tuple offsets */
+			#if PG_VERSION_NUM >= PG_VERSION_18
 				scan->cs_bm_noffsets = tbm_extract_page_tuple(
 					&scan->cs_tbmres,
 					scan->cs_bm_offsets,
 					VALID_ITEMPOINTER_OFFSETS);
+			#else
+				scan->cs_bm_noffsets = scan->cs_tbmres.ntuples;
+				memcpy(scan->cs_bm_offsets,
+					   scan->cs_tbmres.offsets,
+					   sizeof(OffsetNumber) * scan->cs_bm_noffsets);
+			#endif
 				scan->cs_bm_offidx = 0;
 				(*exact_pages)++;
 			}

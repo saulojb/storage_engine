@@ -118,6 +118,13 @@ Supported vectorized operations:
 SET storage_engine.enable_vectorization = on;   -- default: on
 ```
 
+When a plain aggregate query mixes `numeric` and `money` inputs in the same
+aggregate node, `storage_engine` intentionally leaves that plan on
+PostgreSQL's native `Agg` executor instead of forcing `StorageEngineVectorAgg`.
+That mixed shape is covered by regression tests and preserves correctness and
+stability, while supported non-mixed aggregate shapes still use the vectorized
+path.
+
 ### engine.uint8 — Unsigned 64-bit Integer
 
 `storage_engine` ships a native **unsigned 64-bit integer** type (`engine.uint8`) designed for columns that carry values in the full `[0, 2⁶⁴−1]` range, such as ClickBench's `WatchID` and `UserID` columns. Storing these as `bigint` silently wraps around and produces negative values.
@@ -189,7 +196,7 @@ A custom index scan path allows B-tree and other indexes to drive lookups into a
 
 ```sql
 -- Session GUC (applies to all colcompress tables in the session)
-SET storage_engine.enable_columnar_index_scan = on;  -- default: off
+SET storage_engine.enable_engine_index_scan = on;  -- default: off
 
 -- Per-table override (persisted in engine.col_options, survives reconnect)
 SELECT engine.alter_colcompress_table_set('documents'::regclass, index_scan => true);
@@ -228,7 +235,7 @@ For document repositories the combination is compelling: `colcompress` with `zst
 > | **File/document storage** (XML, PDF, JSON blobs — fetched by primary key or unique key) | `index_scan = true`. You want columnar compression for storage savings and point-lookup speed without full-stripe decompression. Sort order is irrelevant; every fetch targets a specific row. |
 > | **Analytics** (aggregations, date ranges, GROUP BY, pattern scans over millions of rows) | `index_scan = false` + `colcompress_merge()`. Sort the data by the query's filter column (`orderby = 'event_date ASC'`), then merge to produce globally ordered stripes. Stripe-level min/max pruning skips irrelevant stripes entirely before any decompression occurs. |
 >
-> Mixing both on the same table is possible but not ideal: a B-tree index on the `orderby` column will cause the planner to prefer `IndexScan` for range queries, disabling stripe pruning (see [Known Limitations](#b-tree-indexes-on-colcompress-disable-stripe-pruning)). If you need occasional point lookups on an analytical table, rely on the GUC `SET storage_engine.enable_columnar_index_scan = on` at session level rather than creating a B-tree index.
+> Mixing both on the same table is possible but not ideal: a B-tree index on the `orderby` column will cause the planner to prefer `IndexScan` for range queries, disabling stripe pruning (see [Known Limitations](#b-tree-indexes-on-colcompress-disable-stripe-pruning)). If you need occasional point lookups on an analytical table, rely on the GUC `SET storage_engine.enable_engine_index_scan = on` at session level rather than creating a B-tree index.
 
 ### DELETE and UPDATE Support
 
@@ -308,16 +315,30 @@ All parameters can be set per-session or globally in `postgresql.conf`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
+| **Storage** | | | |
+| `storage_engine.compression` | enum | `zstd` | Default compression codec: `none`, `pglz`, `zstd`, `lz4`, `deflate` |
+| `storage_engine.compression_level` | int | `3` | Default compression level for zstd (1 – 19) |
+| `storage_engine.stripe_row_limit` | int | `150000` | Maximum rows per stripe (1,000 – 100,000,000) |
+| `storage_engine.chunk_group_row_limit` | int | `10000` | Maximum rows per chunk group (1,000 – 100,000,000) |
+| **Execution** | | | |
 | `storage_engine.enable_parallel_execution` | bool | `on` | Enable parallel custom scan via DSM |
 | `storage_engine.min_parallel_processes` | int | `8` | Minimum worker count to launch for parallel scan |
 | `storage_engine.enable_vectorization` | bool | `on` | Enable vectorized WHERE/aggregate evaluation |
-| `storage_engine.enable_custom_scan` | bool | `on` | Enable projection and qual-pushdown custom scan |
-| `storage_engine.enable_column_cache` | bool | `on` | Enable in-memory column chunk cache |
-| `storage_engine.enable_columnar_index_scan` | bool | `off` | Enable index-driven columnar scan path (recommended `on` for document/point-lookup repositories) |
+| `storage_engine.enable_vectorized_groupagg` | bool | `on` | Enable vectorized `GROUP BY` aggregation (`StorageEngineVectorGroupAgg`). Requires `enable_vectorization = on` |
+| `storage_engine.enable_automatic_plan` | bool | `on` | Automatically compare serial and parallel aggregate plans and choose the cheaper one (two-pass planning) |
 | `storage_engine.enable_dml` | bool | `on` | Allow DELETE and UPDATE on colcompress tables |
-| `storage_engine.stripe_row_limit` | int | `150000` | Default rows per stripe (1,000 – 100,000,000) |
-| `storage_engine.chunk_group_row_limit` | int | `10000` | Default rows per chunk group (1,000 – 100,000,000) |
-| `storage_engine.compression_level` | int | `3` | Default compression level for zstd (1 – 19) |
+| **Custom Scan / Pushdown** | | | |
+| `storage_engine.enable_custom_scan` | bool | `on` | Enable projection and qual-pushdown custom scan |
+| `storage_engine.enable_qual_pushdown` | bool | `on` | Push WHERE quals into the columnar scan layer (requires `enable_custom_scan = on`) |
+| `storage_engine.qual_pushdown_correlation_threshold` | real | `0.4` | Min column correlation to attempt qual pushdown (0.0 = always push down) |
+| `storage_engine.max_custom_scan_paths` | int | `64` | Maximum custom scan paths generated per table during planning (1 – 1024) |
+| `storage_engine.enable_engine_index_scan` | bool | `off` | Enable index-driven columnar scan path (recommended `on` for document/point-lookup repositories) |
+| **Cache** | | | |
+| `storage_engine.enable_column_cache` | bool | `off` | Enable in-memory column chunk cache |
+| `storage_engine.column_cache_size` | int | `200` | Size of the column cache in MB (20 – 20000) |
+| **Debug** | | | |
+| `storage_engine.debug_vectorized_groupagg_fallback` | bool | `off` | Emit `DEBUG1` log message when the planner falls back from `VectorGroupAgg` to standard `HashAggregate` |
+| `storage_engine.planner_debug_level` | enum | `debug3` | Log level for columnar planner diagnostics: `debug5` … `log` |
 
 ### Per-Table Options
 
@@ -700,13 +721,23 @@ See [tests/README.md](tests/README.md) for full environment description and step
 
 | PostgreSQL | Status |
 |---|---|
-| 13 | Supported |
-| 14 | Supported |
-| 15 | Supported |
-| 16 | Supported |
-| 17 | Supported |
-| 18 | Supported (current stable target) |
-| 19 | Supported (devel — tested against `19~~devel` snapshot) |
+| 12 | ⛔ Not supported — use [1.3.4](https://github.com/saulojb/storage_engine/releases/tag/v1.3.4) |
+| 13 | ⛔ Not supported — use [1.3.4](https://github.com/saulojb/storage_engine/releases/tag/v1.3.4) |
+| 14 | ⛔ Not supported — use [1.3.4](https://github.com/saulojb/storage_engine/releases/tag/v1.3.4) |
+| 15 | ✅ Supported |
+| 16 | ✅ Supported |
+| 17 | ✅ Supported |
+| 18 | ✅ Supported (current stable target) |
+| 19 | ✅ Supported (devel — tested against `19~~devel` snapshot) |
+
+> **PostgreSQL 12, 13, and 14 users:** version `2.0.0` drops support for these releases.
+> The last compatible release is **[1.3.4](https://github.com/saulojb/storage_engine/releases/tag/v1.3.4)**.
+
+Version policy:
+
+- `2.0.0` is the first release of the `2.x` line. It requires **PostgreSQL 15 or later**.
+- `1.3.4` remains the supported release for PostgreSQL 12, 13, and 14 installations. No further features will be backported to that line.
+- The `2.x` line is validated against PostgreSQL 15, 16, 17, 18, and 19 (devel).
 
 ---
 

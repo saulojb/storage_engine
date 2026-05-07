@@ -13,6 +13,57 @@
 #include "engine/vectorization/types/types.h"
 #include "engine/vectorization/types/numeric.h"
 
+static Datum
+CallBuiltinAggUnary(PGFunction fn, FunctionCallInfo outer_fcinfo,
+					Datum arg0, bool arg0isnull)
+{
+	FmgrInfo	inner_flinfo;
+	LOCAL_FCINFO(inner_fcinfo, 1);
+
+	memset(&inner_flinfo, 0, sizeof(inner_flinfo));
+	inner_flinfo.fn_addr = fn;
+	if (outer_fcinfo->flinfo != NULL)
+	{
+		inner_flinfo.fn_mcxt = outer_fcinfo->flinfo->fn_mcxt;
+		inner_flinfo.fn_expr = outer_fcinfo->flinfo->fn_expr;
+	}
+
+	InitFunctionCallInfoData(*inner_fcinfo, &inner_flinfo, 1,
+						 outer_fcinfo->fncollation,
+						 outer_fcinfo->context, NULL);
+	inner_fcinfo->args[0].value = arg0;
+	inner_fcinfo->args[0].isnull = arg0isnull;
+
+	return fn(inner_fcinfo);
+}
+
+static Datum
+CallBuiltinAggBinary(PGFunction fn, FunctionCallInfo outer_fcinfo,
+					 Datum arg0, bool arg0isnull,
+					 Datum arg1, bool arg1isnull)
+{
+	FmgrInfo	inner_flinfo;
+	LOCAL_FCINFO(inner_fcinfo, 2);
+
+	memset(&inner_flinfo, 0, sizeof(inner_flinfo));
+	inner_flinfo.fn_addr = fn;
+	if (outer_fcinfo->flinfo != NULL)
+	{
+		inner_flinfo.fn_mcxt = outer_fcinfo->flinfo->fn_mcxt;
+		inner_flinfo.fn_expr = outer_fcinfo->flinfo->fn_expr;
+	}
+
+	InitFunctionCallInfoData(*inner_fcinfo, &inner_flinfo, 2,
+						 outer_fcinfo->fncollation,
+						 outer_fcinfo->context, NULL);
+	inner_fcinfo->args[0].value = arg0;
+	inner_fcinfo->args[0].isnull = arg0isnull;
+	inner_fcinfo->args[1].value = arg1;
+	inner_fcinfo->args[1].isnull = arg1isnull;
+
+	return fn(inner_fcinfo);
+}
+
 /*
  * PG19 renamed numeric_xxx_opt_error() → numeric_xxx_safe().
  * Provide a compat shim so callers need not be ifdef'd individually.
@@ -38,15 +89,14 @@ se_vanycount(PG_FUNCTION_ARGS)
 	int64 result = arg;
 	VectorColumn *arg1 = (VectorColumn *) PG_GETARG_POINTER(1);
 	int i;
-
-	for (i = 0; i <  arg1->dimension; i++) 
+	if (arg1 == NULL)
+		PG_RETURN_INT64(result);
+	for (i = 0; i < arg1->dimension; i++)
 	{
 		if (arg1->isnull[i])
 			continue;
-
 		result++;
 	}
-
 	PG_RETURN_INT64(result);
 }
 
@@ -324,38 +374,28 @@ Datum
 se_vint8acc(PG_FUNCTION_ARGS)
 {
 	Int128AggState *state;
+	Datum		stateDatum;
 	int i;
 
 	state = PG_ARGISNULL(0) ? NULL : (Int128AggState *) PG_GETARG_POINTER(0);
 	VectorColumn *arg1 = (VectorColumn*) PG_GETARG_POINTER(1);
 
-	MemoryContext aggContext;
-	MemoryContext oldContext;
-
-	if (!AggCheckCallContext(fcinfo, &aggContext))
-		elog(ERROR, "aggregate function called in non-aggregate context");
-
-	oldContext = MemoryContextSwitchTo(aggContext);
-
-	/* Create the state data on the first call */
-	if (state == NULL)
-	{
-		state = palloc0(sizeof(Int128AggState));
-		state->calcSumX2 = false;
-	}
-
 	int64 *vectorValue = (int64*) arg1->value;
+	stateDatum = PG_ARGISNULL(0) ? (Datum) 0 : PointerGetDatum(state);
 
 	for (i = 0; i < arg1->dimension; i++)
 	{
 		if (!arg1->isnull[i])
 		{
-			state->N++;
-			state->sumX += (int128) vectorValue[i];
+			stateDatum = CallBuiltinAggBinary(int8_avg_accum,
+								 fcinfo,
+								 stateDatum,
+								 state == NULL,
+								 Int64GetDatum(vectorValue[i]),
+								 false);
+			state = (Int128AggState *) DatumGetPointer(stateDatum);
 		}
 	}
-
-	MemoryContextSwitchTo(oldContext);
 
 	PG_RETURN_POINTER(state);
 }
@@ -364,37 +404,20 @@ PG_FUNCTION_INFO_V1(se_vint8sum);
 Datum
 se_vint8sum(PG_FUNCTION_ARGS)
 {
-	Int128AggState *state;
-
-	state = PG_ARGISNULL(0) ? NULL : (Int128AggState *) PG_GETARG_POINTER(0);
-
-	/* If there were no non-null inputs, return NULL */
-	if (state == NULL || state->N == 0)
-		PG_RETURN_NULL();
-
-	Numeric res = int128_to_numeric(state->sumX);
-
-	PG_RETURN_NUMERIC(res);
+	PG_RETURN_DATUM(CallBuiltinAggUnary(numeric_poly_sum,
+							 fcinfo,
+							 PG_GETARG_DATUM(0),
+							 PG_ARGISNULL(0)));
 }
 
 PG_FUNCTION_INFO_V1(se_vint8avg);
 Datum
 se_vint8avg(PG_FUNCTION_ARGS)
 {
-	Int128AggState *state;
-	Numeric sumNumeric, nNumeric, res;
-
-	state = PG_ARGISNULL(0) ? NULL : (Int128AggState *) PG_GETARG_POINTER(0);
-
-	/* If there were no non-null inputs, return NULL */
-	if (state == NULL || state->N == 0)
-		PG_RETURN_NULL();
-
-	sumNumeric = int128_to_numeric(state->sumX);
-	nNumeric = int128_to_numeric(state->N);
-	res = numeric_div_opt_error(sumNumeric, nNumeric, NULL);
-
-	PG_RETURN_NUMERIC(res);
+	PG_RETURN_DATUM(CallBuiltinAggUnary(numeric_poly_avg,
+							 fcinfo,
+							 PG_GETARG_DATUM(0),
+							 PG_ARGISNULL(0)));
 }
 
 PG_FUNCTION_INFO_V1(se_vint8larger);
@@ -597,19 +620,11 @@ se_vfloat8smaller(PG_FUNCTION_ARGS)
 /*
  * State for vectorized avg(numeric): maintained in aggContext via internal.
  */
-typedef struct NumericVecAvgState
-{
-	int64		N;
-	Numeric		sumX;			/* NULL until first non-null value */
-} NumericVecAvgState;
-
 /*
  * se_vnumeric_add — vectorized transition for sum(numeric).
  *
- * State starts NULL (no initcond).  All allocations must happen in
- * aggContext because VectorAgg does not call ExecAggCopyTransValue;
- * allocating in the per-tuple context would leave a dangling pointer
- * on the next batch call.
+ * Retained for non-parallel/simple compatibility when the vectorized
+ * aggregate OID is used directly.
  */
 PG_FUNCTION_INFO_V1(se_vnumeric_add);
 Datum
@@ -661,63 +676,48 @@ se_vnumeric_add(PG_FUNCTION_ARGS)
 /*
  * se_vnumericavg_accum — vectorized transition for avg(numeric).
  *
- * Uses an internal NumericVecAvgState allocated in aggContext.
+ * Delegates to PostgreSQL's numeric_avg_accum for each scalar value so the
+ * resulting transition state is the native NumericAggState expected by
+ * parallel combine/final functions.
  */
 PG_FUNCTION_INFO_V1(se_vnumericavg_accum);
 Datum
 se_vnumericavg_accum(PG_FUNCTION_ARGS)
 {
-	NumericVecAvgState *state;
 	VectorColumn *arg1 = (VectorColumn *) PG_GETARG_POINTER(1);
-	MemoryContext aggContext;
-	MemoryContext oldContext;
 	Datum	   *vectorValues = (Datum *) arg1->value;
+	Datum		stateDatum;
+	Oid			numeric_avg_accum_oid;
+	FmgrInfo	flinfo;
+	LOCAL_FCINFO(inner_fcinfo, 2);
 	int			i;
 
-	if (!AggCheckCallContext(fcinfo, &aggContext))
-		elog(ERROR, "aggregate function called in non-aggregate context");
+	stateDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
+	numeric_avg_accum_oid = fmgr_internal_function("numeric_avg_accum");
+	if (!OidIsValid(numeric_avg_accum_oid))
+		elog(ERROR, "could not resolve numeric_avg_accum");
 
-	state = PG_ARGISNULL(0) ? NULL : (NumericVecAvgState *) PG_GETARG_POINTER(0);
-
-	oldContext = MemoryContextSwitchTo(aggContext);
-
-	if (state == NULL)
-	{
-		state = palloc0(sizeof(NumericVecAvgState));
-		state->N = 0;
-		state->sumX = NULL;
-	}
+	fmgr_info_cxt(numeric_avg_accum_oid, &flinfo,
+				  fcinfo->flinfo != NULL ? fcinfo->flinfo->fn_mcxt : CurrentMemoryContext);
+	InitFunctionCallInfoData(*inner_fcinfo, &flinfo, 2,
+					 fcinfo->fncollation,
+					 fcinfo->context, NULL);
 
 	for (i = 0; i < arg1->dimension; i++)
 	{
 		if (arg1->isnull[i])
 			continue;
 
-		Numeric		val = DatumGetNumeric(vectorValues[i]);
+		inner_fcinfo->args[0].value = stateDatum;
+		inner_fcinfo->args[0].isnull = (stateDatum == (Datum) 0);
+		inner_fcinfo->args[1].value = vectorValues[i];
+		inner_fcinfo->args[1].isnull = false;
+		inner_fcinfo->isnull = false;
 
-		state->N++;
-
-		if (state->sumX == NULL)
-		{
-			/* Copy first value into aggContext */
-			state->sumX = DatumGetNumeric(
-				datumCopy(NumericGetDatum(val), false, -1));
-		}
-		else
-		{
-			Numeric		oldSum = state->sumX;
-
-			state->sumX = DatumGetNumeric(
-				DirectFunctionCall2(numeric_add,
-									NumericGetDatum(oldSum),
-									NumericGetDatum(val)));
-			pfree(oldSum);
-		}
+		stateDatum = FunctionCallInvoke(inner_fcinfo);
 	}
 
-	MemoryContextSwitchTo(oldContext);
-
-	PG_RETURN_POINTER(state);
+	PG_RETURN_DATUM(stateDatum);
 }
 
 /*
@@ -727,41 +727,26 @@ PG_FUNCTION_INFO_V1(se_vnumericavg_final);
 Datum
 se_vnumericavg_final(PG_FUNCTION_ARGS)
 {
-	NumericVecAvgState *state;
-	Numeric		nNumeric,
-				res;
-
-	state = PG_ARGISNULL(0) ? NULL : (NumericVecAvgState *) PG_GETARG_POINTER(0);
-
-	if (state == NULL || state->N == 0)
-		PG_RETURN_NULL();
-
-	nNumeric = int128_to_numeric((int128) state->N);
-	res = numeric_div_opt_error(state->sumX, nNumeric, NULL);
-
-	PG_RETURN_NUMERIC(res);
+	PG_RETURN_DATUM(CallBuiltinAggUnary(numeric_avg,
+							 fcinfo,
+							 PG_GETARG_DATUM(0),
+							 PG_ARGISNULL(0)));
 }
 
 /*
  * se_vnumericsum_final — final function for vectorized sum(numeric).
  *
- * Extracts just the sum from the shared NumericVecAvgState, allowing
- * vsum(numeric) to use the same stype=internal / sfunc=vnumericavg_accum
- * as vavg(numeric).  This ensures the planner assigns both the same
- * aggtransno so they share a single pertrans entry correctly.
+ * This is a thin wrapper around PostgreSQL's numeric_sum so the vectorized
+ * aggregate remains compatible if its aggregate OID is used directly.
  */
 PG_FUNCTION_INFO_V1(se_vnumericsum_final);
 Datum
 se_vnumericsum_final(PG_FUNCTION_ARGS)
 {
-	NumericVecAvgState *state;
-
-	state = PG_ARGISNULL(0) ? NULL : (NumericVecAvgState *) PG_GETARG_POINTER(0);
-
-	if (state == NULL || state->N == 0)
-		PG_RETURN_NULL();
-
-	PG_RETURN_NUMERIC(state->sumX);
+	PG_RETURN_DATUM(CallBuiltinAggUnary(numeric_sum,
+							 fcinfo,
+							 PG_GETARG_DATUM(0),
+							 PG_ARGISNULL(0)));
 }
 
 /*

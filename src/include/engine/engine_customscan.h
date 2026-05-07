@@ -17,6 +17,7 @@
 
 /* Flag to indicate is vectorized aggregate used in execution */
 #define CUSTOM_SCAN_VECTORIZED_AGGREGATE 1
+#define CUSTOM_SCAN_VECTORIZED_AGG_STAR_ONLY 2
 
 extern void engine_customscan_init(void);
 extern const CustomScanMethods * engine_customscan_methods(void);

@@ -17,10 +17,12 @@ set -euo pipefail
 export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULTS="$SCRIPT_DIR/results_serial.csv"
+RESULTS="${RESULTS:-$SCRIPT_DIR/results_serial_nocitus.csv}"
 RUNS=${1:-3}
-AM_DB="bench_am"
+AM_DB="${AM_DB:-bench_am}"
 PG_USER="$(whoami)"
+PGPORT="${PGPORT:-5432}"
+PG_VERSION_LABEL="${PG_VERSION_LABEL:-18}"
 
 declare -a Q_LABELS=(
   "Q1 count(*)"
@@ -52,9 +54,8 @@ declare -A AM_TARGETS=(
   ["heap"]="$AM_DB:events_heap"
   ["colcompress"]="$AM_DB:events_col"
   ["rowcompress"]="$AM_DB:events_row"
-  ["citus_columnar"]="$AM_DB:events_cit"
 )
-declare -a AM_ORDER=("heap" "colcompress" "rowcompress" "citus_columnar")
+declare -a AM_ORDER=("heap" "colcompress" "rowcompress")
 
 psql_ms() {
     local db="$1" tbl="$2" q_tmpl="$3"
@@ -65,10 +66,20 @@ psql_ms() {
 
     local -a times=()
     for ((i=0; i<RUNS; i++)); do
-        local t
-        t=$(psql -U "$PG_USER" -d "$db" --no-psqlrc -P pager=off -f "$tmpf" 2>&1 \
-            | grep -oP '(?:Time|Tempo):\s*\K[0-9]+[.,][0-9]+' | tail -1 | tr ',' '.')
-        times+=("${t:-9999}")
+    local output
+    local t
+    if ! output=$(psql -U "$PG_USER" -p "$PGPORT" -d "$db" --no-psqlrc -P pager=off -f "$tmpf" 2>&1); then
+      rm -f "$tmpf"
+      printf 'benchmark query failed for %s.%s\n%s\n' "$db" "$tbl" "$output" >&2
+      return 1
+    fi
+    t=$(printf '%s\n' "$output" | grep -oP '(?:Time|Tempo):\s*\K[0-9]+[.,][0-9]+' | tail -1 | tr ',' '.' || true)
+    if [[ -z "$t" ]]; then
+      rm -f "$tmpf"
+      printf 'benchmark timing parse failed for %s.%s\n%s\n' "$db" "$tbl" "$output" >&2
+      return 1
+    fi
+    times+=("$t")
     done
     rm -f "$tmpf"
     printf '%s\n' "${times[@]}" | LC_ALL=C sort -n | LC_NUMERIC=C awk "NR==$(( (RUNS+1)/2 )) {printf \"%.3f\", \$1}"
@@ -77,7 +88,7 @@ psql_ms() {
 echo "AM,query,median_ms" > "$RESULTS"
 
 echo "============================================================"
-echo " Benchmark — PostgreSQL 18  •  1 000 000 rows"
+echo " Benchmark — PostgreSQL $PG_VERSION_LABEL  •  1 000 000 rows"
 echo " Runs per query: $RUNS   JIT: off   Parallelism: off"
 echo "============================================================"
 
