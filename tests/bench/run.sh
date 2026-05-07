@@ -23,6 +23,8 @@ AM_DB="${AM_DB:-bench_am}"
 PG_USER="$(whoami)"
 PGPORT="${PGPORT:-5432}"
 PG_VERSION_LABEL="${PG_VERSION_LABEL:-18}"
+ENABLE_COLUMN_CACHE="${ENABLE_COLUMN_CACHE:-off}"
+COLUMN_CACHE_SIZE="${COLUMN_CACHE_SIZE:-200}"
 
 declare -a Q_LABELS=(
   "Q1 count(*)"
@@ -62,7 +64,11 @@ psql_ms() {
     local q="${q_tmpl//__TBL__/$tbl}"
     local tmpf
     tmpf=$(mktemp /tmp/bench_XXXXXX.sql)
-    printf '\\timing on\nSET jit=off;\nSET max_parallel_workers_per_gather=0;\n%s;\n' "$q" > "$tmpf"
+    if [[ "$ENABLE_COLUMN_CACHE" == "on" ]]; then
+        printf '\\timing on\nSET jit=off;\nSET max_parallel_workers_per_gather=0;\nSET storage_engine.enable_column_cache=on;\nSET storage_engine.column_cache_size=%s;\n%s;\n' "$COLUMN_CACHE_SIZE" "$q" > "$tmpf"
+    else
+        printf '\\timing on\nSET jit=off;\nSET max_parallel_workers_per_gather=0;\n%s;\n' "$q" > "$tmpf"
+    fi
 
     local -a times=()
     for ((i=0; i<RUNS; i++)); do
@@ -90,6 +96,7 @@ echo "AM,query,median_ms" > "$RESULTS"
 echo "============================================================"
 echo " Benchmark — PostgreSQL $PG_VERSION_LABEL  •  1 000 000 rows"
 echo " Runs per query: $RUNS   JIT: off   Parallelism: off"
+echo " Column cache: $ENABLE_COLUMN_CACHE  (size: ${COLUMN_CACHE_SIZE} MB)"
 echo "============================================================"
 
 for am in "${AM_ORDER[@]}"; do

@@ -1,0 +1,15 @@
+-- storage_engine--2.0.0--2.0.1.sql
+--
+-- Upgrade script: storage_engine 2.0.0 → 2.0.1
+--
+-- This release contains only build-quality fixes (no DDL or behavior changes):
+--
+--   * engine_planner_hook.c: extracted inner PG_TRY() into a static helper
+--     TryVectorizeSerialPlan() to eliminate -Wshadow=compatible-local warnings
+--     produced by nested PG_TRY() macro invocations.
+--
+--   * engine_aggregator_node.c: removed dead code block (arg_attno / arg_type /
+--     arg_column variables written but never read) in advance_transition_function,
+--     eliminating -Wunused-but-set-variable warnings.
+--
+-- No catalog changes.  No functional changes.
