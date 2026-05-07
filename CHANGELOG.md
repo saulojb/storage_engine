@@ -1,6 +1,15 @@
 # CHANGELOG
 
-## 1.4.0
+## 2.0.0
+
+* **BREAKING:** minimum PostgreSQL version is now **15**.
+  PostgreSQL 12, 13, and 14 are no longer supported. The last release
+  compatible with those versions is `1.3.4`.
+
+* **BREAKING:** branch `release/1.4.0` was renamed to `release/2.0.0`
+  before merge. No functional changes relative to the `1.4.0` development
+  line — the major version bump reflects the dropped PG 12–14 compatibility
+  and the addition of PG 15 to the official support matrix.
 
 * decision: **keep `storage_engine.enable_automatic_plan` (default: `on`)**
 

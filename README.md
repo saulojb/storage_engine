@@ -707,21 +707,23 @@ See [tests/README.md](tests/README.md) for full environment description and step
 
 | PostgreSQL | Status |
 |---|---|
-| 12 | Legacy via 1.3.4 only |
-| 13 | Legacy via 1.3.4 only |
-| 14 | Legacy via 1.3.4 only |
-| 15 | Validation target for 2.0.0 |
-| 16 | Supported |
-| 17 | Supported |
-| 18 | Supported (current stable target) |
-| 19 | Supported (devel — tested against `19~~devel` snapshot) |
+| 12 | ⛔ Not supported — use [1.3.4](https://github.com/saulojb/storage_engine/releases/tag/v1.3.4) |
+| 13 | ⛔ Not supported — use [1.3.4](https://github.com/saulojb/storage_engine/releases/tag/v1.3.4) |
+| 14 | ⛔ Not supported — use [1.3.4](https://github.com/saulojb/storage_engine/releases/tag/v1.3.4) |
+| 15 | ✅ Supported |
+| 16 | ✅ Supported |
+| 17 | ✅ Supported |
+| 18 | ✅ Supported (current stable target) |
+| 19 | ✅ Supported (devel — tested against `19~~devel` snapshot) |
 
-Current policy:
+> **PostgreSQL 12, 13, and 14 users:** version `2.0.0` drops support for these releases.
+> The last compatible release is **[1.3.4](https://github.com/saulojb/storage_engine/releases/tag/v1.3.4)**.
 
-- `1.3.4` is the last legacy release intended for older PostgreSQL installations.
-- `1.4.x` and the current development line are validated on PostgreSQL 16 and newer.
-- PostgreSQL 15 is the next candidate for re-entry into the official support matrix, but it is not advertised as supported until build and regression validation are green.
-- PostgreSQL 12, 13, and 14 should be documented as historical compatibility only, not as part of the active support matrix.
+Version policy:
+
+- `2.0.0` is the first release of the `2.x` line. It requires **PostgreSQL 15 or later**.
+- `1.3.4` remains the supported release for PostgreSQL 12, 13, and 14 installations. No further features will be backported to that line.
+- The `2.x` line is validated against PostgreSQL 15, 16, 17, 18, and 19 (devel).
 
 ---
 
