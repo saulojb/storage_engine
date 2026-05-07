@@ -97,6 +97,7 @@ type_oid_to_vectype(Oid typeoid)
 		case BPCHAROID:	return VECGAGG_TYPE_BPCHAR;
 		case TEXTOID:	return VECGAGG_TYPE_TEXT;
 		case CASHOID:	return VECGAGG_TYPE_INT8;
+		case BOOLOID:	return VECGAGG_TYPE_INT4; /* bool: Datum 0/1, same as int4 */
 		default:		return -1;
 	}
 }

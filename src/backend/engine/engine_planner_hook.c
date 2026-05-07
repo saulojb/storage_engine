@@ -581,6 +581,7 @@ KeyTypeOidToVecGaggType(Oid typeoid)
 		case FLOAT4OID:	return VECGAGG_TYPE_FLOAT4;
 		case FLOAT8OID:	return VECGAGG_TYPE_FLOAT8;
 		case CASHOID:	return VECGAGG_TYPE_INT8; /* money = int64 internally */
+		case BOOLOID:	return VECGAGG_TYPE_INT4; /* bool: Datum 0/1, same as int4 */
 		case BPCHAROID:	return VECGAGG_TYPE_BPCHAR;
 		case TEXTOID:	return VECGAGG_TYPE_TEXT;
 		default:		return -1;

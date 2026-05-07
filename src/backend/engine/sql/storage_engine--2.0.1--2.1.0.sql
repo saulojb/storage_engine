@@ -272,6 +272,23 @@ COMMENT ON FUNCTION engine.rowcompress_set_maintenance(regclass, text, real, rea
 GRANT EXECUTE ON FUNCTION engine.rowcompress_set_maintenance(regclass, text, real, real) TO PUBLIC;
 
 -- ============================================================
+-- 5a. engine.rowcompress_relation_storageid — C-backed helper
+-- ============================================================
+-- Returns the internal storage_id used by rowcompress (from ColumnarStorageGetStorageId).
+-- This differs from pg_relation_filenode and is required for correct JOINs
+-- against engine.row_batch.storage_id.
+
+CREATE OR REPLACE FUNCTION engine.rowcompress_relation_storageid(relation regclass)
+    RETURNS bigint
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', 'se_rowcompress_relation_storageid';
+
+COMMENT ON FUNCTION engine.rowcompress_relation_storageid(regclass)
+    IS 'returns the internal storage_id for a rowcompress relation (from ColumnarStorageGetStorageId)';
+
+GRANT EXECUTE ON FUNCTION engine.rowcompress_relation_storageid(regclass) TO PUBLIC;
+
+-- ============================================================
 -- 5. engine.storage_health — unified operational health view
 -- ============================================================
 --
@@ -415,7 +432,7 @@ FROM engine.row_options ro
 LEFT JOIN engine.row_maintenance_options rmo
     ON rmo.regclass = ro.regclass
 LEFT JOIN engine.row_batch rb
-    ON rb.storage_id = pg_relation_filenode(ro.regclass)::bigint
+    ON rb.storage_id = engine.rowcompress_relation_storageid(ro.regclass)
 GROUP BY
     ro.regclass,
     rmo.maintenance_mode,
@@ -565,3 +582,192 @@ COMMENT ON FUNCTION engine.storage_maintenance_stats(regclass)
     IS 'returns maintenance statistics for a single colcompress or rowcompress table (subset of engine.storage_health)';
 
 GRANT EXECUTE ON FUNCTION engine.storage_maintenance_stats(regclass) TO PUBLIC;
+
+-- ============================================================
+-- Phase 2: pruning_valid flag (colcompress) + exact deleted_count (rowcompress)
+-- ============================================================
+
+-- 1. Add pruning_valid to engine.stripe.
+--    DEFAULT true: all existing stripes start as pruning-valid.
+--    FlushRowMaskCache (C code) sets this to false on the first delete of a stripe.
+ALTER TABLE engine.stripe
+    ADD COLUMN IF NOT EXISTS pruning_valid boolean NOT NULL DEFAULT true;
+
+COMMENT ON COLUMN engine.stripe.pruning_valid
+    IS 'false when the stripe has been modified by DELETE/UPDATE; reset to true after colcompress_merge';
+
+-- 2. Backfill pruning_valid = false for stripes that already have deleted rows
+--    (detected via engine.chunk_group.deleted_rows, maintained by the C code).
+UPDATE engine.stripe s
+   SET pruning_valid = false
+ WHERE EXISTS (
+       SELECT 1
+         FROM engine.chunk_group cg
+        WHERE cg.storage_id = s.storage_id
+          AND cg.stripe_num  = s.stripe_num
+          AND cg.deleted_rows > 0
+   );
+
+-- 3. Add deleted_count to engine.row_batch.
+--    DEFAULT 0: existing batches start with 0; backfilled below.
+--    The C code (batch delete path) increments this on each row deletion.
+ALTER TABLE engine.row_batch
+    ADD COLUMN IF NOT EXISTS deleted_count integer NOT NULL DEFAULT 0;
+
+COMMENT ON COLUMN engine.row_batch.deleted_count
+    IS 'exact count of deleted rows in this batch (popcount of deleted_mask); maintained by the C code since v2.1.0 Phase 2';
+
+-- 4. Utility: count set bits in a rowcompress deletion bitmask.
+CREATE OR REPLACE FUNCTION engine.se_bytea_popcount(mask bytea)
+RETURNS integer LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT COALESCE(sum(
+        ((get_byte(mask, i) >> 0) & 1) +
+        ((get_byte(mask, i) >> 1) & 1) +
+        ((get_byte(mask, i) >> 2) & 1) +
+        ((get_byte(mask, i) >> 3) & 1) +
+        ((get_byte(mask, i) >> 4) & 1) +
+        ((get_byte(mask, i) >> 5) & 1) +
+        ((get_byte(mask, i) >> 6) & 1) +
+        ((get_byte(mask, i) >> 7) & 1)
+    )::integer, 0)
+    FROM generate_series(0, octet_length(mask) - 1) AS gs(i)
+$$;
+
+COMMENT ON FUNCTION engine.se_bytea_popcount(bytea)
+    IS 'count set bits (deleted rows) in a rowcompress deletion bitmask; used during migration backfill and available as a utility for manual inspection';
+
+GRANT EXECUTE ON FUNCTION engine.se_bytea_popcount(bytea) TO PUBLIC;
+
+-- 5. Backfill deleted_count for existing batches that have a deleted_mask.
+UPDATE engine.row_batch
+   SET deleted_count = engine.se_bytea_popcount(deleted_mask)
+ WHERE deleted_mask IS NOT NULL;
+
+-- 6. Update storage_health view: use pruning_valid for colcompress dirty detection
+--    and exact deleted_count for rowcompress tombstone count.
+CREATE OR REPLACE VIEW engine.storage_health AS
+
+-- colcompress segment
+SELECT
+    co.regclass::text                                    AS table_name,
+    'colcompress'::text                                  AS am_name,
+    COALESCE(cmo.maintenance_mode,                'eager') AS maintenance_mode,
+    COALESCE(cmo.maintenance_target_pruning_ratio, 0.70)  AS maintenance_target_pruning_ratio,
+    COALESCE(cmo.maintenance_merge_trigger_ratio,  0.20)  AS maintenance_merge_trigger_ratio,
+    -- unit = stripe; dirty when pruning_valid = false (set by FlushRowMaskCache on any delete)
+    count(s.stripe_num)::bigint                          AS total_units,
+    count(s.stripe_num)
+        FILTER (WHERE NOT s.pruning_valid)::bigint
+                                                         AS dirty_units,
+    CASE WHEN count(s.stripe_num) > 0
+         THEN count(s.stripe_num)
+                  FILTER (WHERE NOT s.pruning_valid)::real
+              / count(s.stripe_num)
+         ELSE 0.0
+    END                                                  AS dirty_ratio,
+    -- exact tombstone count: chunk_group.deleted_rows (maintained eagerly by C code)
+    COALESCE(sum(cg_s.stripe_deleted_rows), 0)::bigint   AS tombstone_rows,
+    COALESCE(
+        sum(s.row_count) - sum(COALESCE(cg_s.stripe_deleted_rows, 0)),
+        0
+    )::bigint                                            AS live_rows,
+    -- effective pruning ratio: fraction of clean stripes (pruning_valid = true)
+    CASE WHEN count(s.stripe_num) > 0
+         THEN 1.0::real
+              - count(s.stripe_num)
+                    FILTER (WHERE NOT s.pruning_valid)::real
+              / count(s.stripe_num)
+         ELSE 1.0
+    END                                                  AS effective_pruning_ratio_est,
+    CASE
+        WHEN count(s.stripe_num) = 0 THEN 'ok'
+        WHEN count(s.stripe_num)
+                 FILTER (WHERE NOT s.pruning_valid)::real
+             / NULLIF(count(s.stripe_num), 0)
+             > (1.0 - COALESCE(cmo.maintenance_target_pruning_ratio, 0.70))
+            THEN 'run_full_repack'
+        WHEN count(s.stripe_num)
+                 FILTER (WHERE NOT s.pruning_valid)::real
+             / NULLIF(count(s.stripe_num), 0)
+             > COALESCE(cmo.maintenance_merge_trigger_ratio, 0.20)
+            THEN 'run_incremental_merge'
+        ELSE 'ok'
+    END                                                  AS recommended_action
+FROM engine.col_options co
+LEFT JOIN engine.col_maintenance_options cmo
+    ON cmo.regclass = co.regclass
+LEFT JOIN engine.stripe s
+    ON s.storage_id = engine.colcompress_relation_storageid(co.regclass)
+LEFT JOIN (
+    SELECT storage_id, stripe_num, sum(deleted_rows) AS stripe_deleted_rows
+    FROM engine.chunk_group
+    GROUP BY storage_id, stripe_num
+) cg_s ON cg_s.storage_id = s.storage_id
+      AND cg_s.stripe_num  = s.stripe_num
+GROUP BY
+    co.regclass,
+    cmo.maintenance_mode,
+    cmo.maintenance_target_pruning_ratio,
+    cmo.maintenance_merge_trigger_ratio
+
+UNION ALL
+
+-- rowcompress segment
+SELECT
+    ro.regclass::text                                    AS table_name,
+    'rowcompress'::text                                  AS am_name,
+    COALESCE(rmo.maintenance_mode,                'eager') AS maintenance_mode,
+    COALESCE(rmo.maintenance_target_pruning_ratio, 0.70)  AS maintenance_target_pruning_ratio,
+    COALESCE(rmo.maintenance_merge_trigger_ratio,  0.20)  AS maintenance_merge_trigger_ratio,
+    -- unit = batch; dirty when deleted_mask IS NOT NULL (at least one row deleted)
+    count(rb.batch_num)::bigint                          AS total_units,
+    count(rb.batch_num)
+        FILTER (WHERE rb.deleted_mask IS NOT NULL)::bigint
+                                                         AS dirty_units,
+    CASE WHEN count(rb.batch_num) > 0
+         THEN count(rb.batch_num)
+                  FILTER (WHERE rb.deleted_mask IS NOT NULL)::real
+              / count(rb.batch_num)
+         ELSE 0.0
+    END                                                  AS dirty_ratio,
+    -- exact tombstone count via deleted_count (maintained by C code since v2.1.0 Phase 2)
+    COALESCE(sum(rb.deleted_count), 0)::bigint           AS tombstone_rows,
+    COALESCE(
+        sum(rb.row_count) - sum(rb.deleted_count),
+        sum(rb.row_count),
+        0
+    )::bigint                                            AS live_rows,
+    CASE WHEN count(rb.batch_num) > 0
+         THEN 1.0::real
+              - count(rb.batch_num)
+                    FILTER (WHERE rb.deleted_mask IS NOT NULL)::real
+              / count(rb.batch_num)
+         ELSE 1.0
+    END                                                  AS effective_pruning_ratio_est,
+    CASE
+        WHEN count(rb.batch_num) = 0 THEN 'ok'
+        WHEN count(rb.batch_num)
+                 FILTER (WHERE rb.deleted_mask IS NOT NULL)::real
+             / NULLIF(count(rb.batch_num), 0)
+             > (1.0 - COALESCE(rmo.maintenance_target_pruning_ratio, 0.70))
+            THEN 'run_full_repack'
+        WHEN count(rb.batch_num)
+                 FILTER (WHERE rb.deleted_mask IS NOT NULL)::real
+             / NULLIF(count(rb.batch_num), 0)
+             > COALESCE(rmo.maintenance_merge_trigger_ratio, 0.20)
+            THEN 'run_incremental_merge'
+        ELSE 'ok'
+    END                                                  AS recommended_action
+FROM engine.row_options ro
+LEFT JOIN engine.row_maintenance_options rmo
+    ON rmo.regclass = ro.regclass
+LEFT JOIN engine.row_batch rb
+    ON rb.storage_id = engine.rowcompress_relation_storageid(ro.regclass)
+GROUP BY
+    ro.regclass,
+    rmo.maintenance_mode,
+    rmo.maintenance_target_pruning_ratio,
+    rmo.maintenance_merge_trigger_ratio;
+
+COMMENT ON VIEW engine.storage_health
+    IS 'unified operational health view for all colcompress and rowcompress tables; shows dirty_ratio, tombstone rows and maintenance recommendation based on configured thresholds';

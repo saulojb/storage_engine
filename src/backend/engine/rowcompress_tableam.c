@@ -261,8 +261,9 @@ typedef struct IndexFetchRowCompressData
 #define Anum_rowcompress_batch_deleted_mask      7
 #define Anum_rowcompress_batch_min_value         8
 #define Anum_rowcompress_batch_max_value         9
+#define Anum_rowcompress_batch_deleted_count    10
 
-#define Natts_rowcompress_batch                  9
+#define Natts_rowcompress_batch                 10
 
 /*
  * RC_IS_DELETED — returns true if the bit for rowOffset is set in the
@@ -580,6 +581,8 @@ RCInsertBatchMetadata(uint64 storageId, uint64 batchNum,
 		values[Anum_rowcompress_batch_max_value - 1] = PointerGetDatum(maxValue);
 	else
 		nulls[Anum_rowcompress_batch_max_value - 1] = true;
+
+	values[Anum_rowcompress_batch_deleted_count - 1]     = Int32GetDatum(0);
 
 	Relation batchRel = table_open(RCBatchRelationId(), RowExclusiveLock);
 	TupleDesc tupdesc = RelationGetDescr(batchRel);
@@ -2439,6 +2442,13 @@ RCMarkRowDeleted(uint64 storageId, uint64 batchNum, uint32 rowCount, uint32 rowO
 
 	newValues[Anum_rowcompress_batch_deleted_mask - 1] = PointerGetDatum(newMask);
 	doReplace[Anum_rowcompress_batch_deleted_mask - 1] = true;
+
+	/* Exact tombstone counter: increment deleted_count by 1 */
+	Datum existingCountDatum = heap_getattr(tup, Anum_rowcompress_batch_deleted_count,
+											tupdesc, &isNull);
+	int32 existingCount = isNull ? 0 : DatumGetInt32(existingCountDatum);
+	newValues[Anum_rowcompress_batch_deleted_count - 1] = Int32GetDatum(existingCount + 1);
+	doReplace[Anum_rowcompress_batch_deleted_count - 1] = true;
 
 	HeapTuple newTup = heap_modify_tuple(tup, tupdesc, newValues, newIsNull, doReplace);
 	CatalogTupleUpdate(batchRel, &tup->t_self, newTup);
