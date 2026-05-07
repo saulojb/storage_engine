@@ -1,0 +1,11 @@
+-- storage_engine--1.3.4--2.0.0.sql
+-- Upgrade script: v1.3.4 → v2.0.0
+--
+-- v2.0.0 — BREAKING: minimum PostgreSQL version is now 15 (PG 12/13/14 no longer supported)
+--          new: StorageEngineVectorGroupAgg — vectorized GROUP BY aggregation for colcompress tables
+--          new GUCs: enable_vectorized_groupagg, enable_automatic_plan,
+--                    debug_vectorized_groupagg_fallback
+--          PG 15 added to official support matrix (175/175 tests pass)
+--
+-- No catalog changes in this release.
+-- All new functionality is implemented in the shared library (storage_engine.so).
