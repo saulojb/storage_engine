@@ -409,7 +409,7 @@ extern bool SaveEmptyRowMask(uint64 storageId, uint64 stripeId,
 extern bool UpdateRowMask(RelFileLocator relfilelocator, uint64 storageId,
 						  Snapshot snapshot, uint64 rowNumber);
 extern void FlushRowMaskCache(RowMaskWriteStateEntry *rowMaskEntry);
-extern void MarkStripePruningInvalid(uint64 storageId, uint64 stripeId);
+extern void MarkStripePruningInvalid(uint64 storageId, uint64 stripeId, int32 additionalDirtyRows);
 extern bytea * ReadChunkRowMask(RelFileLocator relfilelocator, Snapshot snapshot,
 								MemoryContext ctx,
 								uint64 stripeFirstRowNumber, int rowCount);

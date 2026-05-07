@@ -74,11 +74,12 @@ CREATE TABLE engine.stripe (
     chunk_group_row_count   int     NOT NULL,
     first_row_number        bigint  NOT NULL,
     pruning_valid           boolean NOT NULL DEFAULT true,
+    dirty_rows              bigint  NOT NULL DEFAULT 0,
     PRIMARY KEY (storage_id, stripe_num)
 ) WITH (user_catalog_table = true);
 
 COMMENT ON TABLE engine.stripe
-    IS 'colcompress per-stripe metadata: location, dimensions and row range; pruning_valid=false marks stripes with deleted rows';
+    IS 'colcompress per-stripe metadata: location, dimensions and row range; pruning_valid=false marks stripes with deleted rows; dirty_rows accumulates deleted row count for tombstone reporting';
 
 CREATE INDEX stripe_first_row_number_idx
     ON engine.stripe (storage_id, first_row_number);
@@ -178,11 +179,12 @@ CREATE TABLE engine.row_batch (
     batch_min_value  bytea,  -- serialized min of pruning column (NULL = no stats)
     batch_max_value  bytea,  -- serialized max of pruning column (NULL = no stats)
     deleted_count    integer NOT NULL DEFAULT 0,
+    pruning_valid    boolean NOT NULL DEFAULT true,
     PRIMARY KEY (storage_id, batch_num)
 ) WITH (user_catalog_table = true);
 
 COMMENT ON TABLE engine.row_batch
-    IS 'rowcompress per-batch metadata: file location and row range per compressed batch; deleted_count is an exact tombstone counter maintained by the C code';
+    IS 'rowcompress per-batch metadata: file location and row range per compressed batch; deleted_count is an exact tombstone counter; pruning_valid=false marks batches whose min/max may be stale after a DELETE';
 
 
 -- ============================================================
@@ -2563,10 +2565,10 @@ SELECT
               / count(s.stripe_num)
          ELSE 0.0
     END                                                  AS dirty_ratio,
-    -- exact tombstone count: chunk_group.deleted_rows (maintained eagerly by C code)
-    COALESCE(sum(cg_s.stripe_deleted_rows), 0)::bigint   AS tombstone_rows,
+    -- exact tombstone count: stripe.dirty_rows (denormalized sum of chunk_group.deleted_rows, maintained by C code)
+    COALESCE(sum(s.dirty_rows), 0)::bigint               AS tombstone_rows,
     COALESCE(
-        sum(s.row_count) - sum(COALESCE(cg_s.stripe_deleted_rows, 0)),
+        sum(s.row_count) - sum(s.dirty_rows),
         0
     )::bigint                                            AS live_rows,
     -- effective pruning ratio: fraction of clean stripes (pruning_valid = true)
@@ -2596,12 +2598,6 @@ LEFT JOIN engine.col_maintenance_options cmo
     ON cmo.regclass = co.regclass
 LEFT JOIN engine.stripe s
     ON s.storage_id = engine.colcompress_relation_storageid(co.regclass)
-LEFT JOIN (
-    SELECT storage_id, stripe_num, sum(deleted_rows) AS stripe_deleted_rows
-    FROM engine.chunk_group
-    GROUP BY storage_id, stripe_num
-) cg_s ON cg_s.storage_id = s.storage_id
-      AND cg_s.stripe_num  = s.stripe_num
 GROUP BY
     co.regclass,
     cmo.maintenance_mode,
@@ -2617,14 +2613,14 @@ SELECT
     COALESCE(rmo.maintenance_mode,                'eager') AS maintenance_mode,
     COALESCE(rmo.maintenance_target_pruning_ratio, 0.70)  AS maintenance_target_pruning_ratio,
     COALESCE(rmo.maintenance_merge_trigger_ratio,  0.20)  AS maintenance_merge_trigger_ratio,
-    -- unit = batch; dirty when deleted_mask IS NOT NULL (at least one row deleted)
+    -- unit = batch; dirty when pruning_valid = false (set by RCMarkRowDeleted on any delete)
     count(rb.batch_num)::bigint                          AS total_units,
     count(rb.batch_num)
-        FILTER (WHERE rb.deleted_mask IS NOT NULL)::bigint
+        FILTER (WHERE NOT rb.pruning_valid)::bigint
                                                          AS dirty_units,
     CASE WHEN count(rb.batch_num) > 0
          THEN count(rb.batch_num)
-                  FILTER (WHERE rb.deleted_mask IS NOT NULL)::real
+                  FILTER (WHERE NOT rb.pruning_valid)::real
               / count(rb.batch_num)
          ELSE 0.0
     END                                                  AS dirty_ratio,
@@ -2638,19 +2634,19 @@ SELECT
     CASE WHEN count(rb.batch_num) > 0
          THEN 1.0::real
               - count(rb.batch_num)
-                    FILTER (WHERE rb.deleted_mask IS NOT NULL)::real
+                    FILTER (WHERE NOT rb.pruning_valid)::real
               / count(rb.batch_num)
          ELSE 1.0
     END                                                  AS effective_pruning_ratio_est,
     CASE
         WHEN count(rb.batch_num) = 0 THEN 'ok'
         WHEN count(rb.batch_num)
-                 FILTER (WHERE rb.deleted_mask IS NOT NULL)::real
+                 FILTER (WHERE NOT rb.pruning_valid)::real
              / NULLIF(count(rb.batch_num), 0)
              > (1.0 - COALESCE(rmo.maintenance_target_pruning_ratio, 0.70))
             THEN 'run_full_repack'
         WHEN count(rb.batch_num)
-                 FILTER (WHERE rb.deleted_mask IS NOT NULL)::real
+                 FILTER (WHERE NOT rb.pruning_valid)::real
              / NULLIF(count(rb.batch_num), 0)
              > COALESCE(rmo.maintenance_merge_trigger_ratio, 0.20)
             THEN 'run_incremental_merge'
