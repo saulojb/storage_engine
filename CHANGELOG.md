@@ -23,7 +23,7 @@
   - serial latency deltas were small and noisy (no consistent winner);
   - parallel runs tended to be slightly better with `on` on median and tail.
 
-  Policy for 1.4.x:
+  Policy for 2.0.0:
 
   - keep `storage_engine.enable_automatic_plan = on` as the recommended default;
   - keep `off` as an operational/diagnostic escape hatch for targeted troubleshooting
@@ -69,7 +69,7 @@
 
   Validation status for this change set:
 
-  - PG18 (`5432`) regression suite: **ALL 164 TESTS PASSED**;
+  - regression suite: **PG15 175/175, PG16–PG19 174/174 PASSED** (all five versions);
   - real plans on `bench_am_30m` show
     `Parallel Custom Scan (StorageEngineVectorGroupAgg)` for
     `count/sum/min/max` grouped shapes;
@@ -106,8 +106,7 @@
   - result equality between `enable_vectorization=off` and `on`
   - successful execution of the mixed query without backend termination
 
-  The updated regression suite completed with `ALL 155 TESTS PASSED` on both
-  PG 18 (`5432`) and PG 15 (`5436`) during validation.
+  The updated regression suite completed with **PG15 175/175, PG16–PG19 174/174 PASSED** during final validation.
 
 * feature: **VectorGroupAgg — vectorized GROUP BY aggregation for `colcompress` tables**
 
