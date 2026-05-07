@@ -1,8 +1,10 @@
 # storage_engine
 
+> **v2.0 — Vectorized GROUP BY Aggregation** `storage_engine` now ships `StorageEngineVectorGroupAgg`, a batch-oriented vectorized aggregate executor that transparently replaces `HashAggregate`/`GroupAggregate` for `GROUP BY` queries over `colcompress` tables. Supports `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, and `AVG` across all integer, float, and numeric types. Parallel partial mode (`AGGSPLIT_INITIAL_SERIAL`) works on PG 15–19. Validated: **175/175 on PG 15, 174/174 on PG 16–19**.
+
 A PostgreSQL extension providing two high-performance Table Access Methods designed for analytical and HTAP workloads.
 
-- **`colcompress`** — column-oriented compressed storage with vectorized execution and parallel scan
+- **`colcompress`** — column-oriented compressed storage with vectorized execution, **vectorized GROUP BY aggregation**, and parallel scan
 - **`rowcompress`** — row-oriented batch-compressed storage with parallel scan
 
 Both AMs coexist alongside standard heap tables in the same database. All catalog objects are isolated in the `engine` schema, making the extension safe to install alongside `citus_columnar` or any other columnar extension (all exported C symbols carry the `se_` prefix to avoid linker conflicts).
@@ -106,6 +108,25 @@ SET storage_engine.enable_column_cache = on;   -- default: on
 ### Vectorized Execution
 
 `colcompress` ships a **vectorized expression evaluation engine** that processes WHERE clauses and aggregates in column-oriented batches of up to 10,000 values per call, instead of row-at-a-time evaluation. This maps naturally onto column chunks and eliminates per-row interpreter overhead.
+
+#### Vectorized GROUP BY Aggregation (v2.0)
+
+`storage_engine` v2.0 introduces **`StorageEngineVectorGroupAgg`** — a custom aggregate executor node that transparently replaces `HashAggregate` and `GroupAggregate` for `GROUP BY` queries over `colcompress` tables. The planner hooks intercept supported plans and substitute the vectorized path with no SQL changes required.
+
+- Supported aggregates: `COUNT(*)`, `COUNT(col)` (NULL-aware), `SUM`, `MIN`, `MAX`, `AVG`
+- Supported types: `int2`, `int4`, `int8`, `float4`, `float8`, `numeric`, `money`, `engine.uint8`
+- Up to 4 `GROUP BY` keys; constant-key plans (`numCols=0`) are also handled
+- **Parallel partial mode**: runs inside parallel workers via `AGGSPLIT_INITIAL_SERIAL`, feeding the native `Finalize GroupAggregate` combine step
+- Automatic fallback to native `Agg` for unsupported shapes (HAVING, subquery targets, unsupported types)
+
+```sql
+SET storage_engine.enable_vectorized_groupagg = on;   -- default: on
+SET storage_engine.enable_automatic_plan = on;        -- auto-select vectorized path (default: on)
+```
+
+> **Tip:** set `storage_engine.debug_vectorized_groupagg_fallback = on` to log why a given plan fell back to native aggregation.
+
+#### Vectorized Filter Evaluation
 
 Supported vectorized operations:
 
