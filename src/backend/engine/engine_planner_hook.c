@@ -2269,7 +2269,13 @@ QueryHasVectorizableAggregate(Query *parse)
  * The planner hook is invoked for the explained SELECT, not the outer
  * ExplainStmt utility wrapper, so inspecting only the current Query node is
  * insufficient for multi-statement commands such as `SET ...; EXPLAIN ...`.
-	* Parse the full command string and inspect the raw ExplainStmt options.
+ * Parse the full command string and inspect the raw ExplainStmt options.
+ *
+ * NOTE: debug_query_string may contain PL/pgSQL assignment syntax
+ * (e.g. "mymode := 'eager'") which is not valid SQL and would cause
+ * raw_parser() to throw a parse error.  We wrap the call in a PG_TRY
+ * block so that any parse error is silently swallowed — this function
+ * is a heuristic check only and returning false on parse failure is safe.
  */
 static bool
 QueryStringHasPlainExplain(const char *query)
@@ -2280,12 +2286,26 @@ QueryStringHasPlainExplain(const char *query)
 	if (query == NULL)
 		return false;
 
-	/* raw_parser is already used elsewhere in the extension for syntax checks */
+	/*
+	 * raw_parser() throws an error for non-SQL text (e.g. PL/pgSQL
+	 * assignment "var := expr" stored in debug_query_string).  Catch and
+	 * discard any such error: a false negative here is always safe.
+	 */
+	PG_TRY();
+	{
 #if PG_VERSION_NUM >= PG_VERSION_14
-	raw_parsetree_list = raw_parser(query, RAW_PARSE_DEFAULT);
+		raw_parsetree_list = raw_parser(query, RAW_PARSE_DEFAULT);
 #else
-	raw_parsetree_list = raw_parser(query);
+		raw_parsetree_list = raw_parser(query);
 #endif
+	}
+	PG_CATCH();
+	{
+		/* Not valid SQL — cannot be a plain EXPLAIN */
+		FlushErrorState();
+		return false;
+	}
+	PG_END_TRY();
 
 	foreach(lc, raw_parsetree_list)
 	{

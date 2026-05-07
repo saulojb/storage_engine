@@ -1,5 +1,66 @@
 # CHANGELOG
 
+## 2.1.0
+
+**Phase 1: Lazy/Eager Maintenance + Incremental Merge — catalog scaffold**
+
+No behavior changes. All new objects default to `eager` mode (current behavior),
+so existing tables are completely unaffected. No C code changes.
+
+### New catalog tables
+
+* **`engine.col_maintenance_options`** — per-table maintenance settings for
+  `colcompress` tables:
+  - `maintenance_mode` (`'eager'` | `'lazy'`, default `'eager'`)
+  - `maintenance_target_pruning_ratio` (`real`, default `0.70`) — minimum
+    fraction of stripes with valid pruning metadata before full repack is
+    recommended.
+  - `maintenance_merge_trigger_ratio` (`real`, default `0.20`) — fraction of
+    dirty stripes at which incremental merge is recommended.
+
+* **`engine.row_maintenance_options`** — same settings for `rowcompress` tables.
+
+### New management functions
+
+* **`engine.colcompress_set_maintenance(table, mode, target_ratio, merge_ratio)`**
+  — UPSERT into `engine.col_maintenance_options`; validates arguments.
+* **`engine.rowcompress_set_maintenance(table, mode, target_ratio, merge_ratio)`**
+  — same for rowcompress tables.
+
+### New observability view and functions
+
+* **`engine.storage_health`** — unified health view for all colcompress and
+  rowcompress tables. Columns: `table_name`, `am_name`, `maintenance_mode`,
+  thresholds, `total_units`, `dirty_units`, `dirty_ratio`, `tombstone_rows`,
+  `live_rows`, `effective_pruning_ratio_est`, `recommended_action`.
+  - `recommended_action` values: `'ok'`, `'run_incremental_merge'`,
+    `'run_full_repack'`.
+  - Phase 1 note: `dirty_units` is derived from existing deletion metadata
+    (colcompress: `chunk_group.deleted_rows`; rowcompress: `deleted_mask IS NOT NULL`).
+    Phase 2 will add per-unit `pruning_valid` flags for precise tracking.
+
+* **`engine.storage_maintenance_recommendation(table regclass)`** — returns
+  `(status, reason, suggested_command, priority)` for a single table.
+
+* **`engine.storage_maintenance_stats(table regclass)`** — tabular stats for
+  a single table (subset of `storage_health`).
+
+### Phase roadmap
+
+- **Phase 1** (this release) — catalog scaffold + observability (no behavior change)
+- **Phase 2** — lazy mode: C code marks stripes/batches dirty on UPDATE/DELETE;
+  `pruning_valid` flag per unit
+- **Phase 3** — `engine.colcompress_merge_incremental()`: merge only dirty stripes;
+  rowcompress incremental merge
+- **Phase 4** (optional) — `engine.storage_maintenance_auto()` scheduler
+
+Upgrade with:
+```sql
+ALTER EXTENSION storage_engine UPDATE TO '2.1.0';
+```
+
+---
+
 ## 2.0.1
 
 * **fix:** eliminate compiler warnings reported against commit `671a9a2`
