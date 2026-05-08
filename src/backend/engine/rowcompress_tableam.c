@@ -282,7 +282,8 @@ typedef struct IndexFetchRowCompressData
 #define Anum_rowcompress_options_compression_level 4
 #define Anum_rowcompress_options_pruning_attnum    5
 #define Anum_rowcompress_options_index_scan        6
-#define Natts_rowcompress_options                  6
+#define Anum_rowcompress_options_orderby           7
+#define Natts_rowcompress_options                  7
 
 
 /* ================================================================
@@ -926,6 +927,11 @@ RCInitOptions(Oid relationId)
 		CompressionTypeStr(ROWCOMPRESS_DEFAULT_COMPRESSION));
 	values[Anum_rowcompress_options_compression_level - 1]  = Int32GetDatum(ROWCOMPRESS_DEFAULT_COMPRESSION_LEVEL);
 
+	/* nullable columns default to NULL */
+	nulls[Anum_rowcompress_options_pruning_attnum - 1] = true;
+	nulls[Anum_rowcompress_options_index_scan - 1]     = true;
+	nulls[Anum_rowcompress_options_orderby - 1]        = true;
+
 	Relation optRel  = table_open(RCOptionsRelationId(), RowExclusiveLock);
 	TupleDesc tupdesc = RelationGetDescr(optRel);
 	HeapTuple tuple   = heap_form_tuple(tupdesc, values, nulls);
@@ -948,6 +954,7 @@ RCReadOptions(Oid relationId, RowCompressOptions *options)
 	options->compression      = ROWCOMPRESS_DEFAULT_COMPRESSION;
 	options->compressionLevel = ROWCOMPRESS_DEFAULT_COMPRESSION_LEVEL;
 	options->indexScan        = false;
+	options->orderby          = NULL;
 
 	Oid optOid = RCOptionsRelationId();
 	if (!OidIsValid(optOid))
@@ -1010,6 +1017,16 @@ RCReadOptions(Oid relationId, RowCompressOptions *options)
 										 tupdesc, &isNull);
 			if (!isNull)
 				options->indexScan = DatumGetBool(isDatum);
+		}
+
+		/* Read orderby (nullable text, added in v2.2.0) */
+		options->orderby = NULL;
+		if (tupdesc->natts >= Anum_rowcompress_options_orderby)
+		{
+			Datum obDatum = heap_getattr(tup, Anum_rowcompress_options_orderby,
+									 tupdesc, &isNull);
+			if (!isNull)
+				options->orderby = text_to_cstring(DatumGetTextPP(obDatum));
 		}
 	}
 
@@ -1087,6 +1104,11 @@ RCSetOptions(Oid relationId, const RowCompressOptions *options)
 		values[Anum_rowcompress_options_index_scan - 1] = BoolGetDatum(true);
 	else
 		nulls[Anum_rowcompress_options_index_scan - 1]  = true;
+
+	if (options->orderby != NULL && options->orderby[0] != '\0')
+		values[Anum_rowcompress_options_orderby - 1] = CStringGetTextDatum(options->orderby);
+	else
+		nulls[Anum_rowcompress_options_orderby - 1]  = true;
 
 	Relation  optRel  = table_open(RCOptionsRelationId(), RowExclusiveLock);
 	TupleDesc tupdesc = RelationGetDescr(optRel);
@@ -3570,6 +3592,33 @@ alter_rowcompress_table_set(PG_FUNCTION_ARGS)
 								options.indexScan ? "true" : "false")));
 	}
 
+	/* orderby => not null: "col1 ASC, col2 DESC" or "" to clear */
+	if (!PG_ARGISNULL(6))
+	{
+		text *orderbyText = PG_GETARG_TEXT_PP(6);
+		char *orderbyStr  = text_to_cstring(orderbyText);
+
+		/* empty string clears the orderby */
+		options.orderby = (orderbyStr[0] != '\0') ? orderbyStr : NULL;
+
+		/* validate SQL syntax eagerly so callers fail fast */
+		if (options.orderby != NULL)
+		{
+			StringInfoData chkbuf;
+			initStringInfo(&chkbuf);
+			appendStringInfo(&chkbuf, "SELECT 1 ORDER BY %s", options.orderby);
+#if PG_VERSION_NUM >= PG_VERSION_14
+			raw_parser(chkbuf.data, RAW_PARSE_DEFAULT);
+#else
+			raw_parser(chkbuf.data);
+#endif
+			pfree(chkbuf.data);
+		}
+
+		ereport(DEBUG1, (errmsg("setting orderby to %s",
+							options.orderby ? options.orderby : "(none)")));
+	}
+
 	RCSetOptions(relationId, &options);
 
 	table_close(rel, NoLock);
@@ -3649,6 +3698,13 @@ alter_rowcompress_table_reset(PG_FUNCTION_ARGS)
 		ereport(DEBUG1, (errmsg("resetting index_scan to false")));
 	}
 
+	/* orderby => true: reset to NULL (no sort) */
+	if (!PG_ARGISNULL(5) && PG_GETARG_BOOL(5))
+	{
+		options.orderby = NULL;
+		ereport(DEBUG1, (errmsg("resetting orderby to (none)")));
+	}
+
 	RCSetOptions(relationId, &options);
 
 	table_close(rel, NoLock);
@@ -3726,7 +3782,12 @@ rowcompress_repack(PG_FUNCTION_ARGS)
 	RCSetOptions(relationId, &options);
 
 	resetStringInfo(&buf);
-	appendStringInfo(&buf, "INSERT INTO %s SELECT * FROM %s", qualname, tmpname);
+	if (options.orderby != NULL && options.orderby[0] != '\0')
+		appendStringInfo(&buf,
+			"INSERT INTO %s SELECT * FROM %s ORDER BY %s",
+			qualname, tmpname, options.orderby);
+	else
+		appendStringInfo(&buf, "INSERT INTO %s SELECT * FROM %s", qualname, tmpname);
 	ret = SPI_execute(buf.data, false, 0);
 	if (ret != SPI_OK_INSERT)
 		ereport(ERROR, (errmsg("rowcompress_repack: INSERT failed (code %d)", ret)));
@@ -3742,8 +3803,9 @@ rowcompress_repack(PG_FUNCTION_ARGS)
 	SPI_finish();
 
 	ereport(NOTICE,
-			(errmsg("rowcompress_repack: " UINT64_FORMAT " rows rewritten into %s",
-					rowsRepacked, qualname)));
+			(errmsg("rowcompress_repack: " UINT64_FORMAT " rows rewritten into %s%s",
+					rowsRepacked, qualname,
+					(options.orderby && options.orderby[0]) ? " (globally sorted)" : "")));
 
 	PG_RETURN_VOID();
 }

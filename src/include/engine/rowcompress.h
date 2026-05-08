@@ -50,6 +50,8 @@ typedef struct RowCompressOptions
 	                                   * 0 means pruning disabled */
 	bool            indexScan;        /* true = allow index scans (OLTP mode);
 	                                   * false (default) = remove range index paths */
+	char           *orderby;          /* ORDER BY clause for rowcompress_repack;
+	                                   * NULL means no sort */
 } RowCompressOptions;
 
 /*
