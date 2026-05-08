@@ -59,6 +59,8 @@ static void   EndVecGroupAgg(CustomScanState *node);
 static void   ReScanVecGroupAgg(CustomScanState *node);
 static void   ExplainVecGroupAgg(CustomScanState *node, List *ancestors,
 								 ExplainState *es);
+static Datum  eval_vec_expr_node(VecExprNode *nodes, VecExprNode *cur,
+								  TupleTableSlot *batch_slot, int row_i, bool *isnull);
 
 static CustomScanMethods VecGroupAggScanMethods = {
 	"StorageEngineVectorGroupAgg",
@@ -97,6 +99,7 @@ type_oid_to_vectype(Oid typeoid)
 		case BPCHAROID:	return VECGAGG_TYPE_BPCHAR;
 		case TEXTOID:	return VECGAGG_TYPE_TEXT;
 		case CASHOID:	return VECGAGG_TYPE_INT8;
+		case BOOLOID:	return VECGAGG_TYPE_INT4; /* bool: Datum 0/1, same as int4 */
 		default:		return -1;
 	}
 }
@@ -400,12 +403,110 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 			entry->numeric_acc[i]		= (Datum) 0;
 			entry->numeric_state_acc[i]	= (Datum) 0;
 			entry->acc_isnull[i]		= true;
+			entry->distinct_htab[i]		= NULL;
+
+			/* For COUNT(DISTINCT col), create a per-group hash set */
+			if (state->targets[i].agg_kind == VECGAGG_COUNT_DISTINCT)
+			{
+				HASHCTL		ctl;
+				char		htab_name[64];
+				int			col_type = state->targets[i].col_type;
+				Size		key_size;
+
+				/*
+				 * Key size depends on the column type.
+				 * For text/bpchar we store a fixed-width hash of the bytes
+				 * to avoid pointer lifetime issues — use uint64 hash key.
+				 * For by-value types we store the raw Datum (always 8 bytes).
+				 */
+				if (col_type == VECGAGG_TYPE_TEXT || col_type == VECGAGG_TYPE_BPCHAR)
+					key_size = sizeof(uint64);	/* hash of the text bytes */
+				else
+					key_size = sizeof(int64);	/* raw int64/float8/etc Datum */
+
+				memset(&ctl, 0, sizeof(ctl));
+				ctl.keysize   = key_size;
+				ctl.entrysize = key_size;
+				ctl.hcxt      = state->agg_context;
+				snprintf(htab_name, sizeof(htab_name), "distinct_set_t%d_g%d",
+						 i, state->num_groups);
+				entry->distinct_htab[i] = hash_create(htab_name, 64, &ctl,
+										  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+			}
 		}
 
 		state->num_groups++;
 	}
 
 	return entry;
+}
+
+/*
+ * Recursively evaluate an inline VecExprNode expression tree against
+ * a single row (row_i) of a VectorTupleTableSlot batch.
+ *
+ * Returns the result Datum and sets *isnull.  Any NULL input propagates
+ * as NULL output (SQL 3-valued logic).
+ */
+static Datum
+eval_vec_expr_node(VecExprNode *nodes, VecExprNode *cur,
+				   TupleTableSlot *batch_slot, int row_i, bool *isnull)
+{
+	if (cur->is_var)
+	{
+		VectorColumn *col = (VectorColumn *) batch_slot->tts_values[cur->slot_idx];
+
+		if (col == NULL)
+		{
+			*isnull = true;
+			return (Datum) 0;
+		}
+		*isnull = col->isnull[row_i];
+		if (*isnull)
+			return (Datum) 0;
+
+		{
+			int8 *rawptr = (int8 *) col->value +
+						   (int) col->columnTypeLen * row_i;
+			return fetch_att(rawptr, col->columnIsVal, col->columnTypeLen);
+		}
+	}
+	else
+	{
+		bool	lnull;
+		Datum	lval;
+
+		lval = eval_vec_expr_node(nodes, &nodes[cur->left],
+								  batch_slot, row_i, &lnull);
+		if (lnull)
+		{
+			*isnull = true;
+			return (Datum) 0;
+		}
+
+		if (cur->right >= 0)
+		{
+			/* Binary operator */
+			bool	rnull;
+			Datum	rval;
+
+			rval = eval_vec_expr_node(nodes, &nodes[cur->right],
+									  batch_slot, row_i, &rnull);
+			if (rnull)
+			{
+				*isnull = true;
+				return (Datum) 0;
+			}
+			*isnull = false;
+			return FunctionCall2(&cur->opfmgr, lval, rval);
+		}
+		else
+		{
+			/* Unary operator (type cast) */
+			*isnull = false;
+			return FunctionCall1(&cur->opfmgr, lval);
+		}
+	}
 }
 
 /*
@@ -435,11 +536,43 @@ accumulate_value(VecGroupAggState *state, VecGroupEntry *entry,
 		return;
 	}
 
+	if (tgt->agg_kind == VECGAGG_COUNT_DISTINCT)
+	{
+		/*
+		 * count(distinct col): insert the value into the per-group hash set.
+		 * NULL values are ignored (SQL semantics).
+		 * For text/bpchar we hash the bytes to uint64 so the key is always
+		 * fixed-width and has no pointer lifetime issue.
+		 * For numeric types we store the raw int64 Datum.
+		 */
+		if (!isnull && entry->distinct_htab[t_idx] != NULL)
+		{
+			bool found;
+			if (tgt->col_type == VECGAGG_TYPE_TEXT ||
+				tgt->col_type == VECGAGG_TYPE_BPCHAR)
+			{
+				text	*tv  = DatumGetTextPP(val);
+				uint64	 hv  = hash_any_extended(
+								(const unsigned char *) VARDATA_ANY(tv),
+								VARSIZE_ANY_EXHDR(tv), 0);
+				hash_search(entry->distinct_htab[t_idx], &hv, HASH_ENTER, &found);
+			}
+			else
+			{
+				int64	 kv = DatumGetInt64(val);	/* float/int all fit */
+				hash_search(entry->distinct_htab[t_idx], &kv, HASH_ENTER, &found);
+			}
+			entry->acc_isnull[t_idx] = false;
+		}
+		return;
+	}
+
 	if (isnull)
 		return;		/* other aggregates skip NULLs */
 
 	switch (tgt->agg_kind)
 	{
+		case VECGAGG_SUM_EXPR:	/* fall through: val was pre-evaluated from expr */
 		case VECGAGG_SUM:
 			if (tgt->result_typeoid == NUMERICOID)
 			{
@@ -852,7 +985,17 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 			Datum	val = (Datum) 0;
 			bool	val_null = true;
 
-			if (tgt->agg_kind != VECGAGG_COUNT_STAR && tgt->col_attnum >= 0)
+			if (tgt->agg_kind == VECGAGG_SUM_EXPR && tgt->expr_num_nodes > 0)
+			{
+				/*
+				 * VECGAGG_SUM_EXPR: evaluate the arithmetic expression tree
+				 * row-by-row against the VectorColumn batch.
+				 */
+				val = eval_vec_expr_node(tgt->expr_nodes,
+										 &tgt->expr_nodes[tgt->expr_root_idx],
+										 slot, i, &val_null);
+			}
+			else if (tgt->agg_kind != VECGAGG_COUNT_STAR && tgt->col_attnum >= 0)
 			{
 				int val_idx = tgt->col_attnum;
 				VectorColumn *val_col = (VectorColumn *) slot->tts_values[val_idx];
@@ -863,6 +1006,55 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 					val      = fetch_att(vrawPtr, val_col->columnIsVal,
 										 val_col->columnTypeLen);
 					val_null = val_col->isnull[i];
+				}
+			}
+
+			/*
+			 * CASE WHEN col = const THEN val END filter.
+			 * If the filter condition is false (or NULL), treat the value as
+			 * NULL so that accumulate_value skips it.
+			 */
+			if (tgt->has_case_filter && !val_null)
+			{
+				VectorColumn *fcol = (tgt->filter_col_attnum >= 0)
+					? (VectorColumn *) slot->tts_values[tgt->filter_col_attnum]
+					: NULL;
+
+				if (fcol == NULL || fcol->isnull[i])
+				{
+					val_null = true;	/* NULL filter column → skip */
+				}
+				else
+				{
+					int8  *frawPtr = (int8 *) fcol->value +
+									 (int) fcol->columnTypeLen * i;
+					Datum  fval    = fetch_att(frawPtr, fcol->columnIsVal,
+											   fcol->columnTypeLen);
+					bool   matches;
+
+					if (tgt->filter_col_type == VECGAGG_TYPE_TEXT ||
+						tgt->filter_col_type == VECGAGG_TYPE_BPCHAR)
+					{
+						/*
+						 * Varlena text comparison: compare raw bytes after
+						 * stripping any varlena header (VARDATA_ANY / VARSIZE_ANY_EXHDR).
+						 */
+						text *fa = DatumGetTextPP(fval);
+						text *fb = DatumGetTextPP(tgt->filter_eq_value);
+						Size  la = VARSIZE_ANY_EXHDR(fa);
+						Size  lb = VARSIZE_ANY_EXHDR(fb);
+
+						matches  = (la == lb &&
+									memcmp(VARDATA_ANY(fa), VARDATA_ANY(fb), la) == 0);
+					}
+					else
+					{
+						/* By-value comparison (int4, int8, float8, bool, etc.) */
+						matches = (fval == tgt->filter_eq_value);
+					}
+
+					if (!matches)
+						val_null = true;	/* condition false → skip */
 				}
 			}
 
@@ -923,12 +1115,24 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 			case VECGAGG_COUNT_COL:
 				slot->tts_values[ra] = Int64GetDatum(entry->int64_acc[t]);
 				break;
+			case VECGAGG_COUNT_DISTINCT:
+				/*
+				 * Count the number of unique keys in the per-group hash set.
+				 * hash_get_num_entries returns the current fill count.
+				 */
+				slot->tts_values[ra] = Int64GetDatum(
+					entry->distinct_htab[t] != NULL
+					? (int64) hash_get_num_entries(entry->distinct_htab[t])
+					: 0);
+				break;
 			case VECGAGG_SUM:
+			case VECGAGG_SUM_EXPR:
 			case VECGAGG_MIN:
 			case VECGAGG_MAX:
 					if (tgt->result_typeoid == NUMERICOID)
 					{
-						if (state->is_partial_serial && tgt->agg_kind == VECGAGG_SUM)
+						if (state->is_partial_serial &&
+							(tgt->agg_kind == VECGAGG_SUM || tgt->agg_kind == VECGAGG_SUM_EXPR))
 						{
 							slot->tts_values[ra] =
 								call_numeric_unary_fmgr(
@@ -937,7 +1141,8 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 									entry->numeric_state_acc[t] == (Datum) 0,
 									(Node *) &state->numeric_fake_aggstate);
 						}
-						else if (tgt->agg_kind == VECGAGG_SUM)
+						else if (tgt->agg_kind == VECGAGG_SUM ||
+								 tgt->agg_kind == VECGAGG_SUM_EXPR)
 						{
 							slot->tts_values[ra] =
 								call_numeric_unary_fmgr(
@@ -1136,7 +1341,8 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 	 *   [4*num_keys+3]  aggsplit_mode
 	 *   [Const nodes for ki where key_is_consts[ki]=true, in order]
 	 *   [8 Ints per target: kind, col_type, col_attnum, result_attnum,
-	 *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid]
+	 *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid,
+	 *    has_case_filter, filter_col_attnum, filter_col_type, <Const filter_value>]
 	 */
 	List   *priv = cscan->custom_private;
 	int		target_idx;
@@ -1196,6 +1402,56 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 		state->targets[tno].result_typeoid = (Oid) PRIV_INT(list_nth(priv, target_idx++));
 		state->targets[tno].use_int8_avg_path = (bool) PRIV_INT(list_nth(priv, target_idx++));
 		state->targets[tno].avg_transfn_oid = (Oid) PRIV_INT(list_nth(priv, target_idx++));
+		/* CASE WHEN filter deserialization */
+		state->targets[tno].has_case_filter   = (bool) PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].filter_col_attnum = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].filter_col_type   = PRIV_INT(list_nth(priv, target_idx++));
+		{
+			Const *fc = (Const *) list_nth(priv, target_idx++);
+			state->targets[tno].filter_const_plan = NULL; /* runtime: unused */
+			if (state->targets[tno].has_case_filter && !fc->constisnull)
+			{
+				state->targets[tno].filter_eq_typeoid = fc->consttype;
+				get_typlenbyval(fc->consttype,
+								&state->targets[tno].filter_typlen,
+								&state->targets[tno].filter_typbyval);
+				state->targets[tno].filter_eq_value =
+					datumCopy(fc->constvalue,
+							  state->targets[tno].filter_typbyval,
+							  state->targets[tno].filter_typlen);
+			}
+			else
+			{
+				state->targets[tno].filter_eq_typeoid = InvalidOid;
+				state->targets[tno].filter_typlen     = 0;
+				state->targets[tno].filter_typbyval   = true;
+				state->targets[tno].filter_eq_value   = (Datum) 0;
+			}
+		}
+
+		/* VECGAGG_SUM_EXPR: inline expression tree */
+		state->targets[tno].expr_num_nodes = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].expr_root_idx  = PRIV_INT(list_nth(priv, target_idx++));
+		for (int en = 0; en < state->targets[tno].expr_num_nodes; en++)
+		{
+			VecExprNode *n = &state->targets[tno].expr_nodes[en];
+
+			n->is_var    = (bool) PRIV_INT(list_nth(priv, target_idx++));
+			n->slot_idx  = PRIV_INT(list_nth(priv, target_idx++));
+			n->col_type  = PRIV_INT(list_nth(priv, target_idx++));
+			n->left      = PRIV_INT(list_nth(priv, target_idx++));
+			n->right     = PRIV_INT(list_nth(priv, target_idx++));
+			n->opfuncid  = (Oid) PRIV_INT(list_nth(priv, target_idx++));
+			n->rettype   = (Oid) PRIV_INT(list_nth(priv, target_idx++));
+
+			/* Load runtime function info for operator nodes */
+			if (!n->is_var && OidIsValid(n->opfuncid))
+				fmgr_info_cxt(n->opfuncid, &n->opfmgr, state->agg_context);
+
+			/* Load type info for the node's return type */
+			if (OidIsValid(n->rettype))
+				get_typlenbyval(n->rettype, &n->rettyplen, &n->retbyval);
+		}
 	}
 
 	#undef PRIV_INT
@@ -1412,8 +1668,10 @@ ExplainVecGroupAgg(CustomScanState *css, List *ancestors, ExplainState *es)
  *   [4*num_keys+2]  sort_output
  *   [4*num_keys+3]  aggsplit_mode
  *   [Const nodes for each ki where key_is_consts[ki]=true, in order]
- *   [8 Ints per target: kind, col_type, col_attnum, result_attnum,
- *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid]
+ *   [12 items per target: 11 ints + 1 Const:
+ *    kind, col_type, col_attnum, result_attnum,
+ *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid,
+ *    has_case_filter, filter_col_attnum, filter_col_type, <Const filter_value>]
  */
 CustomScan *
 engine_create_groupagg_node(int num_keys,
@@ -1473,6 +1731,29 @@ engine_create_groupagg_node(int num_keys,
 		MKINT((int) targets[t].result_typeoid);
 		MKINT((int) targets[t].use_int8_avg_path);
 		MKINT((int) targets[t].avg_transfn_oid);
+		/* CASE WHEN filter: 3 ints + 1 Const node */
+		MKINT((int) targets[t].has_case_filter);
+		MKINT(targets[t].filter_col_attnum);
+		MKINT(targets[t].filter_col_type);
+		if (targets[t].has_case_filter && targets[t].filter_const_plan != NULL)
+			priv = lappend(priv, copyObject(targets[t].filter_const_plan));
+		else
+			priv = lappend(priv, makeNullConst(INT4OID, -1, InvalidOid));
+
+		/* VECGAGG_SUM_EXPR: inline expression tree (2 ints + 7 ints per node) */
+		MKINT(targets[t].expr_num_nodes);
+		MKINT(targets[t].expr_root_idx);
+		for (int en = 0; en < targets[t].expr_num_nodes; en++)
+		{
+			const VecExprNode *n = &targets[t].expr_nodes[en];
+			MKINT((int) n->is_var);
+			MKINT(n->slot_idx);
+			MKINT(n->col_type);
+			MKINT(n->left);
+			MKINT(n->right);
+			MKINT((int) n->opfuncid);
+			MKINT((int) n->rettype);
+		}
 	}
 
 #undef MKINT

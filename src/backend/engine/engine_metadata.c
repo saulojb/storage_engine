@@ -29,6 +29,7 @@
 #include "engine/engine_storage.h"
 #include "engine/engine_version_compat.h"
 #include "engine/utils/listutils.h"
+#include "engine/rowcompress.h"
 
 #include <sys/stat.h>
 #include "access/heapam.h"
@@ -179,7 +180,7 @@ typedef FormData_engine_options *Form_engine_options;
 
 
 /* constants for columnar.stripe */
-#define Natts_engine_stripe 9
+#define Natts_engine_stripe 11
 #define Anum_engine_stripe_storageid 1
 #define Anum_engine_stripe_stripe 2
 #define Anum_engine_stripe_file_offset 3
@@ -189,6 +190,8 @@ typedef FormData_engine_options *Form_engine_options;
 #define Anum_engine_stripe_row_count 7
 #define Anum_engine_stripe_chunk_count 8
 #define Anum_engine_stripe_first_row_number 9
+#define Anum_engine_stripe_pruning_valid 10
+#define Anum_engine_stripe_dirty_rows 11
 
 /* constants for columnar.chunk_group */
 #define Natts_engine_chunkgroup 5
@@ -1150,6 +1153,13 @@ void FlushRowMaskCache(RowMaskWriteStateEntry *rowMaskEntry)
 
 	if (HeapTupleIsValid(oldHeapTuple))
 	{
+		/* Read the previously-flushed deleted_rows so we can compute the delta */
+		bool prevIsNull;
+		Datum prevDatum = heap_getattr(oldHeapTuple, Anum_engine_row_mask_deleted_rows,
+									   tupleDescriptor, &prevIsNull);
+		int32 prevDeletedRows = prevIsNull ? 0 : DatumGetInt32(prevDatum);
+		int32 deltaDeletedRows = (int32) rowMaskEntry->deletedRows - prevDeletedRows;
+
 		bool update[Natts_engine_row_mask] = { 0 };
 		bool nulls[Natts_engine_row_mask] = { 0 };
 		Datum values[Natts_engine_row_mask] = { 0 };
@@ -1168,12 +1178,87 @@ void FlushRowMaskCache(RowMaskWriteStateEntry *rowMaskEntry)
 		CatalogTupleUpdate(columnarChunkGroupMask, &oldHeapTuple->t_self, newHeapTuple);
 
 		heap_freetuple(newHeapTuple);
+
+		/*
+		 * Phase 2: mark the stripe as pruning-invalid and accumulate only the
+		 * NEW deletions (delta) into stripe.dirty_rows.  Using the full
+		 * rowMaskEntry->deletedRows would double-count across multiple flushes.
+		 */
+		if (deltaDeletedRows > 0)
+			MarkStripePruningInvalid(rowMaskEntry->storageId, rowMaskEntry->stripeId,
+									 deltaDeletedRows);
 	}
 
 	systable_endscan_ordered(scanDescriptor);
 	table_close(columnarChunkGroupMask, AccessShareLock);
 
 	CommandCounterIncrement();
+}
+
+
+/*
+ * MarkStripePruningInvalid sets pruning_valid = false and accumulates
+ * additionalDirtyRows into dirty_rows on the stripe row identified by
+ * (storageId, stripeId).  Called by FlushRowMaskCache whenever deleted rows are
+ * flushed, so that storage_health can report tombstone_rows without aggregating
+ * chunk_group.deleted_rows.
+ *
+ * Uses a regular CatalogTupleUpdate (MVCC, not inplace) so that it works both
+ * on newly-inserted tuples and on pre-v2.1.0 tuples that were physically stored
+ * with fewer columns (heap_inplace_update would fail if the tuple grew in size).
+ */
+void
+MarkStripePruningInvalid(uint64 storageId, uint64 stripeId, int32 additionalDirtyRows)
+{
+	ScanKeyData scanKey[2];
+	ScanKeyInit(&scanKey[0], Anum_engine_stripe_storageid,
+				BTEqualStrategyNumber, F_OIDEQ, Int64GetDatum(storageId));
+	ScanKeyInit(&scanKey[1], Anum_engine_stripe_stripe,
+				BTEqualStrategyNumber, F_OIDEQ, Int64GetDatum(stripeId));
+
+	Oid columnarStripesOid = ColumnarStripeRelationId();
+	Relation columnarStripes = table_open(columnarStripesOid, RowExclusiveLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(columnarStripes);
+
+	Relation pkeyIndex = index_open(ColumnarStripePKeyIndexRelationId(), AccessShareLock);
+
+	SnapshotData dirtySnapshot;
+	InitDirtySnapshot(dirtySnapshot);
+
+	SysScanDesc scanDescriptor = systable_beginscan_ordered(columnarStripes, pkeyIndex,
+															&dirtySnapshot, 2, scanKey);
+
+	HeapTuple oldTuple = systable_getnext_ordered(scanDescriptor, ForwardScanDirection);
+	if (HeapTupleIsValid(oldTuple))
+	{
+		/* Read current dirty_rows (may be NULL on pre-2.1.5 tuples) */
+		bool dirtyIsNull;
+		Datum dirtyDatum = heap_getattr(oldTuple, Anum_engine_stripe_dirty_rows,
+										tupleDescriptor, &dirtyIsNull);
+		int64 currentDirtyRows = dirtyIsNull ? 0 : DatumGetInt64(dirtyDatum);
+
+		bool update[Natts_engine_stripe] = { false };
+		update[Anum_engine_stripe_pruning_valid - 1] = true;
+		update[Anum_engine_stripe_dirty_rows - 1]    = true;
+
+		Datum newValues[Natts_engine_stripe] = { 0 };
+		newValues[Anum_engine_stripe_pruning_valid - 1] = BoolGetDatum(false);
+		newValues[Anum_engine_stripe_dirty_rows - 1]    =
+			Int64GetDatum(currentDirtyRows + (int64) additionalDirtyRows);
+
+		bool newNulls[Natts_engine_stripe] = { false };
+
+		HeapTuple modifiedTuple = heap_modify_tuple(oldTuple, tupleDescriptor,
+													newValues, newNulls, update);
+
+		CatalogTupleUpdate(columnarStripes, &oldTuple->t_self, modifiedTuple);
+
+		heap_freetuple(modifiedTuple);
+	}
+
+	systable_endscan_ordered(scanDescriptor);
+	index_close(pkeyIndex, AccessShareLock);
+	table_close(columnarStripes, RowExclusiveLock);
 }
 
 
@@ -1633,6 +1718,10 @@ InsertEmptyStripeMetadataRow(uint64 storageId, uint64 stripeId, uint32 columnCou
 		UInt64GetDatum(0);
 	values[Anum_engine_stripe_chunk_count - 1] =
 		UInt32GetDatum(0);
+	values[Anum_engine_stripe_pruning_valid - 1] =
+		BoolGetDatum(true);
+	values[Anum_engine_stripe_dirty_rows - 1] =
+		Int64GetDatum(0);
 
 	Oid columnarStripesOid = ColumnarStripeRelationId();
 	Relation columnarStripes = table_open(columnarStripesOid, RowExclusiveLock);
@@ -2633,6 +2722,33 @@ se_engine_relation_storageid(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT64(storageId);
 }
+
+
+/*
+ * se_rowcompress_relation_storageid returns the internal storage_id for a
+ * rowcompress relation.  Analogous to se_engine_relation_storageid but
+ * accepts rowcompress tables instead of colcompress tables.
+ */
+PG_FUNCTION_INFO_V1(se_rowcompress_relation_storageid);
+
+Datum
+se_rowcompress_relation_storageid(PG_FUNCTION_ARGS)
+{
+	Oid relationId = PG_GETARG_OID(0);
+	Relation relation = relation_open(relationId, AccessShareLock);
+	if (!IsRowCompressTableAmTable(relationId))
+	{
+		elog(ERROR, "relation \"%s\" is not a rowcompress table",
+			 RelationGetRelationName(relation));
+	}
+
+	uint64 storageId = ColumnarStorageGetStorageId(relation, false);
+
+	relation_close(relation, AccessShareLock);
+
+	PG_RETURN_INT64(storageId);
+}
+
 
 /*
  * create_table_row_mask creates empty row mask for table

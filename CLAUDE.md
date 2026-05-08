@@ -13,7 +13,7 @@ This file provides context for AI coding assistants working on the **storage_eng
 
 Repository: https://github.com/saulojb/storage_engine  
 Current version: 1.0.5  
-PostgreSQL compatibility: 16–18  
+PostgreSQL compatibility: 15–19  
 
 ---
 

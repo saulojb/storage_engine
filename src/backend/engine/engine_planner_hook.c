@@ -581,10 +581,124 @@ KeyTypeOidToVecGaggType(Oid typeoid)
 		case FLOAT4OID:	return VECGAGG_TYPE_FLOAT4;
 		case FLOAT8OID:	return VECGAGG_TYPE_FLOAT8;
 		case CASHOID:	return VECGAGG_TYPE_INT8; /* money = int64 internally */
+		case BOOLOID:	return VECGAGG_TYPE_INT4; /* bool: Datum 0/1, same as int4 */
 		case BPCHAROID:	return VECGAGG_TYPE_BPCHAR;
 		case TEXTOID:	return VECGAGG_TYPE_TEXT;
 		default:		return -1;
 	}
+}
+
+/*
+ * Detect: SUM(CASE WHEN filter_col = const THEN value_col END)
+ *
+ * Matches a CaseExpr with exactly one CaseWhen whose condition is
+ * (Var = Const) or (Const = Var), and whose THEN result is a plain Var.
+ * The ELSE branch must be absent or explicitly NULL.
+ *
+ * On success, fills:
+ *   out_value_var        — Var for the value column (THEN branch)
+ *   out_filter_scan_pos  — varattno of the filter column (1-based scan pos)
+ *   out_filter_const     — the Const node from the equality condition
+ *   out_filter_typeoid   — type OID of the filter column
+ *
+ * Returns false if the expression does not match the pattern.
+ */
+static bool
+ExtractCaseWhenFilter(Node *expr,
+					  Var **out_value_var,
+					  AttrNumber *out_filter_scan_pos,
+					  Const **out_filter_const,
+					  Oid *out_filter_typeoid)
+{
+	CaseExpr   *caseexpr;
+	CaseWhen   *casewhen;
+	OpExpr	   *opexpr;
+	Var		   *filter_var;
+	Const	   *filter_const;
+	Node	   *then_node;
+	Node	   *arg0, *arg1;
+	Node	   *cond;
+
+	if (expr == NULL || !IsA(expr, CaseExpr))
+		return false;
+
+	caseexpr = (CaseExpr *) expr;
+
+	/* Must have exactly one WHEN clause */
+	if (list_length(caseexpr->args) != 1)
+		return false;
+
+	/* ELSE must be absent or explicitly NULL */
+	if (caseexpr->defresult != NULL)
+	{
+		if (!IsA(caseexpr->defresult, Const))
+			return false;
+		if (!((Const *) caseexpr->defresult)->constisnull)
+			return false;
+	}
+
+	casewhen = (CaseWhen *) linitial(caseexpr->args);
+	if (!IsA(casewhen, CaseWhen))
+		return false;
+
+	/* Peel any RelabelType wrapping the condition */
+	cond = (Node *) casewhen->expr;
+	while (IsA(cond, RelabelType))
+		cond = (Node *) ((RelabelType *) cond)->arg;
+
+	if (!IsA(cond, OpExpr))
+		return false;
+
+	opexpr = (OpExpr *) cond;
+	if (list_length(opexpr->args) != 2)
+		return false;
+
+	/* Verify operator is equality ("=") */
+	{
+		HeapTuple  optup = SearchSysCache1(OPEROID, ObjectIdGetDatum(opexpr->opno));
+		bool	   is_eq;
+		if (!HeapTupleIsValid(optup))
+			return false;
+		is_eq = (strcmp(NameStr(((Form_pg_operator) GETSTRUCT(optup))->oprname), "=") == 0);
+		ReleaseSysCache(optup);
+		if (!is_eq)
+			return false;
+	}
+
+	/* Peel casts from each argument */
+	arg0 = (Node *) linitial(opexpr->args);
+	arg1 = (Node *) lsecond(opexpr->args);
+	while (IsA(arg0, RelabelType)) arg0 = (Node *) ((RelabelType *) arg0)->arg;
+	while (IsA(arg1, RelabelType)) arg1 = (Node *) ((RelabelType *) arg1)->arg;
+
+	/* One side must be a Var, the other a Const */
+	if (IsA(arg0, Var) && IsA(arg1, Const))
+	{
+		filter_var   = (Var *) arg0;
+		filter_const = (Const *) arg1;
+	}
+	else if (IsA(arg0, Const) && IsA(arg1, Var))
+	{
+		filter_var   = (Var *) arg1;
+		filter_const = (Const *) arg0;
+	}
+	else
+		return false;
+
+	/* THEN branch must be a plain Var (the value column) */
+	then_node = (Node *) casewhen->result;
+	while (IsA(then_node, RelabelType))
+		then_node = (Node *) ((RelabelType *) then_node)->arg;
+
+	if (!IsA(then_node, Var))
+		return false;
+
+	*out_value_var       = (Var *) then_node;
+	*out_filter_scan_pos = filter_var->varattno;
+	*out_filter_const    = filter_const;
+	*out_filter_typeoid  = filter_var->vartype;
+
+	return true;
 }
 
 /*
@@ -664,6 +778,153 @@ ExtractAggInputVar(Node *expr, Var **out_var, Oid *out_expr_type,
 }
 
 /*
+ * Recursively build an inline VecExprNode tree from an arithmetic expression.
+ *
+ * Accepted node types:
+ *   Var           — scan column reference (leaf)
+ *   RelabelType   — lossless relabel (peeled, transparent)
+ *   OpExpr        — binary arithmetic operator (both args recursive)
+ *   FuncExpr      — unary numeric cast (single arg recursive)
+ *
+ * All column types and operator/function return types must be supported
+ * (TypeOidToVecGaggType returns ≥ 0).
+ *
+ * Returns the index of the new root node in nodes[], or -1 on failure.
+ */
+static int
+ExtractArithExprNode(Node *expr, Plan *child_plan,
+					 VecExprNode *nodes, int *num_nodes, int max_nodes)
+{
+	if (expr == NULL)
+		return -1;
+
+	/* Peel lossless relabels */
+	while (IsA(expr, RelabelType))
+		expr = (Node *) ((RelabelType *) expr)->arg;
+
+	if (IsA(expr, Var))
+	{
+		Var		   *v = (Var *) expr;
+		AttrNumber	table_attno;
+		int			slot_idx;
+		int			col_type;
+
+		if (v->varattno <= 0)
+			return -1;
+
+		table_attno = ScanOutputPosToVarAttno(child_plan, v->varattno);
+		if (table_attno == 0)
+			return -1;
+
+		slot_idx = VarAttnoToSlotIdx(child_plan, table_attno);
+		if (slot_idx < 0)
+			return -1;
+
+		col_type = TypeOidToVecGaggType(v->vartype);
+		if (col_type < 0)
+			return -1;
+
+		if (*num_nodes >= max_nodes)
+			return -1;
+
+		{
+			int			idx = (*num_nodes)++;
+			VecExprNode *n  = &nodes[idx];
+
+			n->is_var   = true;
+			n->slot_idx = slot_idx;
+			n->col_type = col_type;
+			n->left     = -1;
+			n->right    = -1;
+			n->opfuncid = InvalidOid;
+			n->rettype  = v->vartype;
+			return idx;
+		}
+	}
+
+	if (IsA(expr, OpExpr))
+	{
+		OpExpr *op = (OpExpr *) expr;
+		int		ret_type;
+		int		left_idx, right_idx;
+
+		if (list_length(op->args) != 2)
+			return -1;
+		if (!OidIsValid(op->opfuncid))
+			return -1;
+
+		ret_type = TypeOidToVecGaggType(op->opresulttype);
+		if (ret_type < 0)
+			return -1;
+
+		left_idx = ExtractArithExprNode((Node *) linitial(op->args),
+										child_plan, nodes, num_nodes, max_nodes);
+		if (left_idx < 0)
+			return -1;
+
+		right_idx = ExtractArithExprNode((Node *) lsecond(op->args),
+										 child_plan, nodes, num_nodes, max_nodes);
+		if (right_idx < 0)
+			return -1;
+
+		if (*num_nodes >= max_nodes)
+			return -1;
+
+		{
+			int			idx = (*num_nodes)++;
+			VecExprNode *n  = &nodes[idx];
+
+			n->is_var   = false;
+			n->slot_idx = -1;
+			n->col_type = ret_type;
+			n->left     = left_idx;
+			n->right    = right_idx;
+			n->opfuncid = op->opfuncid;
+			n->rettype  = op->opresulttype;
+			return idx;
+		}
+	}
+
+	if (IsA(expr, FuncExpr))
+	{
+		FuncExpr   *f = (FuncExpr *) expr;
+		int			ret_type;
+		int			child_idx;
+
+		if (list_length(f->args) != 1)
+			return -1;
+
+		ret_type = TypeOidToVecGaggType(f->funcresulttype);
+		if (ret_type < 0)
+			return -1;
+
+		child_idx = ExtractArithExprNode((Node *) linitial(f->args),
+										 child_plan, nodes, num_nodes, max_nodes);
+		if (child_idx < 0)
+			return -1;
+
+		if (*num_nodes >= max_nodes)
+			return -1;
+
+		{
+			int			idx = (*num_nodes)++;
+			VecExprNode *n  = &nodes[idx];
+
+			n->is_var   = false;
+			n->slot_idx = -1;
+			n->col_type = ret_type;
+			n->left     = child_idx;
+			n->right    = -1;		/* unary */
+			n->opfuncid = f->funcid;
+			n->rettype  = f->funcresulttype;
+			return idx;
+		}
+	}
+
+	return -1;	/* unsupported node type */
+}
+
+/*
  * Extract an Aggref from a target expression that may be wrapped by
  * single-argument coercion/finalize nodes.
  */
@@ -718,17 +979,52 @@ ExtractTargetAggref(Node *expr, Aggref **out_aggref)
 /*
  * Classify an Aggref into VECGAGG_COUNT_STAR / SUM / MIN / MAX / AVG.
  * Fills *out_kind, *out_col_varattno, *out_col_typeoid.
+ *
+ * Optional CASE WHEN output params (all nullable — pass NULL to ignore):
+ *   out_has_case_filter   — true when SUM(CASE WHEN col=const THEN val END)
+ *   out_filter_scan_pos   — 1-based scan output pos of the filter column
+ *   out_filter_const      — Const node for the equality constant
+ *   out_filter_typeoid    — type OID of the filter column
+ *
+ * Optional EXPR output params (pass NULL to disable EXPR classification):
+ *   out_expr_nodes        — pre-allocated VecExprNode array (VECGAGG_EXPR_MAX_NODES)
+ *   out_expr_num_nodes    — number of nodes filled in out_expr_nodes
+ *   out_expr_root_idx     — index of root node in out_expr_nodes
+ *
  * Returns false if the aggregate is not supported.
  */
 static bool
 ClassifyAggref(Aggref *aggref, Plan *child_plan,
 			   int *out_kind, AttrNumber *out_col_varattno, Oid *out_col_typeoid,
-			   bool *out_avg_input_as_float8)
+			   bool *out_avg_input_as_float8,
+			   bool *out_has_case_filter,
+			   AttrNumber *out_filter_scan_pos,
+			   Const **out_filter_const,
+			   Oid *out_filter_typeoid,
+			   VecExprNode *out_expr_nodes,
+			   int *out_expr_num_nodes,
+			   int *out_expr_root_idx)
 {
 	const char *fname;
 	Var		   *arg_var = NULL;
 	Oid			arg_expr_type = InvalidOid;
 	bool		arg_cast_to_float8 = false;
+	bool		has_case = false;
+	AttrNumber	case_filter_scan_pos = 0;
+	Const	   *case_filter_const = NULL;
+	Oid			case_filter_typeoid = InvalidOid;
+
+	/* Initialize optional outputs */
+	if (out_has_case_filter)  *out_has_case_filter  = false;
+	if (out_filter_scan_pos)  *out_filter_scan_pos  = 0;
+	if (out_filter_const)     *out_filter_const     = NULL;
+	if (out_filter_typeoid)   *out_filter_typeoid   = InvalidOid;
+	if (out_expr_num_nodes)   *out_expr_num_nodes   = 0;
+	if (out_expr_root_idx)    *out_expr_root_idx    = -1;
+
+	/* FILTER clause not supported */
+	if (aggref->aggfilter != NULL)
+		return false;
 
 	/* count(*): aggstar = true, no args */
 	if (aggref->aggstar)
@@ -749,7 +1045,68 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 						 &arg_var,
 						 &arg_expr_type,
 						 &arg_cast_to_float8))
-		return false;
+	{
+		/*
+		 * Not a plain Var — try CASE WHEN col = const THEN value_col END.
+		 * Only valid for SUM / MIN / MAX (not AVG or COUNT).
+		 */
+		Var		   *case_value_var = NULL;
+
+		if (!ExtractCaseWhenFilter((Node *) arg_te->expr,
+								   &case_value_var,
+								   &case_filter_scan_pos,
+								   &case_filter_const,
+								   &case_filter_typeoid))
+		{
+			/*
+			 * Not CASE WHEN either — try arithmetic expression for SUM.
+			 * Handles SUM(price * quantity), SUM(a + b), SUM(a * b + c), etc.
+			 * Only SUM is supported for expressions (not AVG/MIN/MAX).
+			 */
+			if (out_expr_nodes != NULL && out_expr_num_nodes != NULL &&
+				out_expr_root_idx != NULL)
+			{
+				const char *expr_fname = get_func_name(aggref->aggfnoid);
+
+				if (expr_fname != NULL &&
+					(strcmp(expr_fname, "sum") == 0 ||
+					 strcmp(expr_fname, "int4_sum") == 0 ||
+					 strcmp(expr_fname, "int8_sum") == 0 ||
+					 strcmp(expr_fname, "float8pl") == 0))
+				{
+					int		expr_num = 0;
+					int		expr_root = -1;
+
+					expr_root = ExtractArithExprNode(
+						(Node *) arg_te->expr, child_plan,
+						out_expr_nodes, &expr_num, VECGAGG_EXPR_MAX_NODES);
+
+					if (expr_root >= 0 && expr_num >= 2)
+					{
+						Oid root_rettype = out_expr_nodes[expr_root].rettype;
+						int root_col_type = TypeOidToVecGaggType(root_rettype);
+
+						if (root_col_type >= 0)
+						{
+							*out_expr_num_nodes       = expr_num;
+							*out_expr_root_idx        = expr_root;
+							*out_kind                 = VECGAGG_SUM_EXPR;
+							*out_col_varattno         = 0;
+							*out_col_typeoid          = root_rettype;
+							*out_avg_input_as_float8  = false;
+							return true;
+						}
+					}
+				}
+			}
+			return false;
+		}
+
+		arg_var            = case_value_var;
+		arg_expr_type      = arg_var->vartype;
+		arg_cast_to_float8 = false;
+		has_case           = true;
+	}
 
 	/* Map scan-output position to table varattno */
 	AttrNumber scan_pos  = arg_var->varattno;
@@ -759,8 +1116,7 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 
 	/* Check type is supported */
 	Oid arg_typeoid = arg_var->vartype;
-	if (TypeOidToVecGaggType(arg_typeoid) < 0)
-		return false;
+	int arg_vectype = TypeOidToVecGaggType(arg_typeoid);
 
 	fname = get_func_name(aggref->aggfnoid);
 	if (fname == NULL)
@@ -769,6 +1125,8 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 	if (strcmp(fname, "sum") == 0 || strcmp(fname, "int4_sum") == 0 ||
 		strcmp(fname, "int8_sum") == 0 || strcmp(fname, "float8pl") == 0)
 	{
+		if (arg_vectype < 0)
+			return false;
 		if (arg_cast_to_float8)
 			return false;
 		*out_kind = VECGAGG_SUM;
@@ -778,6 +1136,8 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 			 strcmp(fname, "int8_avg") == 0 ||
 			 strcmp(fname, "float8_avg") == 0)
 	{
+		if (arg_vectype < 0)
+			return false;
 		/*
 		 * Determine the true final result type.  In AGGSPLIT_INITIAL_SERIAL,
 		 * aggref->aggtype is the serialized transition type (BYTEAOID), not
@@ -823,7 +1183,36 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 		/* count(col): NULL-aware — only count non-null values */
 		if (arg_cast_to_float8)
 			return false;
-		*out_kind = VECGAGG_COUNT_COL;
+		/* CASE WHEN filter is not meaningful for COUNT — fall back */
+		if (has_case)
+			return false;
+		if (aggref->aggdistinct != NIL)
+		{
+			/*
+			 * COUNT(DISTINCT col): executor uses a hash set, so any
+			 * by-value type or passable-by-reference type (text, bpchar,
+			 * varchar, …) is fine.  The only hard requirement is that we
+			 * can read the Datum from a VectorColumn batch slot, which all
+			 * supported column types satisfy.  Types that TypeOidToVecGaggType
+			 * returns < 0 for (e.g. text, bpchar) are still valid here because
+			 * the executor uses VECGAGG_TYPE_TEXT / VECGAGG_TYPE_BPCHAR paths.
+			 */
+			int cd_col_type = arg_vectype;	/* may be -1 for text types */
+			if (cd_col_type < 0)
+			{
+				/* Allow text-family types via KeyTypeOidToVecGaggType */
+				cd_col_type = KeyTypeOidToVecGaggType(arg_typeoid);
+				if (cd_col_type < 0)
+					return false;	/* truly unsupported type */
+			}
+			*out_kind = VECGAGG_COUNT_DISTINCT;
+		}
+		else
+		{
+			if (arg_vectype < 0)
+				return false;
+			*out_kind = VECGAGG_COUNT_COL;
+		}
 	}
 	else if (strcmp(fname, "min") == 0 || strcmp(fname, "int4smaller") == 0 ||
 			 strcmp(fname, "int8smaller") == 0 || strcmp(fname, "float8smaller") == 0)
@@ -842,10 +1231,24 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
 	else
 		return false;
 
+	/* AVG with CASE WHEN is not supported */
+	if (has_case && *out_kind == VECGAGG_AVG)
+		return false;
+
 	*out_col_varattno = col_attno;
 	*out_col_typeoid  = arg_typeoid;
 	if (*out_kind != VECGAGG_AVG)
 		*out_avg_input_as_float8 = false;
+
+	/* Propagate CASE WHEN filter info to caller */
+	if (has_case)
+	{
+		if (out_has_case_filter)  *out_has_case_filter  = true;
+		if (out_filter_scan_pos)  *out_filter_scan_pos  = case_filter_scan_pos;
+		if (out_filter_const)     *out_filter_const     = case_filter_const;
+		if (out_filter_typeoid)   *out_filter_typeoid   = case_filter_typeoid;
+	}
+
 	return true;
 }
 
@@ -911,6 +1314,7 @@ PlanTreeMutator(Plan *node, void *context)
 
 			if (!engine_enable_vectorization)
 				return node;
+
 			if (aggNode->plan.lefttree->type == T_CustomScan)
 			{
 				/*
@@ -1051,10 +1455,22 @@ PlanTreeMutator(Plan *node, void *context)
 				 * For AGG_SORTED the planner inserts a Sort node between
 				 * the Agg and the scan.  Strip it — VecGroupAgg uses a
 				 * hash table and does not need sorted input.
+				 *
+				 * When the planner uses parallel workers it wraps the scan in
+				 * Gather / GatherMerge.  VecGroupAgg has its own internal
+				 * parallel scan mechanism, so strip through those nodes too.
 				 */
 				scan_plan = child_plan;
 				if (scan_plan->type == T_Sort)
 					scan_plan = ((Sort *) scan_plan)->plan.lefttree;
+
+				/* Strip Gather / GatherMerge inserted for parallel workers */
+				if (scan_plan->type == T_Gather || scan_plan->type == T_GatherMerge)
+				{
+					scan_plan = scan_plan->lefttree;
+					if (scan_plan->type == T_Sort)
+						scan_plan = ((Sort *) scan_plan)->plan.lefttree;
+				}
 
 				/* Child must be our ColcompressScan */
 				if (scan_plan->type != T_CustomScan)
@@ -1083,15 +1499,13 @@ PlanTreeMutator(Plan *node, void *context)
 				}
 
 				/*
-				 * Multi-key sorted output not supported: VecGroupAgg's
-				 * sorted-emission comparator handles only a single key.
-				 * For multi-column GROUP BY use hash strategy only.
+				 * Multi-key sorted strategy: VecGroupAgg uses a hash table
+				 * internally and does not need sorted input. The sort_output
+				 * flag is already false for multi-key (only single-key AGG_SORTED
+				 * emits sorted output). Any required output ordering is handled
+				 * by the outer Sort node left intact in the plan.
+				 * Therefore this case is safe to vectorize.
 				 */
-				if (aggNode->numCols > 1 && aggNode->aggstrategy == AGG_SORTED)
-				{
-					fallback_reason = "multi-key sorted GROUP BY not supported";
-					goto groupagg_fallback;
-				}
 
 				if (aggNode->numCols >= 1)
 				{
@@ -1324,18 +1738,81 @@ PlanTreeMutator(Plan *node, void *context)
 
 					if (num_targets >= VECGROUPAGG_MAX_TARGETS)
 					{
-						supported = false;
-						break;
+							fallback_reason = psprintf("too many aggregate targets (max %d)", VECGROUPAGG_MAX_TARGETS);
 					}
 
-					if (!ClassifyAggref(aggref, scan_plan,
-											&kind, &col_varattno, &col_typeoid,
-											&avg_input_as_float8))
 					{
-						fallback_reason = psprintf("aggregate target unsupported: %s",
-										   get_func_name(aggref->aggfnoid));
-						supported = false;
-						break;
+						bool        agg_has_case     = false;
+						AttrNumber  agg_filter_spos  = 0;
+						Const      *agg_filter_const = NULL;
+						Oid         agg_filter_toid  = InvalidOid;
+						VecExprNode	expr_nodes_tmp[VECGAGG_EXPR_MAX_NODES];
+						int			expr_num_tmp  = 0;
+						int			expr_root_tmp = -1;
+
+						if (!ClassifyAggref(aggref, scan_plan,
+												&kind, &col_varattno, &col_typeoid,
+												&avg_input_as_float8,
+												&agg_has_case,
+												&agg_filter_spos,
+												&agg_filter_const,
+												&agg_filter_toid,
+												expr_nodes_tmp,
+												&expr_num_tmp,
+												&expr_root_tmp))
+						{
+							fallback_reason = psprintf("aggregate target unsupported: %s",
+											   get_func_name(aggref->aggfnoid));
+							supported = false;
+							break;
+						}
+
+						targets[num_targets].has_case_filter   = agg_has_case;
+						targets[num_targets].filter_const_plan = NULL;
+
+						if (agg_has_case)
+						{
+							/* Map filter column scan-output pos to table varattno */
+							AttrNumber filter_table_attno =
+								ScanOutputPosToVarAttno(scan_plan, agg_filter_spos);
+							if (filter_table_attno == 0)
+							{
+								fallback_reason = "CASE WHEN filter column not in scan output";
+								supported = false;
+								break;
+							}
+							/* Map table varattno to 0-based slot index */
+							int filter_slot_idx = VarAttnoToSlotIdx(scan_plan, filter_table_attno);
+							if (filter_slot_idx < 0)
+							{
+								fallback_reason = "failed to map CASE WHEN filter column to slot";
+								supported = false;
+								break;
+							}
+							targets[num_targets].filter_col_attnum  = filter_slot_idx;
+							targets[num_targets].filter_col_type    =
+								KeyTypeOidToVecGaggType(agg_filter_toid);
+							targets[num_targets].filter_const_plan  = agg_filter_const;
+						}
+						else
+						{
+							targets[num_targets].filter_col_attnum = -1;
+							targets[num_targets].filter_col_type   = -1;
+						}
+
+						/* Copy expression tree for VECGAGG_SUM_EXPR targets */
+						if (kind == VECGAGG_SUM_EXPR && expr_num_tmp > 0)
+						{
+							memcpy(targets[num_targets].expr_nodes, expr_nodes_tmp,
+								   sizeof(VecExprNode) * expr_num_tmp);
+							targets[num_targets].expr_num_nodes = expr_num_tmp;
+							targets[num_targets].expr_root_idx  = expr_root_tmp;
+						}
+						else
+						{
+							targets[num_targets].expr_num_nodes = 0;
+							targets[num_targets].expr_root_idx  = -1;
+						}
 					}
 
 					/*
@@ -1351,8 +1828,8 @@ PlanTreeMutator(Plan *node, void *context)
 					 */
 					{
 						int col_slot_idx;
-						if (kind == VECGAGG_COUNT_STAR)
-							col_slot_idx = -1;
+						if (kind == VECGAGG_COUNT_STAR || kind == VECGAGG_SUM_EXPR)
+							col_slot_idx = -1;  /* no single column for these kinds */
 						else
 						{
 							col_slot_idx = VarAttnoToSlotIdx(scan_plan, col_varattno);
@@ -1367,7 +1844,12 @@ PlanTreeMutator(Plan *node, void *context)
 					}
 
 					targets[num_targets].agg_kind       = kind;
-					targets[num_targets].col_type       = TypeOidToVecGaggType(col_typeoid);
+					{
+						int ct = TypeOidToVecGaggType(col_typeoid);
+						if (ct < 0)
+							ct = KeyTypeOidToVecGaggType(col_typeoid);
+						targets[num_targets].col_type = ct;
+					}
 					targets[num_targets].result_attnum  = result_att;
 					targets[num_targets].avg_input_as_float8 = avg_input_as_float8;
 					{
@@ -2269,7 +2751,13 @@ QueryHasVectorizableAggregate(Query *parse)
  * The planner hook is invoked for the explained SELECT, not the outer
  * ExplainStmt utility wrapper, so inspecting only the current Query node is
  * insufficient for multi-statement commands such as `SET ...; EXPLAIN ...`.
-	* Parse the full command string and inspect the raw ExplainStmt options.
+ * Parse the full command string and inspect the raw ExplainStmt options.
+ *
+ * NOTE: debug_query_string may contain PL/pgSQL assignment syntax
+ * (e.g. "mymode := 'eager'") which is not valid SQL and would cause
+ * raw_parser() to throw a parse error.  We wrap the call in a PG_TRY
+ * block so that any parse error is silently swallowed — this function
+ * is a heuristic check only and returning false on parse failure is safe.
  */
 static bool
 QueryStringHasPlainExplain(const char *query)
@@ -2280,12 +2768,26 @@ QueryStringHasPlainExplain(const char *query)
 	if (query == NULL)
 		return false;
 
-	/* raw_parser is already used elsewhere in the extension for syntax checks */
+	/*
+	 * raw_parser() throws an error for non-SQL text (e.g. PL/pgSQL
+	 * assignment "var := expr" stored in debug_query_string).  Catch and
+	 * discard any such error: a false negative here is always safe.
+	 */
+	PG_TRY();
+	{
 #if PG_VERSION_NUM >= PG_VERSION_14
-	raw_parsetree_list = raw_parser(query, RAW_PARSE_DEFAULT);
+		raw_parsetree_list = raw_parser(query, RAW_PARSE_DEFAULT);
 #else
-	raw_parsetree_list = raw_parser(query);
+		raw_parsetree_list = raw_parser(query);
 #endif
+	}
+	PG_CATCH();
+	{
+		/* Not valid SQL — cannot be a plain EXPLAIN */
+		FlushErrorState();
+		return false;
+	}
+	PG_END_TRY();
 
 	foreach(lc, raw_parsetree_list)
 	{
