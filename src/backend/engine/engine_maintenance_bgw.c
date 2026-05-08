@@ -38,6 +38,7 @@
 #include "executor/spi.h"
 #include "access/xact.h"
 #include "lib/stringinfo.h"
+#include "utils/snapmgr.h"
 
 #include "engine/engine_maintenance_bgw.h"
 
