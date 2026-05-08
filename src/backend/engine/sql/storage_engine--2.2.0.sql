@@ -468,14 +468,16 @@ CREATE OR REPLACE VIEW engine.colcompress_stripes AS
         s.chunk_row_count,
         s.row_count,
         s.chunk_group_row_count,
-        s.first_row_number
+        s.first_row_number,
+        s.pruning_valid,
+        s.dirty_rows
     FROM engine.col_options co
     JOIN pg_class c ON c.oid = co.regclass::oid
     JOIN engine.stripe s ON s.storage_id = engine.colcompress_relation_storageid(co.regclass)
     ORDER BY s.storage_id, s.stripe_num;
 
 COMMENT ON VIEW engine.colcompress_stripes
-    IS 'stripe metadata for all colcompress tables';
+    IS 'stripe metadata for all colcompress tables (includes pruning_valid and dirty_rows for diagnostics)';
 
 GRANT SELECT ON engine.colcompress_stripes TO PUBLIC;
 
@@ -501,17 +503,22 @@ GRANT SELECT ON engine.rowcompress_options TO PUBLIC;
 --
 CREATE OR REPLACE VIEW engine.rowcompress_batches AS
     SELECT
-        storage_id,
-        batch_num,
-        file_offset,
-        data_length,
-        first_row_number,
-        row_count
-    FROM engine.row_batch
-    ORDER BY storage_id, batch_num;
+        c.relname               AS table_name,
+        rb.storage_id,
+        rb.batch_num,
+        rb.file_offset,
+        rb.data_length,
+        rb.first_row_number,
+        rb.row_count,
+        rb.deleted_count,
+        rb.pruning_valid
+    FROM engine.row_options ro
+    JOIN pg_class c ON c.oid = ro.regclass::oid
+    JOIN engine.row_batch rb ON rb.storage_id = engine.rowcompress_relation_storageid(ro.regclass)
+    ORDER BY rb.storage_id, rb.batch_num;
 
 COMMENT ON VIEW engine.rowcompress_batches
-    IS 'per-batch metadata for all rowcompress tables (mirrors engine.row_batch)';
+    IS 'per-batch metadata for all rowcompress tables (includes table_name, deleted_count and pruning_valid for diagnostics)';
 
 -- ============================================================
 -- engine.colcompress_merge — compact + globally sort a colcompress table
