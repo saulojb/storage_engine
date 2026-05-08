@@ -2,8 +2,6 @@
 
 ## 2.1.0
 
-**PostgreSQL compatibility:** 15–18 (PG15 added to CI matrix in this release)
-
 ---
 
 ### VecGroupAgg — major executor expansion
@@ -72,6 +70,11 @@ the VecGroupAgg executor.
 ---
 
 ### Incremental Merge — full implementation (Phases 1–3)
+
+> The lazy/eager maintenance model and incremental merge design are inspired by
+> [`pg_sorted_heap`](https://github.com/tembo-io/pg_sorted_heap), which pioneered
+> the concept of tracking dirty segments and merging only the invalidated portion
+> of a sorted storage structure within a PostgreSQL Table AM.
 
 #### Phase 1 — Lazy/Eager Maintenance catalog scaffold
 
