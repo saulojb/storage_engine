@@ -1,6 +1,6 @@
 # storage_engine
 
-> **v2.0 — Vectorized GROUP BY Aggregation** `storage_engine` now ships `StorageEngineVectorGroupAgg`, a batch-oriented vectorized aggregate executor that transparently replaces `HashAggregate`/`GroupAggregate` for `GROUP BY` queries over `colcompress` tables. Supports `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, and `AVG` across all integer, float, and numeric types. Parallel partial mode (`AGGSPLIT_INITIAL_SERIAL`) works on PG 15–19. Validated: **175/175 on PG 15, 174/174 on PG 16–19**.
+> **v2.2 — Storage Maintenance BGW + Incremental Merge + CREATE TABLE WITH(…)** `storage_engine` v2.2 adds a built-in maintenance Background Worker that automatically calls `engine.storage_maintenance_auto()` on a schedule, incremental merge procedures for both AMs (`colcompress_merge_incremental`, `rowcompress_merge_incremental`), a unified `engine.storage_health` view, and support for `CREATE TABLE … USING colcompress/rowcompress WITH (options)` syntax. Validated: **281/281 on PG 15, 280/280 on PG 16–19**.
 
 A PostgreSQL extension providing two high-performance Table Access Methods designed for analytical and HTAP workloads.
 
@@ -33,6 +33,7 @@ Both AMs coexist alongside standard heap tables in the same database. All catalo
   - [How It Works](#how-it-works-1)
   - [Parallel Scan](#parallel-scan-1)
   - [Per-Table Options](#per-table-options-1)
+- [Storage Maintenance](#storage-maintenance)
 - [Management Functions](#management-functions)
 - [Catalog Views](#catalog-views)
 - [Installation](#installation)
@@ -360,6 +361,10 @@ All parameters can be set per-session or globally in `postgresql.conf`.
 | **Debug** | | | |
 | `storage_engine.debug_vectorized_groupagg_fallback` | bool | `off` | Emit `DEBUG1` log message when the planner falls back from `VectorGroupAgg` to standard `HashAggregate` |
 | `storage_engine.planner_debug_level` | enum | `debug3` | Log level for columnar planner diagnostics: `debug5` … `log` |
+| **Maintenance BGW** | | | |
+| `storage_engine.maintenance_auto_enabled` | bool | `off` | Master switch for the storage maintenance Background Worker |
+| `storage_engine.maintenance_auto_naptime` | int | `300` | Seconds between BGW maintenance cycles (1 – 86400) |
+| `storage_engine.maintenance_auto_database` | string | `''` | Database the BGW connects to; empty string disables the BGW |
 
 ### Per-Table Options
 
@@ -387,6 +392,31 @@ SELECT engine.alter_colcompress_table_reset(
 -- Inspect current options
 SELECT * FROM engine.colcompress_options WHERE table_name = 'events';
 ```
+
+---
+
+### CREATE TABLE … WITH (options)
+
+Both AMs accept options directly in `CREATE TABLE … WITH (…)`:
+
+```sql
+CREATE TABLE events (
+    ts         timestamptz NOT NULL,
+    user_id    bigint,
+    event_type text,
+    value      float8
+) USING colcompress
+  WITH (compression = 'zstd', compression_level = 9, orderby = 'ts ASC');
+
+CREATE TABLE logs (
+    id         bigserial,
+    logged_at  timestamptz NOT NULL,
+    message    text
+) USING rowcompress
+  WITH (batch_size = 5000, compression = 'lz4');
+```
+
+All accepted option names are identical to `engine.alter_colcompress_table_set` / `engine.alter_rowcompress_table_set`.
 
 ---
 
@@ -444,17 +474,71 @@ SELECT * FROM engine.rowcompress_batches LIMIT 10;
 
 ---
 
+## Storage Maintenance
+
+### Incremental Merge
+
+Instead of rewriting an entire table, use the incremental merge procedures to process only dirty stripes/batches:
+
+```sql
+-- colcompress: rewrite at most 64 dirty stripes
+CALL engine.colcompress_merge_incremental('events', max_stripes => 64);
+
+-- rowcompress: rewrite at most 128 dirty batches
+CALL engine.rowcompress_merge_incremental('logs', max_batches => 128);
+```
+
+Both procedures acquire `ShareUpdateExclusiveLock` — reads and writes continue while maintenance runs.
+
+### Health View and Recommendation
+
+```sql
+-- All tables
+SELECT table_name, am_name, live_rows, dirty_units, recommended_action
+FROM engine.storage_health
+ORDER BY dirty_units DESC;
+
+-- Single table
+SELECT * FROM engine.storage_maintenance_recommendation('events'::regclass);
+```
+
+### Auto-Scheduler
+
+**Option A — `pg_cron`:**
+```sql
+SELECT cron.schedule('storage-maint', '*/5 * * * *',
+  $$CALL engine.storage_maintenance_auto(false, NULL, NULL, false)$$);
+```
+
+**Option B — Built-in Background Worker** (requires `storage_engine` in `shared_preload_libraries`):
+```
+# postgresql.conf
+shared_preload_libraries = 'storage_engine'
+storage_engine.maintenance_auto_enabled  = on
+storage_engine.maintenance_auto_database = 'mydb'
+storage_engine.maintenance_auto_naptime  = 300   # seconds
+```
+Reload with `SELECT pg_reload_conf()` after changing `maintenance_auto_*` GUCs — no restart required.
+
+---
+
 ## Management Functions
 
-| Function | Description |
+| Function / Procedure | Description |
 |---|---|
 | `engine.alter_colcompress_table_set(regclass, ...)` | Set one or more options on a colcompress table |
 | `engine.alter_colcompress_table_reset(regclass, ...)` | Reset colcompress options to system defaults |
 | `engine.colcompress_merge(regclass)` | Rewrite and globally sort a colcompress table by its `orderby` key |
-| `engine.colcompress_repack(regclass)` | Alias for `colcompress_merge`; drop-in replacement for `pg_repack` on colcompress tables |
+| `engine.colcompress_repack(regclass, min_fill_ratio)` | Online defragmentation; drops stripes below fill threshold; alias for `colcompress_merge` with compaction |
+| `CALL engine.colcompress_merge_incremental(regclass, max_stripes)` | Rewrite only dirty stripes (low-lock, incremental) |
+| `CALL engine.smart_update(regclass, set_clause, where_clause, max_stripes)` | Stripe-grouped bulk UPDATE; avoids 1-row mini-stripe fragmentation |
 | `engine.alter_rowcompress_table_set(regclass, ...)` | Set one or more options on a rowcompress table |
 | `engine.alter_rowcompress_table_reset(regclass, ...)` | Reset rowcompress options to system defaults |
 | `engine.rowcompress_repack(regclass)` | Rewrite all batches of a rowcompress table with current options |
+| `CALL engine.rowcompress_merge_incremental(regclass, max_batches)` | Rewrite only dirty batches (low-lock, incremental) |
+| `engine.storage_maintenance_recommendation(regclass)` | Returns health metrics and `recommended_action` for a single table |
+| `CALL engine.storage_maintenance_auto(dry_run, max_tables, am_filter, p_verbose)` | Dispatch merge/repack for all tables with pending maintenance |
+| `engine.rowcompress_scan_stats()` | Session-local scan statistics for rowcompress tables (batches read/skipped, bytes, cache hits) |
 
 ---
 
@@ -463,9 +547,10 @@ SELECT * FROM engine.rowcompress_batches LIMIT 10;
 | View | Description |
 |---|---|
 | `engine.colcompress_options` | Per-table options for all colcompress tables |
-| `engine.colcompress_stripes` | Stripe-level metadata (offset, size, row range) per table |
+| `engine.colcompress_stripes` | Stripe-level metadata (offset, size, row range, `dirty_rows`, `pruning_valid`) per table |
 | `engine.rowcompress_options` | Per-table options for all rowcompress tables |
-| `engine.rowcompress_batches` | Batch-level metadata for all rowcompress tables |
+| `engine.rowcompress_batches` | Batch-level metadata including `table_name`, `deleted_count`, and `pruning_valid` for all rowcompress tables |
+| `engine.storage_health` | Unified operational health across all colcompress and rowcompress tables; includes `live_rows`, `dirty_units`, `tombstone_rows`, `total_size`, and `recommended_action` |
 
 All views grant `SELECT` to `PUBLIC`.
 
@@ -734,7 +819,7 @@ python3 tests/bench/chart_parallel.py
 
 See [tests/README.md](tests/README.md) for full environment description and step-by-step instructions.
 
-> Benchmark results above correspond to version 1.0.6 with `lz4` compression and globally sorted stripes.
+> Benchmark results above correspond to version 2.2.0 with `lz4` compression and globally sorted stripes.
 
 ---
 
