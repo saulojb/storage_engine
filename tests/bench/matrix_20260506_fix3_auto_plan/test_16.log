@@ -1,0 +1,233 @@
+
+==============================================================
+  storage_engine test suite — PG@5434
+==============================================================
+
+[setup] creating test database 'storage_engine_test'…
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Extension Lifecycle[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] extension version = 1.3.4
+  [[32mPASS[0m] schema engine exists
+  [[32mPASS[0m] catalog table engine.col_options exists
+  [[32mPASS[0m] catalog table engine.stripe exists
+  [[32mPASS[0m] catalog table engine.chunk_group exists
+  [[32mPASS[0m] catalog table engine.chunk exists
+  [[32mPASS[0m] access method colcompress registered
+  [[32mPASS[0m] access method rowcompress registered
+  [[32mPASS[0m] aggregate engine.vcount(count) registered
+  [[32mPASS[0m] aggregate engine.vmin(integer) registered
+  [[32mPASS[0m] aggregate engine.vmax(smallint) registered
+  [[32mPASS[0m] aggregate engine.vsum(bigint) registered
+  [[32mPASS[0m] aggregate engine.vavg(bigint) registered
+  [[32mPASS[0m] aggregate engine.vmin(date) registered
+  [[32mPASS[0m] aggregate engine.vsum(double precision) registered
+  [[32mPASS[0m] aggregate engine.vavg(double precision) registered
+  [[32mPASS[0m] aggregate engine.vmin(numeric) registered
+  [[32mPASS[0m] aggregate engine.vavg(numeric) registered
+  [[32mPASS[0m] aggregate engine.vsum(money) registered
+  [[32mPASS[0m] aggregate engine.vmin(money) registered
+  [[32mPASS[0m] aggregate engine.vmax(money) registered
+  [[32mPASS[0m] no engine.vavg(money) — PostgreSQL has no avg(money)
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: colcompress DML[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] CREATE TABLE + INSERT colcompress
+  [[32mPASS[0m] row count after INSERT = 50000
+  [[32mPASS[0m] SELECT with WHERE filter
+  [[32mPASS[0m] UPDATE single row
+  [[32mPASS[0m] UPDATE value persisted
+  [[32mPASS[0m] DELETE 10 rows
+  [[32mPASS[0m] count after DELETE = 49990
+  [[32mPASS[0m] TRUNCATE
+  [[32mPASS[0m] count after TRUNCATE = 0
+  [[32mPASS[0m] re-INSERT after TRUNCATE
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: rowcompress DML[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] CREATE TABLE + INSERT rowcompress
+  [[32mPASS[0m] row count = 10000
+  [[32mPASS[0m] SELECT with WHERE filter (val > N → N/2 rows)
+  [[32mPASS[0m] UPDATE rowcompress
+  [[32mPASS[0m] DELETE rowcompress
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Compression Options[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] colcompress: alter_colcompress_table_set compression='zstd'
+  [[32mPASS[0m]   row count with zstd = 2000
+  [[32mPASS[0m]   engine.col_options.compression = 'zstd'
+  [[32mPASS[0m] colcompress: alter_colcompress_table_set compression='lz4'
+  [[32mPASS[0m]   row count with lz4 = 2000
+  [[32mPASS[0m]   engine.col_options.compression = 'lz4'
+  [[32mPASS[0m] colcompress: alter_colcompress_table_set compression='pglz'
+  [[32mPASS[0m]   row count with pglz = 2000
+  [[32mPASS[0m]   engine.col_options.compression = 'pglz'
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Sort Key (orderby) Option[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] alter_colcompress_table_set orderby='ts'
+  [[32mPASS[0m] engine.col_options.orderby = 'ts'
+  [[32mPASS[0m] all rows readable after sorted INSERT
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Vectorized Aggregates — smallint / integer / bigint[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] count(*)   [smallint]
+  [[32mPASS[0m] count(col) [smallint]
+  [[32mPASS[0m] min(smallint)
+  [[32mPASS[0m] max(smallint)
+  [[32mPASS[0m] sum(smallint)
+  [[32mPASS[0m] avg(smallint)
+  [[32mPASS[0m] count(*)   [integer]
+  [[32mPASS[0m] count(col) [integer]
+  [[32mPASS[0m] min(integer)
+  [[32mPASS[0m] max(integer)
+  [[32mPASS[0m] sum(integer)
+  [[32mPASS[0m] avg(integer)
+  [[32mPASS[0m] count(*)   [bigint]
+  [[32mPASS[0m] count(col) [bigint]
+  [[32mPASS[0m] min(bigint)
+  [[32mPASS[0m] max(bigint)
+  [[32mPASS[0m] sum(bigint)
+  [[32mPASS[0m] avg(bigint)
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Vectorized Aggregates — float8 (double precision)[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] count(*)   [float8]
+  [[32mPASS[0m] count(col) [float8]
+  [[32mPASS[0m] min(float8)
+  [[32mPASS[0m] max(float8)
+  [[32mPASS[0m] sum(float8)
+  [[32mPASS[0m] avg(float8)
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Vectorized Aggregates — numeric[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] count(*)   [numeric]
+  [[32mPASS[0m] count(col) [numeric]
+  [[32mPASS[0m] min(numeric)
+  [[32mPASS[0m] max(numeric)
+  [[32mPASS[0m] sum(numeric)
+  [[32mPASS[0m] avg(numeric)
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Vectorized Aggregates — money[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] count(*)   [money]
+  [[32mPASS[0m] min(money)
+  [[32mPASS[0m] max(money)
+  [[32mPASS[0m] sum(money)
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Vectorized Aggregates — date[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] count(*)   [date]
+  [[32mPASS[0m] count(col) [date]
+  [[32mPASS[0m] min(date)
+  [[32mPASS[0m] max(date)
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Multi-column / Multi-type Aggregate Query[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] multi-type query: count/min/max for all columns
+  [[32mPASS[0m] multi-type query: sum/avg for numeric types
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: NULL Handling[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] empty table: count(*) = 0
+  [[32mPASS[0m] empty table: min(i2) VEC==OFF
+  [[32mPASS[0m] empty table: max(i2) VEC==OFF
+  [[32mPASS[0m] empty table: sum(i2) VEC==OFF
+  [[32mPASS[0m] empty table: min(i4) VEC==OFF
+  [[32mPASS[0m] empty table: max(i4) VEC==OFF
+  [[32mPASS[0m] empty table: sum(i4) VEC==OFF
+  [[32mPASS[0m] empty table: min(f8) VEC==OFF
+  [[32mPASS[0m] empty table: max(f8) VEC==OFF
+  [[32mPASS[0m] empty table: min(num) VEC==OFF
+  [[32mPASS[0m] empty table: max(num) VEC==OFF
+  [[32mPASS[0m] empty table: min(d) VEC==OFF
+  [[32mPASS[0m] empty table: max(d) VEC==OFF
+  [[32mPASS[0m] empty table: min(m) VEC==OFF
+  [[32mPASS[0m] empty table: max(m) VEC==OFF
+  [[32mPASS[0m] empty table: sum(i2) IS NULL (VEC default)
+  [[32mPASS[0m] empty table: sum(i4) IS NULL (VEC default)
+  [[32mPASS[0m] empty table: min(i4) IS NULL (VEC default)
+  [[32mPASS[0m] empty table: max(f8) IS NULL (VEC default)
+  [[32mPASS[0m] empty table: sum(m) IS NULL (VEC default)
+  [[32mPASS[0m] all-NULL cols: count(*) = 1000
+  [[32mPASS[0m] all-NULL col: count(f8) = 0
+  [[32mPASS[0m] all-NULL col: min(f8) VEC==OFF
+  [[32mPASS[0m] all-NULL col: max(num) VEC==OFF
+  [[32mPASS[0m] all-NULL col: sum(money) VEC==OFF
+  [[32mPASS[0m] all-NULL col: min(f8) IS NULL
+  [[32mPASS[0m] all-NULL col: max(num) IS NULL
+  [[32mPASS[0m] mixed NULLs: count(*)
+  [[32mPASS[0m] mixed NULLs: count(val)
+  [[32mPASS[0m] mixed NULLs: min(integer)
+  [[32mPASS[0m] mixed NULLs: max(integer)
+  [[32mPASS[0m] mixed NULLs: sum(integer)
+  [[32mPASS[0m] mixed NULLs: avg(integer)
+  [[32mPASS[0m] mixed NULLs: sum(float8)
+  [[32mPASS[0m] mixed NULLs: avg(float8)
+  [[32mPASS[0m] single row: min/max/sum/count
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: EXPLAIN Plan Verification[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] VEC ON: EXPLAIN shows StorageEngineVectorAgg
+  [[32mPASS[0m] VEC ON: EXPLAIN shows 'Engine Vectorized Aggregate: enabled'
+  [[32mPASS[0m] VEC OFF: EXPLAIN has no StorageEngineVectorAgg
+  [[32mPASS[0m] EXPLAIN ANALYZE: no error (VEC ON)
+  [[32mPASS[0m] EXPLAIN ANALYZE: shows StorageEngineVectorAgg
+  [[32mPASS[0m] EXPLAIN SELECT (filter): no crash, returns plan
+  [[32mPASS[0m] mixed numeric+money: EXPLAIN falls back to regular Agg
+  [[32mPASS[0m] mixed numeric+money: VEC ON falls back without changing result
+  [[32mPASS[0m] mixed numeric+money: VEC ON query runs without crash
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Parallel Safety (AGGSPLIT_SIMPLE guard)[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] parallel=4: result equals serial
+  [[32mPASS[0m] parallel=4: no crash / error
+  [[32mPASS[0m] parallel=4 float8+numeric+money: result equals serial
+  [[32mPASS[0m] parallel grouped count/sum/min/max: EXPLAIN shows StorageEngineVectorGroupAgg
+  [[32mPASS[0m] parallel grouped count/sum/min/max: EXPLAIN is parallel
+  [[32mPASS[0m] parallel grouped avg: EXPLAIN falls back (no StorageEngineVectorGroupAgg)
+  [[32mPASS[0m] parallel perf sanity: vectorized EXPLAIN ANALYZE executes
+  [[32mPASS[0m] parallel perf sanity: native EXPLAIN ANALYZE executes
+  [[32mPASS[0m] parallel perf sanity: execution times parsed
+  [[32mPASS[0m] parallel perf sanity: vectorized <= 5x native
+
+[1;36m──────────────────────────────────────────────────────────────[0m
+[1;36m  PG@5434: Upgrade Path Chain[0m
+[1;36m──────────────────────────────────────────────────────────────[0m
+  [[32mPASS[0m] latest available version = 1.3.4
+  [[32mPASS[0m] upgrade path 1.0 → 1.3.4 exists
+  [[32mPASS[0m] upgrade step 1.0 → 1.1
+  [[32mPASS[0m] upgrade step 1.1 → 1.2.0
+  [[32mPASS[0m] upgrade step 1.2.0 → 1.2.1
+  [[32mPASS[0m] upgrade step 1.2.1 → 1.2.2
+  [[32mPASS[0m] upgrade step 1.2.2 → 1.2.3
+  [[32mPASS[0m] upgrade step 1.2.3 → 1.2.4
+  [[32mPASS[0m] upgrade step 1.2.4 → 1.2.5
+  [[32mPASS[0m] upgrade step 1.2.5 → 1.2.6
+  [[32mPASS[0m] upgrade step 1.2.6 → 1.2.7
+  [[32mPASS[0m] upgrade step 1.2.7 → 1.2.8
+  [[32mPASS[0m] upgrade step 1.2.8 → 1.2.9
+  [[32mPASS[0m] upgrade step 1.2.9 → 1.3.0
+  [[32mPASS[0m] upgrade step 1.3.0 → 1.3.1
+  [[32mPASS[0m] upgrade step 1.3.1 → 1.3.2
+  [[32mPASS[0m] upgrade step 1.3.2 → 1.3.3
+  [[32mPASS[0m] upgrade step 1.3.3 → 1.3.4
+
+==============================================================
+  PG@5434: [32mALL 162 TESTS PASSED[0m
+==============================================================
+

@@ -1,0 +1,15 @@
+=== PG15 (port 5436) ===
+PG15: PASS       PG@5436: [32mALL 163 TESTS PASSED[0m
+
+=== PG16 (port 5434) ===
+PG16: PASS       PG@5434: [32mALL 162 TESTS PASSED[0m
+
+=== PG17 (port 5435) ===
+PG17: PASS       PG@5435: [32mALL 162 TESTS PASSED[0m
+
+=== PG18 (port 5432) ===
+PG18: PASS       PG@5432: [32mALL 162 TESTS PASSED[0m
+
+=== PG19 (port 5433) ===
+PG19: PASS       PG@5433: [32mALL 162 TESTS PASSED[0m
+

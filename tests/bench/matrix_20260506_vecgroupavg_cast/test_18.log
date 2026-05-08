@@ -1,0 +1,12 @@
+
+==============================================================
+  storage_engine test suite — PG@5432
+==============================================================
+
+[setup] creating test database 'storage_engine_test'…
+[31mFATAL: CREATE EXTENSION failed — ERROR:  could not load library "/usr/lib/postgresql/18/lib/storage_engine.so": /usr/lib/postgresql/18/lib/storage_engine.so: não é possível abrir arquivo compartilhado: Muitos arquivos abertos
+CONTEXTO:  SQL statement "CREATE OR REPLACE FUNCTION engine.colcompress_handler(internal)
+    RETURNS table_am_handler
+    LANGUAGE C
+AS '$libdir/storage_engine', 'colcompress_handler'"
+extension script file "storage_engine--1.3.4.sql", near line 161[0m

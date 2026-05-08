@@ -102,5 +102,7 @@ extern int64 rowcompress_get_batches_pruned(TableScanDesc sscan);
 extern Datum alter_rowcompress_table_set(PG_FUNCTION_ARGS);
 extern Datum alter_rowcompress_table_reset(PG_FUNCTION_ARGS);
 extern Datum rowcompress_repack(PG_FUNCTION_ARGS);
+extern Datum rowcompress_scan_stats(PG_FUNCTION_ARGS);
+extern Datum rowcompress_reset_scan_stats(PG_FUNCTION_ARGS);
 
 #endif /* ROWCOMPRESS_H */

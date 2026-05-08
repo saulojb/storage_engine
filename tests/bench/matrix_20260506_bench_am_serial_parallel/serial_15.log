@@ -1,0 +1,8 @@
+============================================================
+ Benchmark — PostgreSQL 15  •  1 000 000 rows
+ Runs per query: 3   JIT: off   Parallelism: off
+============================================================
+
+── heap  (db: bench_am  table: events_heap) ─────────────────────────
+benchmark query failed for bench_am.events_heap
+psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5436" failed: FATAL:  role "saulo" does not exist

@@ -73,6 +73,8 @@
 #include "catalog/objectaccess.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "funcapi.h"
+#include "utils/tuplestore.h"
 
 #if PG_VERSION_NUM >= PG_VERSION_16
 #include "storage/relfilelocator.h"
@@ -177,6 +179,7 @@ typedef struct RowCompressScanDesc
 	/* Batch-level pruning: set by rowcompress_set_pushdown_clauses() */
 	RCPruningCtx  *pruningCtx;     /* NULL = pruning disabled for this scan */
 	int64          batchesPruned;  /* number of batches skipped via pruning */
+	int            batchesTotal;   /* total batches in batchList at scan start */
 
 #if PG_VERSION_NUM < PG_VERSION_18
 	struct TBMIterateResult *tbmres;
@@ -297,6 +300,24 @@ static MemoryContext  RCWriteStateContext = NULL;
 static object_access_hook_type PrevRCObjectAccessHook = NULL;
 static void RCObjectAccessHook(ObjectAccessType access, Oid classId,
 								Oid objectId, int subId, void *arg);
+
+/*
+ * Per-table scan statistics — accumulated in session memory,
+ * keyed by relation OID.  Reset on session end or via
+ * engine.rowcompress_reset_scan_stats().
+ */
+typedef struct RCScanStatsEntry
+{
+	Oid   relid;           /* hash key — must be first */
+	int64 totalScans;
+	int64 batchesTotal;    /* sum of list_length(batchList) across all scans */
+	int64 batchesPruned;   /* sum of batchesPruned across all scans */
+} RCScanStatsEntry;
+
+static HTAB         *RCScanStatsHash = NULL;
+static MemoryContext RCScanStatsCtx  = NULL;
+
+static void RCAccumulateScanStats(Oid relid, int batchesTotal, int64 batchesPruned);
 
 
 /* ================================================================
@@ -1871,6 +1892,7 @@ RCReadOptions(RelationGetRelid(relation), &scan->options);
 
 scan->batchList        = RCGetBatches(scan->storageId);
 scan->currentBatchCell = list_head(scan->batchList);
+scan->batchesTotal     = list_length(scan->batchList);
 
 scan->batchData         = NULL;
 scan->rowOffsets        = NULL;
@@ -1910,6 +1932,11 @@ static void
 rowcompress_endscan(TableScanDesc sscan)
 {
 RowCompressScanDesc *scan = (RowCompressScanDesc *) sscan;
+
+	/* Accumulate session-level scan stats before scanContext is destroyed */
+	RCAccumulateScanStats(RelationGetRelid(scan->rc_base.rs_rd),
+						  scan->batchesTotal, scan->batchesPruned);
+
 	if (scan->bitmapFetch)
 		rowcompress_index_fetch_end((IndexFetchTableData *) scan->bitmapFetch);
 
@@ -3806,6 +3833,158 @@ rowcompress_repack(PG_FUNCTION_ARGS)
 			(errmsg("rowcompress_repack: " UINT64_FORMAT " rows rewritten into %s%s",
 					rowsRepacked, qualname,
 					(options.orderby && options.orderby[0]) ? " (globally sorted)" : "")));
+
+	PG_RETURN_VOID();
+}
+
+/* ================================================================
+ * SESSION-LOCAL SCAN STATISTICS
+ * ================================================================ */
+
+/*
+ * RCAccumulateScanStats — update the session-local stats hash for one scan.
+ * Called from rowcompress_endscan before the scan context is freed.
+ */
+static void
+RCAccumulateScanStats(Oid relid, int batchesTotal, int64 batchesPruned)
+{
+	bool found;
+
+	/* Lazy-init the hash and its memory context */
+	if (RCScanStatsHash == NULL)
+	{
+		HASHCTL hctl;
+
+		RCScanStatsCtx = AllocSetContextCreate(TopMemoryContext,
+											   "RowCompress ScanStats",
+											   ALLOCSET_SMALL_SIZES);
+		memset(&hctl, 0, sizeof(hctl));
+		hctl.keysize   = sizeof(Oid);
+		hctl.entrysize = sizeof(RCScanStatsEntry);
+		hctl.hcxt      = RCScanStatsCtx;
+		RCScanStatsHash = hash_create("RowCompress scan stats",
+									  64, &hctl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	RCScanStatsEntry *entry =
+		(RCScanStatsEntry *) hash_search(RCScanStatsHash, &relid, HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->totalScans    = 0;
+		entry->batchesTotal  = 0;
+		entry->batchesPruned = 0;
+	}
+	entry->totalScans    += 1;
+	entry->batchesTotal  += batchesTotal;
+	entry->batchesPruned += batchesPruned;
+}
+
+/*
+ * rowcompress_scan_stats — SRF returning session-local scan statistics.
+ *
+ * Columns: table_name text, total_scans bigint, batches_total bigint,
+ *          batches_scanned bigint, batches_pruned bigint, pruning_ratio float4
+ *
+ * Usage: SELECT * FROM engine.rowcompress_scan_stats();
+ */
+PG_FUNCTION_INFO_V1(rowcompress_scan_stats);
+Datum
+rowcompress_scan_stats(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	if (!rsinfo || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	rsinfo->returnMode = SFRM_Materialize;
+
+	MemoryContext oldctx =
+		MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+
+	TupleDesc tupdesc;
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR, (errmsg("rowcompress_scan_stats: unexpected return type")));
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	Tuplestorestate *tupstore =
+		tuplestore_begin_heap(false, false, work_mem);
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc   = tupdesc;
+
+	if (RCScanStatsHash != NULL)
+	{
+		HASH_SEQ_STATUS   seq;
+		RCScanStatsEntry *entry;
+
+		hash_seq_init(&seq, RCScanStatsHash);
+		while ((entry = (RCScanStatsEntry *) hash_seq_search(&seq)) != NULL)
+		{
+			char *relname = get_rel_name(entry->relid);
+			if (relname == NULL)
+				continue;  /* table was dropped — skip stale entry */
+
+			int64  batchesScanned = entry->batchesTotal - entry->batchesPruned;
+			float4 pruningRatio   = (entry->batchesTotal > 0)
+				? (float4) entry->batchesPruned / (float4) entry->batchesTotal
+				: 0.0f;
+
+			Datum  values[6];
+			bool   nulls[6] = {false, false, false, false, false, false};
+
+			values[0] = CStringGetTextDatum(relname);
+			values[1] = Int64GetDatum(entry->totalScans);
+			values[2] = Int64GetDatum(entry->batchesTotal);
+			values[3] = Int64GetDatum(batchesScanned);
+			values[4] = Int64GetDatum(entry->batchesPruned);
+			values[5] = Float4GetDatum(pruningRatio);
+
+			HeapTuple tup = heap_form_tuple(tupdesc, values, nulls);
+			tuplestore_puttuple(tupstore, tup);
+		}
+	}
+
+	MemoryContextSwitchTo(oldctx);
+
+	return (Datum) 0;
+}
+
+/*
+ * rowcompress_reset_scan_stats — reset session-local scan statistics.
+ *
+ * With table_name = NULL (default): clears stats for all tables.
+ * With table_name specified: clears stats for that table only.
+ *
+ * Usage:
+ *   SELECT engine.rowcompress_reset_scan_stats();
+ *   SELECT engine.rowcompress_reset_scan_stats('my_table'::regclass);
+ */
+PG_FUNCTION_INFO_V1(rowcompress_reset_scan_stats);
+Datum
+rowcompress_reset_scan_stats(PG_FUNCTION_ARGS)
+{
+	if (RCScanStatsHash == NULL)
+		PG_RETURN_VOID();
+
+	if (PG_ARGISNULL(0))
+	{
+		/* Reset all entries */
+		hash_destroy(RCScanStatsHash);
+		RCScanStatsHash = NULL;
+		if (RCScanStatsCtx != NULL)
+		{
+			MemoryContextDelete(RCScanStatsCtx);
+			RCScanStatsCtx = NULL;
+		}
+	}
+	else
+	{
+		/* Reset one table */
+		Oid relid = PG_GETARG_OID(0);
+		hash_search(RCScanStatsHash, &relid, HASH_REMOVE, NULL);
+	}
 
 	PG_RETURN_VOID();
 }

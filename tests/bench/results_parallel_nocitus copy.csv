@@ -1,0 +1,31 @@
+AM,query,median_ms
+heap,"Q1 count(*)",20.723
+heap,"Q2 SUM/AVG numeric+double",51.199
+heap,"Q3 GROUP BY country (10)",62.331
+heap,"Q4 GROUP BY event_type+p95",444.745
+heap,"Q5 date range 1 month",19.460
+heap,"Q6 JSONB @> GIN",88.860
+heap,"Q7 JSONB key + GROUP BY",378.292
+heap,"Q8 array @> GIN",61.144
+heap,"Q9 LIKE text scan",45.557
+heap,"Q10 heavy multi-agg",1859.827
+colcompress,"Q1 count(*)",21.245
+colcompress,"Q2 SUM/AVG numeric+double",143.981
+colcompress,"Q3 GROUP BY country (10)",154.945
+colcompress,"Q4 GROUP BY event_type+p95",459.492
+colcompress,"Q5 date range 1 month",39.525
+colcompress,"Q6 JSONB @> GIN",198.173
+colcompress,"Q7 JSONB key + GROUP BY",316.957
+colcompress,"Q8 array @> GIN",146.534
+colcompress,"Q9 LIKE text scan",120.920
+colcompress,"Q10 heavy multi-agg",1929.479
+rowcompress,"Q1 count(*)",331.194
+rowcompress,"Q2 SUM/AVG numeric+double",376.013
+rowcompress,"Q3 GROUP BY country (10)",400.837
+rowcompress,"Q4 GROUP BY event_type+p95",700.276
+rowcompress,"Q5 date range 1 month",67.437
+rowcompress,"Q6 JSONB @> GIN",343.233
+rowcompress,"Q7 JSONB key + GROUP BY",734.882
+rowcompress,"Q8 array @> GIN",278.096
+rowcompress,"Q9 LIKE text scan",344.772
+rowcompress,"Q10 heavy multi-agg",2028.562

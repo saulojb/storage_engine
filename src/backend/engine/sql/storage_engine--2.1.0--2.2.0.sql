@@ -71,3 +71,32 @@ CREATE OR REPLACE VIEW engine.rowcompress_options AS
 
 COMMENT ON VIEW engine.rowcompress_options
     IS 'per-table options for rowcompress tables (mirrors engine.row_options)';
+
+-- 5. Session-local scan statistics --------------------------------------------
+
+CREATE OR REPLACE FUNCTION engine.rowcompress_scan_stats(
+    OUT table_name      text,
+    OUT total_scans     bigint,
+    OUT batches_total   bigint,
+    OUT batches_scanned bigint,
+    OUT batches_pruned  bigint,
+    OUT pruning_ratio   float4)
+RETURNS SETOF record
+LANGUAGE C
+AS 'MODULE_PATHNAME', 'rowcompress_scan_stats';
+
+COMMENT ON FUNCTION engine.rowcompress_scan_stats()
+IS 'Session-local scan statistics for rowcompress tables: total scans, batches examined, batches pruned by min/max, and pruning effectiveness ratio. Accumulated since session start (or last reset). Reset on session end.';
+
+GRANT EXECUTE ON FUNCTION engine.rowcompress_scan_stats() TO PUBLIC;
+
+CREATE OR REPLACE FUNCTION engine.rowcompress_reset_scan_stats(
+    table_name regclass DEFAULT NULL)
+RETURNS void
+LANGUAGE C
+AS 'MODULE_PATHNAME', 'rowcompress_reset_scan_stats';
+
+COMMENT ON FUNCTION engine.rowcompress_reset_scan_stats(regclass)
+IS 'Reset session-local scan statistics for all rowcompress tables (NULL) or a specific table.';
+
+GRANT EXECUTE ON FUNCTION engine.rowcompress_reset_scan_stats(regclass) TO PUBLIC;

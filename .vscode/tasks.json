@@ -1,0 +1,25 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "task-probe-write-file",
+			"type": "shell",
+			"command": "sh",
+			"args": [
+				"-lc",
+				"date > /tmp/task_probe.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pg15-19-build-test-matrix",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set +e\noutdir=\"tests/bench/matrix_20260506\"\nmkdir -p \"$outdir\"\nsummary=\"$outdir/build_test_summary.txt\"\n: > \"$summary\"\ndeclare -A ports=( [15]=5436 [16]=5434 [17]=5435 [18]=5432 [19]=5433 )\nfor v in 15 16 17 18 19; do\n  port=\"${ports[$v]}\"\n  pgc=\"/usr/lib/postgresql/$v/bin/pg_config\"\n  build_log=\"$outdir/build_${v}.log\"\n  test_log=\"$outdir/test_${v}.log\"\n  echo \"=== PG$v (port $port) ===\" | tee -a \"$summary\"\n  if [[ ! -x \"$pgc\" ]]; then\n    echo \"PG$v: SKIP (pg_config not found: $pgc)\" | tee -a \"$summary\"\n    echo | tee -a \"$summary\"\n    continue\n  fi\n  sudo -u postgres psql -p \"$port\" -d postgres -Atqc \"SELECT version();\" >\"$outdir/conn_${v}.log\" 2>&1\n  conn_rc=$?\n  if [[ $conn_rc -ne 0 ]]; then\n    echo \"PG$v: FAIL connection (see $outdir/conn_${v}.log)\" | tee -a \"$summary\"\n    echo | tee -a \"$summary\"\n    continue\n  fi\n  make clean >\"$build_log\" 2>&1\n  make -j\"$(nproc)\" all PG_CONFIG=\"$pgc\" >>\"$build_log\" 2>&1\n  build_rc=$?\n  if [[ $build_rc -ne 0 ]]; then\n    echo \"PG$v: FAIL build (see $build_log)\" | tee -a \"$summary\"\n    echo | tee -a \"$summary\"\n    continue\n  fi\n  sudo make install PG_CONFIG=\"$pgc\" >>\"$build_log\" 2>&1\n  install_rc=$?\n  if [[ $install_rc -ne 0 ]]; then\n    echo \"PG$v: FAIL install (see $build_log)\" | tee -a \"$summary\"\n    echo | tee -a \"$summary\"\n    continue\n  fi\n  python3 tests/test_suite.py --port \"$port\" >\"$test_log\" 2>&1\n  test_rc=$?\n  if [[ $test_rc -eq 0 ]]; then\n    pass_line=$(grep -E \"ALL [0-9]+ TESTS PASSED\" \"$test_log\" | tail -1)\n    echo \"PG$v: PASS ${pass_line}\" | tee -a \"$summary\"\n  else\n    fail_line=$(grep -E \"[0-9]+ FAILED\" \"$test_log\" | tail -1)\n    [[ -z \"$fail_line\" ]] && fail_line=\"test suite exited rc=$test_rc\"\n    echo \"PG$v: FAIL ${fail_line}\" | tee -a \"$summary\"\n  fi\n  echo | tee -a \"$summary\"\ndone\ncat \"$summary\""
+			],
+			"group": "test"
+		}
+	]
+}

@@ -1,0 +1,34 @@
+AM,query,median_ms
+heap,"Q1 count(*)",39.346
+heap,"Q2 SUM/AVG numeric+double",182.771
+heap,"Q3 GROUP BY country (10)",225.961
+heap,"Q4 GROUP BY event_type+p95",455.152
+heap,"Q5 date range 1 month",21.188
+heap,"Q6 JSONB @> GIN",117.786
+heap,"Q7 JSONB key + GROUP BY",361.851
+heap,"Q8 array @> GIN",64.470
+heap,"Q9 LIKE text scan",149.264
+heap,"Q10 heavy multi-agg",1879.423
+colcompress,"Q1 count(*)",5.058
+colcompress,"Q2 SUM/AVG numeric+double",126.623
+colcompress,"Q3 GROUP BY country (10)",154.970
+colcompress,"Q4 GROUP BY event_type+p95",447.776
+colcompress,"Q5 date range 1 month",23.380
+colcompress,"Q6 JSONB @> GIN",194.282
+colcompress,"Q7 JSONB key + GROUP BY",325.158
+colcompress,"Q8 array @> GIN",137.916
+colcompress,"Q9 LIKE text scan",117.131
+colcompress,"Q10 heavy multi-agg",1888.054
+rowcompress,"Q1 count(*)",328.985
+rowcompress,"Q2 SUM/AVG numeric+double",375.066
+rowcompress,"Q3 GROUP BY country (10)",400.715
+rowcompress,"Q4 GROUP BY event_type+p95",680.427
+rowcompress,"Q5 date range 1 month",69.108
+rowcompress,"Q6 JSONB @> GIN",332.672
+rowcompress,"Q7 JSONB key + GROUP BY",559.137
+rowcompress,"Q8 array @> GIN",278.328
+rowcompress,"Q9 LIKE text scan",342.273
+rowcompress,"Q10 heavy multi-agg",2036.774
+
+
+implementar suporte real a aggregate vetorizado paralelo, com split/combine;

@@ -1,0 +1,20 @@
+=== PG15 (port 5436) ===
+PG15 SERIAL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel_r1/results_serial_15.csv)
+PG15 PARALLEL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel_r1/results_parallel_15.csv)
+
+=== PG16 (port 5434) ===
+PG16 SERIAL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel_r1/results_serial_16.csv)
+PG16 PARALLEL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel_r1/results_parallel_16.csv)
+
+=== PG17 (port 5435) ===
+PG17 SERIAL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel_r1/results_serial_17.csv)
+PG17 PARALLEL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel_r1/results_parallel_17.csv)
+
+=== PG18 (port 5432) ===
+PG18 SERIAL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel_r1/results_serial_18.csv)
+PG18 PARALLEL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel_r1/results_parallel_18.csv)
+
+=== PG19 (port 5433) ===
+PG19 SERIAL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel_r1/results_serial_19.csv)
+PG19 PARALLEL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel_r1/results_parallel_19.csv)
+

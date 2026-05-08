@@ -1,0 +1,41 @@
+============================================================
+ Benchmark - PostgreSQL 19  •  1 000 000 rows
+ Runs per query: 3   JIT: off   Parallelism: off
+============================================================
+
+-- heap (table: events_heap) --
+Q1 count(*): 41.069 ms | samples=[43.538, 40.772, 41.069]
+Q2 SUM/AVG numeric+double: 129.190 ms | samples=[131.062, 129.19, 118.447]
+Q3 GROUP BY country (10): 159.795 ms | samples=[159.048, 162.873, 159.795]
+Q4 GROUP BY event_type+p95: 539.643 ms | samples=[539.643, 535.113, 543.749]
+Q5 date range 1 month: 20.132 ms | samples=[35.511, 19.168, 20.132]
+Q6 JSONB @> GIN: 124.298 ms | samples=[115.16, 124.298, 129.462]
+Q7 JSONB key + GROUP BY: 326.921 ms | samples=[326.921, 326.39, 330.157]
+Q8 array @> GIN: 83.909 ms | samples=[81.611, 83.909, 86.04]
+Q9 LIKE text scan: 119.894 ms | samples=[125.729, 119.894, 116.663]
+Q10 heavy multi-agg: 1967.034 ms | samples=[2000.378, 1956.415, 1967.034]
+
+-- colcompress (table: events_col) --
+Q1 count(*): 4.731 ms | samples=[5.051, 4.731, 4.61]
+Q2 SUM/AVG numeric+double: 92.362 ms | samples=[95.79, 89.644, 92.362]
+Q3 GROUP BY country (10): 148.544 ms | samples=[148.14, 150.407, 148.544]
+Q4 GROUP BY event_type+p95: 501.764 ms | samples=[501.72, 519.734, 501.764]
+Q5 date range 1 month: 21.478 ms | samples=[21.478, 21.464, 21.726]
+Q6 JSONB @> GIN: 187.264 ms | samples=[190.714, 184.193, 187.264]
+Q7 JSONB key + GROUP BY: 328.087 ms | samples=[333.051, 324.484, 328.087]
+Q8 array @> GIN: 138.952 ms | samples=[138.952, 145.68, 137.927]
+Q9 LIKE text scan: 118.451 ms | samples=[118.451, 116.874, 122.184]
+Q10 heavy multi-agg: 1906.890 ms | samples=[1906.89, 1900.97, 1915.6]
+
+-- rowcompress (table: events_row) --
+Q1 count(*): 328.740 ms | samples=[374.904, 322.254, 328.74]
+Q2 SUM/AVG numeric+double: 373.656 ms | samples=[370.975, 373.656, 377.245]
+Q3 GROUP BY country (10): 429.166 ms | samples=[433.654, 428.761, 429.166]
+Q4 GROUP BY event_type+p95: 720.424 ms | samples=[716.445, 720.424, 749.77]
+Q5 date range 1 month: 71.623 ms | samples=[71.609, 72.052, 71.623]
+Q6 JSONB @> GIN: 344.176 ms | samples=[344.176, 332.851, 352.996]
+Q7 JSONB key + GROUP BY: 555.556 ms | samples=[549.678, 555.556, 559.992]
+Q8 array @> GIN: 288.521 ms | samples=[300.939, 288.521, 283.711]
+Q9 LIKE text scan: 344.435 ms | samples=[344.435, 340.122, 349.924]
+Q10 heavy multi-agg: 2212.276 ms | samples=[2168.537, 2212.276, 2227.474]
+
