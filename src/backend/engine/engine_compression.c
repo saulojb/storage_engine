@@ -39,10 +39,315 @@
 #if PG_VERSION_NUM >= PG_VERSION_16
 #include "varatt.h"
 #endif
+
+/* -----------------------------------------------------------------------
+ * ClickHouse-style numeric transform codecs (Delta, DoubleDelta, Gorilla)
+ *
+ * These codecs apply a reversible numeric transform over the raw byte buffer
+ * (treated as an array of uint64 elements), then compress the result with
+ * LZ4 (preferred) or ZSTD (fallback) or DEFLATE (last resort).
+ *
+ * The codecs are most effective for 8-byte typed columns:
+ *   - Delta:       monotonically increasing integers, counters, unix timestamps
+ *   - DoubleDelta: regularly-sampled timestamps (near-constant intervals)
+ *   - Gorilla:     float8 sensor readings, price ticks, slowly-drifting metrics
+ *
+ * Data requirements:
+ *   - Input length must be a multiple of 8 bytes.
+ *   - If not, CompressBuffer returns false and the caller falls back to NONE.
+ *
+ * Wire format: [LZ4/ZSTD/DEFLATE compressed transform array]
+ *   The transform array has exactly the same byte length as the original data.
+ *   DecompressBuffer decompresses it and then applies the inverse transform
+ *   using the decompressedSize passed in from the chunk metadata.
+ * -----------------------------------------------------------------------*/
+
 /*
- *	The information at the start of the compressed data. This decription is taken
- *	from pg_lzcompress in pre-9.5 version of PostgreSQL.
+ * ch_compress_inner - compress a transform buffer using whatever is available.
+ * Priority: LZ4 > ZSTD > DEFLATE.  Returns false if nothing is available.
  */
+static bool
+ch_compress_inner(StringInfo transformedBuf, StringInfo outputBuffer,
+				  int compressionLevel)
+{
+#if HAVE_LIBLZ4
+	{
+		int maxOut = LZ4_compressBound(transformedBuf->len);
+		resetStringInfo(outputBuffer);
+		enlargeStringInfo(outputBuffer, maxOut);
+		int compressedSize = LZ4_compress_default(transformedBuf->data,
+												  outputBuffer->data,
+												  transformedBuf->len,
+												  maxOut);
+		if (compressedSize > 0)
+		{
+			outputBuffer->len = compressedSize;
+			return true;
+		}
+	}
+#endif
+#if HAVE_LIBZSTD
+	{
+		int maxOut = ZSTD_compressBound(transformedBuf->len);
+		resetStringInfo(outputBuffer);
+		enlargeStringInfo(outputBuffer, maxOut);
+		size_t compressedSize = ZSTD_compress(outputBuffer->data,
+											  outputBuffer->maxlen,
+											  transformedBuf->data,
+											  transformedBuf->len,
+											  compressionLevel > 0 ? compressionLevel : 3);
+		if (!ZSTD_isError(compressedSize))
+		{
+			outputBuffer->len = compressedSize;
+			return true;
+		}
+	}
+#endif
+#if HAVE_LIBDEFLATE
+	{
+		struct libdeflate_compressor *cmp =
+			libdeflate_alloc_compressor(compressionLevel > 0 ? compressionLevel : 6);
+		if (cmp)
+		{
+			size_t maxOut = libdeflate_deflate_compress_bound(cmp, transformedBuf->len);
+			resetStringInfo(outputBuffer);
+			enlargeStringInfo(outputBuffer, maxOut);
+			size_t compressedSize = libdeflate_deflate_compress(cmp,
+																transformedBuf->data,
+																transformedBuf->len,
+																outputBuffer->data,
+																maxOut);
+			libdeflate_free_compressor(cmp);
+			if (compressedSize > 0)
+			{
+				outputBuffer->len = compressedSize;
+				return true;
+			}
+		}
+	}
+#endif
+	return false;   /* no compression library available */
+}
+
+/*
+ * ch_decompress_inner - decompress to a buffer of exactly `decompressedSize`.
+ * Tries LZ4, then ZSTD, then DEFLATE in order.
+ */
+static StringInfo
+ch_decompress_inner(StringInfo buffer, uint64 decompressedSize)
+{
+	StringInfo out = makeStringInfo();
+	enlargeStringInfo(out, decompressedSize);
+
+#if HAVE_LIBLZ4
+	{
+		int r = LZ4_decompress_safe(buffer->data, out->data,
+									buffer->len, (int) decompressedSize);
+		if (r == (int) decompressedSize)
+		{
+			out->len = decompressedSize;
+			return out;
+		}
+	}
+#endif
+#if HAVE_LIBZSTD
+	{
+		size_t r = ZSTD_decompress(out->data, decompressedSize,
+								   buffer->data, buffer->len);
+		if (!ZSTD_isError(r) && r == decompressedSize)
+		{
+			out->len = decompressedSize;
+			return out;
+		}
+	}
+#endif
+#if HAVE_LIBDEFLATE
+	{
+		struct libdeflate_decompressor *dc = libdeflate_alloc_decompressor();
+		if (dc)
+		{
+			size_t actual = 0;
+			enum libdeflate_result r =
+				libdeflate_deflate_decompress(dc,
+											  buffer->data, buffer->len,
+											  out->data, decompressedSize,
+											  &actual);
+			libdeflate_free_decompressor(dc);
+			if (r == LIBDEFLATE_SUCCESS && actual == decompressedSize)
+			{
+				out->len = decompressedSize;
+				return out;
+			}
+		}
+	}
+#endif
+	pfree(out->data);
+	pfree(out);
+	ereport(ERROR,
+			(errmsg("ch codec: inner decompression failed — no matching library"),
+			 errdetail("compressed size=%d, expected decompressed=%lu",
+					   buffer->len, (unsigned long) decompressedSize)));
+}
+
+/* ---------- Delta -------------------------------------------------------- */
+
+/*
+ * ChDeltaCompress: store v[0] unchanged; for i>0 store v[i]-v[i-1] (uint64).
+ * Effective for monotonically increasing int8/timestamptz columns.
+ */
+static bool
+ChDeltaCompress(StringInfo inputBuffer, StringInfo outputBuffer, int compressionLevel)
+{
+	if (inputBuffer->len % 8 != 0 || inputBuffer->len == 0)
+		return false;
+
+	size_t		n = inputBuffer->len / 8;
+	uint64	   *in = (uint64 *) inputBuffer->data;
+	uint64	   *tmp = palloc(inputBuffer->len);
+
+	tmp[0] = in[0];
+	for (size_t i = 1; i < n; i++)
+		tmp[i] = in[i] - in[i - 1];
+
+	StringInfoData transformedBuf;
+	initStringInfo(&transformedBuf);
+	transformedBuf.data = (char *) tmp;
+	transformedBuf.len = inputBuffer->len;
+	transformedBuf.maxlen = inputBuffer->len;
+
+	bool ok = ch_compress_inner(&transformedBuf, outputBuffer, compressionLevel);
+	pfree(tmp);
+	return ok;
+}
+
+static StringInfo
+ChDeltaDecompress(StringInfo buffer, uint64 decompressedSize)
+{
+	if (decompressedSize % 8 != 0)
+		ereport(ERROR, (errmsg("Delta codec: decompressedSize=%lu is not a multiple of 8",
+							   (unsigned long) decompressedSize)));
+
+	StringInfo	out = ch_decompress_inner(buffer, decompressedSize);
+
+	/* Inverse: prefix sum over uint64 values */
+	uint64	   *data = (uint64 *) out->data;
+	size_t		n = decompressedSize / 8;
+
+	for (size_t i = 1; i < n; i++)
+		data[i] += data[i - 1];
+
+	return out;
+}
+
+/* ---------- DoubleDelta -------------------------------------------------- */
+
+/*
+ * ChDoubleDeltaCompress: second-order differences.
+ * dd[0] = v[0], dd[1] = v[1]-v[0], dd[i] = (v[i]-v[i-1])-(v[i-1]-v[i-2])
+ * Effective for timestamps with near-constant sampling intervals.
+ */
+static bool
+ChDoubleDeltaCompress(StringInfo inputBuffer, StringInfo outputBuffer,
+					  int compressionLevel)
+{
+	if (inputBuffer->len % 8 != 0 || inputBuffer->len < 8)
+		return false;
+
+	size_t		n = inputBuffer->len / 8;
+	uint64	   *in = (uint64 *) inputBuffer->data;
+	uint64	   *tmp = palloc(inputBuffer->len);
+
+	tmp[0] = in[0];
+	if (n > 1)
+		tmp[1] = in[1] - in[0];
+	for (size_t i = 2; i < n; i++)
+		tmp[i] = (in[i] - in[i - 1]) - (in[i - 1] - in[i - 2]);
+
+	StringInfoData transformedBuf;
+	initStringInfo(&transformedBuf);
+	transformedBuf.data = (char *) tmp;
+	transformedBuf.len = inputBuffer->len;
+	transformedBuf.maxlen = inputBuffer->len;
+
+	bool ok = ch_compress_inner(&transformedBuf, outputBuffer, compressionLevel);
+	pfree(tmp);
+	return ok;
+}
+
+static StringInfo
+ChDoubleDeltaDecompress(StringInfo buffer, uint64 decompressedSize)
+{
+	if (decompressedSize % 8 != 0)
+		ereport(ERROR, (errmsg("DoubleDelta codec: decompressedSize=%lu not multiple of 8",
+							   (unsigned long) decompressedSize)));
+
+	StringInfo	out = ch_decompress_inner(buffer, decompressedSize);
+
+	uint64	   *data = (uint64 *) out->data;
+	size_t		n = decompressedSize / 8;
+
+	/* Reconstruct: out[i] = 2*out[i-1] - out[i-2] + dd[i] */
+	if (n > 1)
+		data[1] = data[0] + data[1];
+	for (size_t i = 2; i < n; i++)
+		data[i] = 2 * data[i - 1] - data[i - 2] + data[i];
+
+	return out;
+}
+
+/* ---------- Gorilla ------------------------------------------------------- */
+
+/*
+ * ChGorillaCompress: XOR consecutive 8-byte values.
+ * xor[0] = v[0]; xor[i] = v[i] ^ v[i-1].
+ * XOR of similar float64 values has many leading zero bytes, which LZ4
+ * encodes very efficiently.  Best for slowly-drifting float8 columns.
+ */
+static bool
+ChGorillaCompress(StringInfo inputBuffer, StringInfo outputBuffer, int compressionLevel)
+{
+	if (inputBuffer->len % 8 != 0 || inputBuffer->len == 0)
+		return false;
+
+	size_t		n = inputBuffer->len / 8;
+	uint64	   *in = (uint64 *) inputBuffer->data;
+	uint64	   *tmp = palloc(inputBuffer->len);
+
+	tmp[0] = in[0];
+	for (size_t i = 1; i < n; i++)
+		tmp[i] = in[i] ^ in[i - 1];
+
+	StringInfoData transformedBuf;
+	initStringInfo(&transformedBuf);
+	transformedBuf.data = (char *) tmp;
+	transformedBuf.len = inputBuffer->len;
+	transformedBuf.maxlen = inputBuffer->len;
+
+	bool ok = ch_compress_inner(&transformedBuf, outputBuffer, compressionLevel);
+	pfree(tmp);
+	return ok;
+}
+
+static StringInfo
+ChGorillaDecompress(StringInfo buffer, uint64 decompressedSize)
+{
+	if (decompressedSize % 8 != 0)
+		ereport(ERROR, (errmsg("Gorilla codec: decompressedSize=%lu not multiple of 8",
+							   (unsigned long) decompressedSize)));
+
+	StringInfo	out = ch_decompress_inner(buffer, decompressedSize);
+
+	/* Inverse XOR: running accumulator */
+	uint64	   *data = (uint64 *) out->data;
+	size_t		n = decompressedSize / 8;
+
+	for (size_t i = 1; i < n; i++)
+		data[i] ^= data[i - 1];
+
+	return out;
+}
+
+/* ---------------------------------------------------------------------- */
 typedef struct ColumnarCompressHeader
 {
 	int32 vl_len_;              /* varlena header (do not touch directly!) */
@@ -225,6 +530,16 @@ CompressBuffer(StringInfo inputBuffer,
 			return compressionResult;
 		}
 
+		/* --- ClickHouse-style transform codecs (v2.3) --- */
+		case COMPRESSION_DELTA:
+			return ChDeltaCompress(inputBuffer, outputBuffer, compressionLevel);
+
+		case COMPRESSION_DOUBLEDELTA:
+			return ChDoubleDeltaCompress(inputBuffer, outputBuffer, compressionLevel);
+
+		case COMPRESSION_GORILLA:
+			return ChGorillaCompress(inputBuffer, outputBuffer, compressionLevel);
+
 		default:
 		{
 			return false;
@@ -401,6 +716,16 @@ DecompressBuffer(StringInfo buffer,
 
 			return decompressedBuffer;
 		}
+
+		/* --- ClickHouse-style transform codecs (v2.3) --- */
+		case COMPRESSION_DELTA:
+			return ChDeltaDecompress(buffer, decompressedSize);
+
+		case COMPRESSION_DOUBLEDELTA:
+			return ChDoubleDeltaDecompress(buffer, decompressedSize);
+
+		case COMPRESSION_GORILLA:
+			return ChGorillaDecompress(buffer, decompressedSize);
 
 		default:
 		{

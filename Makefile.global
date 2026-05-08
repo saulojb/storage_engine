@@ -61,3 +61,15 @@ ifneq (,$(wildcard /usr/local/include/zxc.h))
   override CPPFLAGS += -DHAVE_LIBZXC=1
   SHLIB_LINK += -lzxc
 endif
+
+# chDB — embedded ClickHouse engine (Arco 2: chcompress Table AM)
+# Install: curl -sL https://lib.chdb.io | bash
+#   installs /usr/local/lib/libchdb.so + /usr/local/include/chdb.h (~150 MB)
+# chcompress requires chDB at runtime.  We load it via dlopen() at runtime
+# (not at link time) to avoid symbol conflicts between libchdb's bundled
+# PostgreSQL internals and the running PostgreSQL binary.
+# The build only needs to know whether the header exists to enable the code path.
+ifneq (,$(wildcard /usr/local/include/chdb.h))
+  override CPPFLAGS += -DHAVE_LIBCHDB=1 -I/usr/local/include
+  SHLIB_LINK += -ldl
+endif

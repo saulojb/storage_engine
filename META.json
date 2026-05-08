@@ -2,7 +2,7 @@
    "name": "storage_engine",
    "abstract": "Columnar (colcompress) and row-compressed (rowcompress) Table AMs for PostgreSQL with vectorized GROUP BY aggregation, parallel scan, and zone-map pruning",
    "description": "storage_engine v2.0 introduces StorageEngineVectorGroupAgg — a vectorized GROUP BY aggregate executor that replaces HashAggregate/GroupAggregate with a batch-oriented HTAB pipeline for COUNT, SUM, MIN, MAX, and AVG over colcompress tables, including parallel partial mode on PG 15–19. The extension also provides colcompress (columnar, MergeTree-style sort key, stripe and chunk-level min/max pruning, parallel DSM scan) and rowcompress (batch-compressed rows, parallel work-stealing scan). Both AMs use zstd by default and coexist safely with heap tables. All catalog objects live in the engine schema; C symbols use the se_ prefix.",
-   "version": "2.2.0",
+   "version": "2.3.0",
    "release_status": "stable",
    "maintainer": [
       "Saulo José Benvenutti <saulojb@gmail.com>"
@@ -13,7 +13,7 @@
          "abstract": "colcompress and rowcompress Table AMs with vectorized GROUP BY aggregation (v2.0), parallel scan, and zone-map pruning",
          "file": "src/backend/engine/sql/storage_engine--1.0.sql",
          "docfile": "README.md",
-         "version": "2.2.0"
+         "version": "2.3.0"
       }
    },
    "prereqs": {

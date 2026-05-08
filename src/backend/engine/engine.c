@@ -73,6 +73,10 @@ static const struct config_enum_entry engine_compression_options[] =
 #if HAVE_LIBZXC
 	{ "zxc", COMPRESSION_ZXC, false },
 #endif
+	/* ClickHouse-style transform codecs (require LZ4/ZSTD/DEFLATE internally) */
+	{ "delta",       COMPRESSION_DELTA,       false },
+	{ "doubledelta", COMPRESSION_DOUBLEDELTA, false },
+	{ "gorilla",     COMPRESSION_GORILLA,     false },
 	{ NULL, 0, false }
 };
 
