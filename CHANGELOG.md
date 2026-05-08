@@ -72,7 +72,7 @@ the VecGroupAgg executor.
 ### Incremental Merge — full implementation (Phases 1–3)
 
 > The lazy/eager maintenance model and incremental merge design are inspired by
-> [`pg_sorted_heap`](https://github.com/tembo-io/pg_sorted_heap), which pioneered
+> [`pg_sorted_heap`](https://github.com/skuznetsov/pg_sorted_heap), which pioneered
 > the concept of tracking dirty segments and merging only the invalidated portion
 > of a sorted storage structure within a PostgreSQL Table AM.
 
