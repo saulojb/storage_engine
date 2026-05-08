@@ -94,6 +94,8 @@
 #include "engine/engine_tableam.h"
 #include "engine/engine_version_compat.h"
 #include "engine/rowcompress.h"
+#include "commands/defrem.h"
+#include "nodes/parsenodes.h"
 
 
 /* ================================================================
@@ -3470,6 +3472,130 @@ static const TableAmRoutine rowcompress_methods = {
 /* ================================================================
  * USER-FACING MANAGEMENT FUNCTIONS
  * ================================================================ */
+
+/*
+ * ApplyRowcompressWithOptions — apply WITH clause options from a CREATE TABLE
+ * statement to a newly created rowcompress table.
+ *
+ * Called from ColumnarProcessUtility after the standard utility has already
+ * created the table (with the options list stripped to avoid PostgreSQL's
+ * "unrecognized parameter" error for unknown reloption names).
+ *
+ * Accepted option names: batch_size, compression, compression_level,
+ *   pruning_column, index_scan, orderby.
+ */
+void
+ApplyRowcompressWithOptions(Oid relid, List *defElemOptions)
+{
+	if (defElemOptions == NIL)
+		return;
+
+	RowCompressOptions options = { 0 };
+	if (!RCReadOptions(relid, &options))
+		ereport(ERROR, (errmsg("unable to read current options for rowcompress table")));
+
+	Relation rel = table_open(relid, AccessShareLock);
+
+	ListCell *lc;
+	foreach(lc, defElemOptions)
+	{
+		DefElem *def = (DefElem *) lfirst(lc);
+		const char *name = def->defname;
+
+		if (strcmp(name, "batch_size") == 0)
+		{
+			options.batchSize = (int32) strtol(defGetString(def), NULL, 10);
+			if (options.batchSize < ROWCOMPRESS_BATCH_SIZE_MIN ||
+				options.batchSize > ROWCOMPRESS_BATCH_SIZE_MAX)
+				ereport(ERROR, (errmsg("batch_size out of range"),
+								errhint("batch_size must be between %d and %d",
+										ROWCOMPRESS_BATCH_SIZE_MIN,
+										ROWCOMPRESS_BATCH_SIZE_MAX)));
+		}
+		else if (strcmp(name, "compression") == 0)
+		{
+			options.compression = ParseCompressionType(defGetString(def));
+			if (options.compression == COMPRESSION_TYPE_INVALID)
+				ereport(ERROR, (errmsg("unknown compression type: \"%s\"",
+									   defGetString(def))));
+		}
+		else if (strcmp(name, "compression_level") == 0)
+		{
+			options.compressionLevel = (int) strtol(defGetString(def), NULL, 10);
+			if (options.compressionLevel < COMPRESSION_LEVEL_MIN ||
+				options.compressionLevel > COMPRESSION_LEVEL_MAX)
+				ereport(ERROR, (errmsg("compression_level out of range"),
+								errhint("compression_level must be between %d and %d",
+										COMPRESSION_LEVEL_MIN, COMPRESSION_LEVEL_MAX)));
+		}
+		else if (strcmp(name, "pruning_column") == 0)
+		{
+			char *colNameStr = defGetString(def);
+			if (colNameStr[0] == '\0')
+			{
+				options.pruningAttnum = 0;
+			}
+			else
+			{
+				TupleDesc td = RelationGetDescr(rel);
+				int16 attno = 0;
+				for (int i = 0; i < td->natts; i++)
+				{
+					Form_pg_attribute a = TupleDescAttr(td, i);
+					if (!a->attisdropped &&
+						strcmp(NameStr(a->attname), colNameStr) == 0)
+					{
+						attno = a->attnum;
+						break;
+					}
+				}
+				if (attno == 0)
+					ereport(ERROR,
+							(errmsg("column \"%s\" does not exist in table \"%s\"",
+									colNameStr, RelationGetRelationName(rel))));
+				Form_pg_attribute pattr = TupleDescAttr(td, attno - 1);
+				TypeCacheEntry *tc = lookup_type_cache(pattr->atttypid,
+													   TYPECACHE_CMP_PROC_FINFO);
+				if (!OidIsValid(tc->cmp_proc))
+					ereport(ERROR,
+							(errmsg("column \"%s\" has type %s which has no btree comparator",
+									colNameStr, format_type_be(pattr->atttypid))));
+				options.pruningAttnum = attno;
+			}
+		}
+		else if (strcmp(name, "index_scan") == 0)
+		{
+			options.indexScan = defGetBoolean(def);
+		}
+		else if (strcmp(name, "orderby") == 0)
+		{
+			char *obStr = defGetString(def);
+			options.orderby = (obStr[0] != '\0') ? obStr : NULL;
+			if (options.orderby != NULL)
+			{
+				StringInfoData chkbuf;
+				initStringInfo(&chkbuf);
+				appendStringInfo(&chkbuf, "SELECT 1 ORDER BY %s", options.orderby);
+#if PG_VERSION_NUM >= PG_VERSION_14
+				raw_parser(chkbuf.data, RAW_PARSE_DEFAULT);
+#else
+				raw_parser(chkbuf.data);
+#endif
+				pfree(chkbuf.data);
+			}
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("unrecognized rowcompress option: \"%s\"", name)));
+		}
+	}
+
+	table_close(rel, AccessShareLock);
+	RCSetOptions(relid, &options);
+}
+
 
 /*
  * alter_rowcompress_table_set — change options on a rowcompress table.

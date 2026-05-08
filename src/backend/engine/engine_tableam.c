@@ -76,7 +76,11 @@
 #include "engine/engine_storage.h"
 #include "engine/engine_tableam.h"
 #include "engine/engine_version_compat.h"
+#include "engine/rowcompress.h"
 #include "engine/utils/listutils.h"
+#include "commands/defrem.h"
+#include "nodes/parsenodes.h"
+#include "catalog/namespace.h"
 
 #include "engine/vectorization/engine_vector_types.h"
 #include "engine/engine_metadata.h"
@@ -3397,6 +3401,104 @@ ColumnarTableAMObjectAccessHook(ObjectAccessType access, Oid classId, Oid object
 
 
 /*
+ * ApplyColcompressWithOptions — apply WITH clause options from a CREATE TABLE
+ * statement to a newly created colcompress table.
+ *
+ * Called from ColumnarProcessUtility after the standard utility has created the
+ * table (with the options list stripped to avoid the "unrecognized parameter"
+ * error from PostgreSQL's reloption validation).
+ *
+ * Accepted option names: stripe_row_limit, chunk_group_row_limit, compression,
+ *   compression_level, orderby, index_scan.
+ */
+static void
+ApplyColcompressWithOptions(Oid relid, List *defElemOptions)
+{
+	if (defElemOptions == NIL)
+		return;
+
+	ColumnarOptions options = { 0 };
+	if (!ReadColumnarOptions(relid, &options))
+		ereport(ERROR, (errmsg("unable to read current options for colcompress table")));
+
+	ListCell *lc;
+	foreach(lc, defElemOptions)
+	{
+		DefElem *def = (DefElem *) lfirst(lc);
+		const char *name = def->defname;
+
+		if (strcmp(name, "stripe_row_limit") == 0)
+		{
+			options.stripeRowCount = (uint64) strtoul(defGetString(def), NULL, 10);
+			if (options.stripeRowCount < STRIPE_ROW_COUNT_MINIMUM ||
+				options.stripeRowCount > STRIPE_ROW_COUNT_MAXIMUM)
+				ereport(ERROR, (errmsg("stripe_row_limit out of range"),
+								errhint("stripe_row_limit must be between "
+										UINT64_FORMAT " and " UINT64_FORMAT,
+										(uint64) STRIPE_ROW_COUNT_MINIMUM,
+										(uint64) STRIPE_ROW_COUNT_MAXIMUM)));
+		}
+		else if (strcmp(name, "chunk_group_row_limit") == 0)
+		{
+			options.chunkRowCount = (uint32) strtoul(defGetString(def), NULL, 10);
+			if (options.chunkRowCount < CHUNK_ROW_COUNT_MINIMUM ||
+				options.chunkRowCount > CHUNK_ROW_COUNT_MAXIMUM)
+				ereport(ERROR, (errmsg("chunk_group_row_limit out of range"),
+								errhint("chunk_group_row_limit must be between "
+										UINT64_FORMAT " and " UINT64_FORMAT,
+										(uint64) CHUNK_ROW_COUNT_MINIMUM,
+										(uint64) CHUNK_ROW_COUNT_MAXIMUM)));
+		}
+		else if (strcmp(name, "compression") == 0)
+		{
+			options.compressionType = ParseCompressionType(defGetString(def));
+			if (options.compressionType == COMPRESSION_TYPE_INVALID)
+				ereport(ERROR, (errmsg("unknown compression type: \"%s\"",
+									   defGetString(def))));
+		}
+		else if (strcmp(name, "compression_level") == 0)
+		{
+			options.compressionLevel = (int) strtol(defGetString(def), NULL, 10);
+			if (options.compressionLevel < COMPRESSION_LEVEL_MIN ||
+				options.compressionLevel > COMPRESSION_LEVEL_MAX)
+				ereport(ERROR, (errmsg("compression_level out of range"),
+								errhint("compression_level must be between %d and %d",
+										COMPRESSION_LEVEL_MIN, COMPRESSION_LEVEL_MAX)));
+		}
+		else if (strcmp(name, "orderby") == 0)
+		{
+			char *obStr = defGetString(def);
+			options.orderby = (obStr[0] != '\0') ? obStr : NULL;
+			if (options.orderby != NULL)
+			{
+				StringInfoData chkbuf;
+				initStringInfo(&chkbuf);
+				appendStringInfo(&chkbuf, "SELECT 1 ORDER BY %s", options.orderby);
+#if PG_VERSION_NUM >= PG_VERSION_14
+				raw_parser(chkbuf.data, RAW_PARSE_DEFAULT);
+#else
+				raw_parser(chkbuf.data);
+#endif
+				pfree(chkbuf.data);
+			}
+		}
+		else if (strcmp(name, "index_scan") == 0)
+		{
+			options.indexScan = defGetBoolean(def);
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("unrecognized colcompress option: \"%s\"", name)));
+		}
+	}
+
+	SetColumnarOptions(relid, &options);
+}
+
+
+/*
  * Utility hook for columnar tables.
  */
 static void
@@ -3419,6 +3521,52 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 #endif
 
 	Node *parsetree = pstmt->utilityStmt;
+
+	elog(DEBUG1, "ColumnarProcessUtility: nodeTag=%d IsCreateStmt=%d",
+		 (int) nodeTag(parsetree), IsA(parsetree, CreateStmt));
+
+	/*
+	 * Intercept CREATE TABLE ... USING colcompress/rowcompress WITH (...).
+	 *
+	 * PostgreSQL rejects unknown reloption names before reaching any AM
+	 * callback, so we strip the WITH options list from the statement before
+	 * passing it to the standard utility, then apply them ourselves after the
+	 * table has been created.
+	 */
+	if (IsA(parsetree, CreateStmt))
+	{
+		CreateStmt *createStmt = (CreateStmt *) parsetree;
+		bool isColcompress = false;
+		bool isRowcompress = false;
+
+		if (createStmt->accessMethod != NULL)
+		{
+			isColcompress = (strcmp(createStmt->accessMethod, "colcompress") == 0);
+			isRowcompress = (strcmp(createStmt->accessMethod, "rowcompress") == 0);
+		}
+
+		if ((isColcompress || isRowcompress) && createStmt->options != NIL)
+		{
+			/* Save and strip the WITH options so PG won't reject unknown names */
+			List *savedOptions = createStmt->options;
+			createStmt->options = NIL;
+
+			/* Let the standard utility create the table */
+			PrevProcessUtilityHook_compat(pstmt, queryString, false, context,
+										  params, queryEnv, dest, completionTag);
+
+			/* Now look up the OID of the freshly created table */
+			Oid relid = RangeVarGetRelid(createStmt->relation, NoLock, false);
+
+			/* Apply the saved options */
+			if (isColcompress)
+				ApplyColcompressWithOptions(relid, savedOptions);
+			else
+				ApplyRowcompressWithOptions(relid, savedOptions);
+
+			return;
+		}
+	}
 
 	if (IsA(parsetree, IndexStmt))
 	{

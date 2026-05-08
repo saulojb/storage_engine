@@ -98,6 +98,9 @@ extern void rowcompress_set_pushdown_clauses(TableScanDesc sscan,
 											 TupleDesc tupdesc);
 extern int64 rowcompress_get_batches_pruned(TableScanDesc sscan);
 
+/* WITH-clause options helper (used by ColumnarProcessUtility) */
+extern void ApplyRowcompressWithOptions(Oid relid, List *defElemOptions);
+
 /* User-facing management functions (exposed as SQL UDFs) */
 extern Datum alter_rowcompress_table_set(PG_FUNCTION_ARGS);
 extern Datum alter_rowcompress_table_reset(PG_FUNCTION_ARGS);
