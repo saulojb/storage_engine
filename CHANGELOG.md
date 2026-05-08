@@ -2,57 +2,130 @@
 
 ## 2.1.0
 
-**Phase 1: Lazy/Eager Maintenance + Incremental Merge — catalog scaffold**
+**PostgreSQL compatibility:** 15–18 (PG15 added to CI matrix in this release)
 
-No behavior changes. All new objects default to `eager` mode (current behavior),
-so existing tables are completely unaffected. No C code changes.
+---
 
-### New catalog tables
+### VecGroupAgg — major executor expansion
 
-* **`engine.col_maintenance_options`** — per-table maintenance settings for
-  `colcompress` tables:
+`StorageEngineVectorGroupAgg` is the vectorized aggregation custom-scan node for
+`colcompress` tables. This release significantly expands its aggregate support:
+
+#### COUNT(DISTINCT col)
+
+```sql
+SELECT country_code, COUNT(DISTINCT user_id) FROM events GROUP BY country_code;
+```
+
+* Supported types: all integer types (`int2`, `int4`, `int8`), `float4`, `float8`,
+  `numeric`, `date`, `timestamp`, `timestamptz`, `uuid`, **`text`**, **`bpchar`**,
+  **`varchar`**.
+* Per-group in-memory hash set (`distinct_htab`) tracks seen values. For text/bpchar,
+  `VARDATA_ANY` bytes are hashed to `uint64` to avoid palloc per value.
+* Previously only numeric types were supported; text/bpchar fell back to the heap
+  executor due to a type-classification bug in `ClassifyAggref` (planner hook).
+  Fixed by using `KeyTypeOidToVecGaggType` fallback for `COUNT(DISTINCT)` when
+  the primary numeric classifier returns −1.
+
+#### SUM(CASE WHEN col = const THEN val END)
+
+```sql
+SELECT browser, SUM(CASE WHEN event_type = 'purchase' THEN amount END) FROM events GROUP BY browser;
+```
+
+* `ExtractConditionalSumNode()` decomposes the `CASE` expression inside `SUM`
+  into a `VecExprNode` triple `(filter_attno, filter_const, sum_attno)`.
+* Executed as a single-pass vectorized predicate + accumulate — no intermediate
+  `CASE` evaluation overhead.
+
+#### SUM(col1 * col2) — arithmetic expressions
+
+```sql
+SELECT browser, SUM(price * quantity) FROM events GROUP BY browser;
+```
+
+* `ExtractArithExprNode()` detects `OpExpr(*, col, col)` patterns inside `SUM`
+  and emits a `VECGAGG_SUM_EXPR` target.
+* Supports: `int2×int2 → int8`, `int4×int4 → int8`, `float4×float4 → float8`,
+  `float8×float8 → float8`.
+
+#### VECGROUPAGG_MAX_TARGETS increased to 16
+
+The maximum number of aggregate targets per `VecGroupAgg` node was raised from
+8 to 16, enabling complex multi-aggregate queries (e.g. the benchmark Q10 with
+10 simultaneous aggregates) to vectorize without falling back to the heap executor.
+
+#### GatherMerge stripping + AGG_SORTED guard removal
+
+The planner mutator now strips a `GatherMerge` node that appears between the
+`Agg` and the colcompress scan in parallel plans, allowing
+`StorageEngineVectorGroupAgg` to take over the parallel path. The previously
+required `AGG_SORTED` guard was also removed, since the custom node maintains
+its own internal hash table and does not require sorted input.
+
+#### AVG(int8) fix
+
+`AVG` on `int8` columns previously emitted a zero result when the transition
+sum overflowed `int4`. Fixed by using a dedicated `int8` accumulator path in
+the VecGroupAgg executor.
+
+---
+
+### Incremental Merge — full implementation (Phases 1–3)
+
+#### Phase 1 — Lazy/Eager Maintenance catalog scaffold
+
+New catalog objects (no behavior change; all tables default to `eager` mode):
+
+* **`engine.col_maintenance_options`** — per-table settings for `colcompress`:
   - `maintenance_mode` (`'eager'` | `'lazy'`, default `'eager'`)
-  - `maintenance_target_pruning_ratio` (`real`, default `0.70`) — minimum
-    fraction of stripes with valid pruning metadata before full repack is
-    recommended.
-  - `maintenance_merge_trigger_ratio` (`real`, default `0.20`) — fraction of
-    dirty stripes at which incremental merge is recommended.
-
-* **`engine.row_maintenance_options`** — same settings for `rowcompress` tables.
-
-### New management functions
-
+  - `maintenance_target_pruning_ratio` (`real`, default `0.70`)
+  - `maintenance_merge_trigger_ratio` (`real`, default `0.20`)
+* **`engine.row_maintenance_options`** — same for `rowcompress`.
 * **`engine.colcompress_set_maintenance(table, mode, target_ratio, merge_ratio)`**
-  — UPSERT into `engine.col_maintenance_options`; validates arguments.
 * **`engine.rowcompress_set_maintenance(table, mode, target_ratio, merge_ratio)`**
-  — same for rowcompress tables.
 
-### New observability view and functions
+Observability:
 
-* **`engine.storage_health`** — unified health view for all colcompress and
-  rowcompress tables. Columns: `table_name`, `am_name`, `maintenance_mode`,
-  thresholds, `total_units`, `dirty_units`, `dirty_ratio`, `tombstone_rows`,
-  `live_rows`, `effective_pruning_ratio_est`, `recommended_action`.
-  - `recommended_action` values: `'ok'`, `'run_incremental_merge'`,
-    `'run_full_repack'`.
-  - Phase 1 note: `dirty_units` is derived from existing deletion metadata
-    (colcompress: `chunk_group.deleted_rows`; rowcompress: `deleted_mask IS NOT NULL`).
-    Phase 2 will add per-unit `pruning_valid` flags for precise tracking.
-
+* **`engine.storage_health`** — unified health view. Columns: `table_name`,
+  `am_name`, `maintenance_mode`, thresholds, `total_units`, `dirty_units`,
+  `dirty_ratio`, `tombstone_rows`, `live_rows`, `effective_pruning_ratio_est`,
+  `recommended_action` (`'ok'` | `'run_incremental_merge'` | `'run_full_repack'`).
 * **`engine.storage_maintenance_recommendation(table regclass)`** — returns
-  `(status, reason, suggested_command, priority)` for a single table.
-
+  `(status, reason, suggested_command, priority)`.
 * **`engine.storage_maintenance_stats(table regclass)`** — tabular stats for
-  a single table (subset of `storage_health`).
+  a single table.
 
-### Phase roadmap
+#### Phase 2.5 — Precise dirty tracking
 
-- **Phase 1** (this release) — catalog scaffold + observability (no behavior change)
-- **Phase 2** — lazy mode: C code marks stripes/batches dirty on UPDATE/DELETE;
-  `pruning_valid` flag per unit
-- **Phase 3** — `engine.colcompress_merge_incremental()`: merge only dirty stripes;
-  rowcompress incremental merge
-- **Phase 4** (optional) — `engine.storage_maintenance_auto()` scheduler
+* `engine.stripe` gains a `dirty_rows` column: incremented by the C layer on
+  every `DELETE` / `UPDATE` affecting a colcompress stripe.
+* `engine.row_batch` gains a `pruning_valid` boolean: cleared when a batch's
+  min/max metadata is invalidated by an UPDATE in-place.
+* `storage_health` now uses these precise counters instead of the heuristic
+  `deleted_rows` proxy.
+
+#### Phase 3 — Incremental merge procedures
+
+* **`CALL engine.colcompress_merge_incremental(table)`** — identifies dirty
+  stripes (those with `dirty_rows > 0`), reads only those stripes, rewrites
+  them compacted and sorted, and updates stripe catalog metadata in-place.
+  Full repacks of clean stripes are skipped entirely.
+* **`CALL engine.rowcompress_merge_incremental(table)`** — same for rowcompress
+  batches with `pruning_valid = false` or non-zero tombstone counts.
+
+Phase 4 (`engine.storage_maintenance_auto()` background scheduler) is deferred
+to 2.2.0.
+
+---
+
+### CI and testing
+
+* PG15 added to the automated test matrix (PG15–PG19 now all validated).
+* Regression suite expanded to **264 tests** covering VecGroupAgg, incremental
+  merge, maintenance catalog, and all existing colcompress/rowcompress paths.
+
+---
 
 Upgrade with:
 ```sql
