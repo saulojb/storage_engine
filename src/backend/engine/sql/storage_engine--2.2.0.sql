@@ -2594,6 +2594,7 @@ SELECT
         ELSE 'ok'
     END                                                  AS recommended_action
 FROM engine.col_options co
+JOIN pg_class _alive ON _alive.oid = co.regclass  -- skip stale OIDs (dropped tables)
 LEFT JOIN engine.col_maintenance_options cmo
     ON cmo.regclass = co.regclass
 LEFT JOIN engine.stripe s
@@ -2653,6 +2654,7 @@ SELECT
         ELSE 'ok'
     END                                                  AS recommended_action
 FROM engine.row_options ro
+JOIN pg_class _alive ON _alive.oid = ro.regclass  -- skip stale OIDs (dropped tables)
 LEFT JOIN engine.row_maintenance_options rmo
     ON rmo.regclass = ro.regclass
 LEFT JOIN engine.row_batch rb
@@ -3260,3 +3262,67 @@ COMMENT ON FUNCTION engine.rowcompress_reset_scan_stats(regclass)
 IS 'Reset session-local scan statistics for all rowcompress tables (NULL) or a specific table.';
 
 GRANT EXECUTE ON FUNCTION engine.rowcompress_reset_scan_stats(regclass) TO PUBLIC;
+
+-- ============================================================
+-- Storage Maintenance Auto-Scheduler (2.2.0)
+-- ============================================================
+
+-- engine.storage_maintenance_auto() — dispatch merge/repack automatically.
+-- Can be called from pg_cron or manually; also invoked by the
+-- storage_engine background worker when
+-- storage_engine.maintenance_auto_enabled = on.
+CREATE OR REPLACE PROCEDURE engine.storage_maintenance_auto(
+    dry_run    boolean DEFAULT false,
+    max_tables int     DEFAULT NULL,
+    am_filter  text    DEFAULT NULL,
+    p_verbose  boolean DEFAULT false)
+LANGUAGE plpgsql AS $$
+DECLARE
+    r   record;
+    cnt int := 0;
+BEGIN
+    FOR r IN
+        SELECT table_name, am_name, recommended_action
+          FROM engine.storage_health
+         WHERE recommended_action IN ('run_incremental_merge', 'run_full_repack')
+           AND (am_filter IS NULL OR am_name = am_filter)
+         ORDER BY table_name
+    LOOP
+        EXIT WHEN max_tables IS NOT NULL AND cnt >= max_tables;
+
+        IF p_verbose THEN
+            RAISE NOTICE 'storage_maintenance_auto: % % -> %',
+                r.am_name, r.table_name, r.recommended_action;
+        END IF;
+
+        IF NOT dry_run THEN
+            IF r.am_name = 'colcompress' THEN
+                CALL engine.colcompress_merge_incremental(r.table_name::regclass);
+            ELSIF r.am_name = 'rowcompress' THEN
+                IF r.recommended_action = 'run_full_repack' THEN
+                    PERFORM engine.rowcompress_repack(r.table_name::regclass);
+                ELSE
+                    CALL engine.rowcompress_merge_incremental(r.table_name::regclass);
+                END IF;
+            END IF;
+        END IF;
+
+        cnt := cnt + 1;
+    END LOOP;
+
+    IF p_verbose THEN
+        RAISE NOTICE 'storage_maintenance_auto: processed % table(s)', cnt;
+    END IF;
+END;
+$$;
+
+COMMENT ON PROCEDURE engine.storage_maintenance_auto(boolean, int, text, boolean)
+IS 'Dispatch colcompress_merge_incremental or rowcompress_merge_incremental for '
+   'every table whose storage_health.recommended_action != ''ok''. '
+   'dry_run=true lists tables without acting. max_tables limits how many are '
+   'processed per call. am_filter restricts to ''colcompress'' or ''rowcompress''. '
+   'verbose emits a NOTICE per table. Can be scheduled with pg_cron or run '
+   'automatically via the storage_engine background worker.';
+
+GRANT EXECUTE ON PROCEDURE engine.storage_maintenance_auto(boolean, int, text, boolean)
+    TO PUBLIC;

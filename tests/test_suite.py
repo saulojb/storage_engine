@@ -1820,6 +1820,53 @@ class TestRunner:
                    _line(8).isdigit() and int(_line(8)) > 0, f"got {_line(8)!r}")
         self.check_eq("scan_stats: global reset clears all entries",          _line(9), "0")
 
+    # ------------------------------------------------ storage_maintenance_auto
+
+    def test_storage_maintenance_auto(self) -> None:
+        self.section("storage_maintenance_auto — auto-scheduler procedure")
+
+        # 1) Procedure exists in pg_proc with prokind='p'
+        result = self.q1("""
+            SELECT prokind::text
+              FROM pg_proc p
+              JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'engine'
+               AND p.proname = 'storage_maintenance_auto'
+        """)
+        self.check_eq("storage_maintenance_auto: exists in catalog as procedure",
+                      result, "p")
+
+        # 2) dry_run=true must not raise an error
+        rc, err = self.exec("CALL engine.storage_maintenance_auto(dry_run=>true)")
+        self.check("storage_maintenance_auto: dry_run=true completes without error",
+                   rc == 0, f"rc={rc} err={err!r}")
+
+        # 3) verbose=true emits the "processed N table(s)" notice (stderr in subprocess)
+        rc, err = self.exec(
+            "CALL engine.storage_maintenance_auto(dry_run=>true, p_verbose=>true)")
+        self.check("storage_maintenance_auto: p_verbose=true completes without error",
+                   rc == 0, f"rc={rc} err={err!r}")
+        self.check("storage_maintenance_auto: p_verbose=true emits processed NOTICE",
+                   "processed" in err, f"err={err!r}")
+
+        # 4) am_filter='colcompress' must not process rowcompress tables
+        rc, err = self.exec(
+            "CALL engine.storage_maintenance_auto("
+            "    dry_run=>true, am_filter=>'colcompress', p_verbose=>true)")
+        self.check("storage_maintenance_auto: am_filter='colcompress' completes",
+                   rc == 0, f"rc={rc} err={err!r}")
+        self.check("storage_maintenance_auto: am_filter='colcompress' emits no rowcompress notice",
+                   "rowcompress" not in err, f"err={err!r}")
+
+        # 5) max_tables=0 processes nothing
+        rc, err = self.exec(
+            "CALL engine.storage_maintenance_auto("
+            "    dry_run=>true, max_tables=>0, p_verbose=>true)")
+        self.check("storage_maintenance_auto: max_tables=0 completes",
+                   rc == 0, f"rc={rc} err={err!r}")
+        self.check("storage_maintenance_auto: max_tables=0 processes 0 tables",
+                   "processed 0 table" in err, f"err={err!r}")
+
     # ------------------------------------------------------------------ upgrade path
 
     def test_upgrade_path(self) -> None:
@@ -1899,6 +1946,7 @@ class TestRunner:
         self.test_colcompress_merge_incremental()
         self.test_rowcompress_merge_incremental()
         self.test_rowcompress_scan_stats()
+        self.test_storage_maintenance_auto()
         self.test_upgrade_path()
 
         self.teardown()
