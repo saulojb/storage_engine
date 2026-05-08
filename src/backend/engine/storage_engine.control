@@ -1,4 +1,4 @@
 comment = 'Storage Engine — columnar (colcompress) and row-compressed (rowcompress) Table AMs with vectorized aggregate execution (v2.0)'
-default_version = '2.1.0'
+default_version = '2.2.0'
 module_pathname = '$libdir/storage_engine'
 relocatable = false

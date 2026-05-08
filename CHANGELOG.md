@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 2.2.0
+
+### Storage Maintenance Auto-Scheduler (Phase 4)
+
+* **`engine.storage_maintenance_auto()`** — background scheduler that
+  automatically dispatches `colcompress_merge_incremental` or
+  `rowcompress_merge_incremental` for any table whose `storage_health`
+  `recommended_action` is `'run_incremental_merge'` or `'run_full_repack'`.
+  Designed to run periodically via `pg_cron` or a custom background worker.
+
+---
+
 ## 2.1.0
 
 ---
