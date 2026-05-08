@@ -50,6 +50,8 @@ typedef struct RowCompressOptions
 	                                   * 0 means pruning disabled */
 	bool            indexScan;        /* true = allow index scans (OLTP mode);
 	                                   * false (default) = remove range index paths */
+	char           *orderby;          /* ORDER BY clause for rowcompress_repack;
+	                                   * NULL means no sort */
 } RowCompressOptions;
 
 /*
@@ -96,9 +98,14 @@ extern void rowcompress_set_pushdown_clauses(TableScanDesc sscan,
 											 TupleDesc tupdesc);
 extern int64 rowcompress_get_batches_pruned(TableScanDesc sscan);
 
+/* WITH-clause options helper (used by ColumnarProcessUtility) */
+extern void ApplyRowcompressWithOptions(Oid relid, List *defElemOptions);
+
 /* User-facing management functions (exposed as SQL UDFs) */
 extern Datum alter_rowcompress_table_set(PG_FUNCTION_ARGS);
 extern Datum alter_rowcompress_table_reset(PG_FUNCTION_ARGS);
 extern Datum rowcompress_repack(PG_FUNCTION_ARGS);
+extern Datum rowcompress_scan_stats(PG_FUNCTION_ARGS);
+extern Datum rowcompress_reset_scan_stats(PG_FUNCTION_ARGS);
 
 #endif /* ROWCOMPRESS_H */

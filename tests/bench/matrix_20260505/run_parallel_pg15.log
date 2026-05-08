@@ -1,0 +1,36 @@
+-- heap (table: events_heap) --
+Q1 count(*): 26.234 ms | samples=[33.15, 26.234, 22.389]
+Q2 SUM/AVG numeric+double: 55.032 ms | samples=[45.088, 55.032, 59.301]
+Q3 GROUP BY country (10): 56.355 ms | samples=[56.355, 56.015, 57.464]
+Q4 GROUP BY event_type+p95: 656.365 ms | samples=[657.758, 656.365, 631.168]
+Q5 date range 1 month: 20.947 ms | samples=[36.389, 20.947, 20.69]
+Q6 JSONB @> GIN: 109.947 ms | samples=[121.602, 109.947, 108.961]
+Q7 JSONB key + GROUP BY: 393.929 ms | samples=[400.21, 393.929, 389.107]
+Q8 array @> GIN: 202.304 ms | samples=[202.304, 202.425, 199.329]
+Q9 LIKE text scan: 43.374 ms | samples=[43.374, 43.201, 43.508]
+Q10 heavy multi-agg: 507.341 ms | samples=[507.341, 519.158, 505.681]
+
+-- colcompress (table: events_col) --
+Q1 count(*): 10.049 ms | samples=[10.047, 10.223, 10.049]
+Q2 SUM/AVG numeric+double: 34.592 ms | samples=[35.262, 33.703, 34.592]
+Q3 GROUP BY country (10): 37.034 ms | samples=[37.196, 37.034, 35.531]
+Q4 GROUP BY event_type+p95: 346.446 ms | samples=[344.818, 346.446, 375.055]
+Q5 date range 1 month: 23.183 ms | samples=[23.183, 23.219, 21.895]
+Q6 JSONB @> GIN: 45.929 ms | samples=[45.929, 47.238, 44.684]
+Q7 JSONB key + GROUP BY: 273.683 ms | samples=[273.683, 281.146, 272.849]
+Q8 array @> GIN: 38.278 ms | samples=[39.307, 37.966, 38.278]
+Q9 LIKE text scan: 27.077 ms | samples=[26.063, 27.077, 27.109]
+Q10 heavy multi-agg: 497.172 ms | samples=[496.485, 505.989, 497.172]
+
+-- rowcompress (table: events_row) --
+Q1 count(*): 146.174 ms | samples=[160.681, 146.174, 143.868]
+Q2 SUM/AVG numeric+double: 151.302 ms | samples=[150.865, 151.302, 153.723]
+Q3 GROUP BY country (10): 161.388 ms | samples=[159.503, 170.615, 161.388]
+Q4 GROUP BY event_type+p95: 481.776 ms | samples=[475.865, 481.776, 488.02]
+Q5 date range 1 month: 62.895 ms | samples=[62.895, 63.44, 62.547]
+Q6 JSONB @> GIN: 347.267 ms | samples=[361.201, 347.267, 342.916]
+Q7 JSONB key + GROUP BY: 197.536 ms | samples=[189.581, 199.997, 197.536]
+Q8 array @> GIN: 288.116 ms | samples=[286.809, 288.116, 316.763]
+Q9 LIKE text scan: 145.209 ms | samples=[165.23, 145.209, 143.413]
+Q10 heavy multi-agg: 616.602 ms | samples=[632.986, 616.602, 614.811]
+

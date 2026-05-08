@@ -184,7 +184,7 @@ class TestRunner:
 
         # Version
         ver = self.q1("SELECT extversion FROM pg_extension WHERE extname='storage_engine'")
-        self.check("extension version = 2.1.0", ver == "2.1.0", f"got {ver!r}")
+        self.check("extension version = 2.2.0", ver == "2.2.0", f"got {ver!r}")
 
         # Schema
         ns = self.q1("SELECT nspname FROM pg_namespace WHERE nspname='engine'")
@@ -1719,6 +1719,154 @@ class TestRunner:
         )
         self.check("rowcompress_merge_incremental: error on max_batches=0", rc_err2 != 0)
 
+    # ------------------------------------------------------------------ rowcompress scan stats
+
+    def test_rowcompress_scan_stats(self) -> None:
+        self.section("rowcompress_scan_stats — session-local scan statistics")
+
+        # Create and populate two rowcompress tables.
+        self.exec("""
+            DROP TABLE IF EXISTS _tscanstat;
+            DROP TABLE IF EXISTS _tscanstat2;
+            CREATE TABLE _tscanstat  (id int, val text) USING rowcompress;
+            CREATE TABLE _tscanstat2 (id int)          USING rowcompress;
+            INSERT INTO _tscanstat  SELECT i, 'row' || i FROM generate_series(1, 5000) i;
+            INSERT INTO _tscanstat2 SELECT i            FROM generate_series(1, 1000) i;
+        """)
+
+        # All assertions below must run in a SINGLE psql session because
+        # rowcompress_scan_stats() is session-local.
+        #
+        # The query returns one result row per assertion (in order).
+        # With psql -A -t each row lands on its own output line.
+        # self.q() strips SET lines and returns newline-joined remaining lines.
+        out = self.q("""
+            -- start clean
+            SELECT engine.rowcompress_reset_scan_stats();
+
+            -- one scan of _tscanstat
+            SELECT count(*) FROM _tscanstat;
+
+            -- assertion 1: total_scans = 1
+            SELECT total_scans
+              FROM engine.rowcompress_scan_stats()
+             WHERE table_name = '_tscanstat';
+
+            -- assertion 2: batches_scanned = batches_total - batches_pruned
+            SELECT bool_and(batches_scanned = batches_total - batches_pruned)
+              FROM engine.rowcompress_scan_stats();
+
+            -- assertion 3: pruning_ratio in [0,1]
+            SELECT bool_and(pruning_ratio >= 0.0 AND pruning_ratio <= 1.0)
+              FROM engine.rowcompress_scan_stats();
+
+            -- second scan
+            SELECT count(*) FROM _tscanstat;
+
+            -- assertion 4: total_scans = 2
+            SELECT total_scans
+              FROM engine.rowcompress_scan_stats()
+             WHERE table_name = '_tscanstat';
+
+            -- scan _tscanstat2, then reset _tscanstat only
+            SELECT count(*) FROM _tscanstat2;
+            SELECT engine.rowcompress_reset_scan_stats('_tscanstat'::regclass);
+
+            -- assertion 5: _tscanstat is gone (0 rows)
+            SELECT count(*)
+              FROM engine.rowcompress_scan_stats()
+             WHERE table_name = '_tscanstat';
+
+            -- assertion 6: _tscanstat2 is still there (1 row)
+            SELECT count(*)
+              FROM engine.rowcompress_scan_stats()
+             WHERE table_name = '_tscanstat2';
+
+            -- global reset
+            SELECT engine.rowcompress_reset_scan_stats();
+
+            -- assertion 7: everything cleared
+            SELECT count(*) FROM engine.rowcompress_scan_stats()
+        """)
+
+        # Strip psql procedural output (blank rows from void-returning functions,
+        # count(*) rows we only ran to produce stats, etc.) and collect non-empty
+        # non-SET lines into an ordered list.
+        lines = [ln for ln in out.split("\n") if ln and ln != "SET"]
+
+        # Expected ordering of meaningful output lines:
+        #  0: 5000          (count _tscanstat scan 1)
+        #  1: 1             (total_scans assertion 1)
+        #  2: t             (batches_ok assertion 2)
+        #  3: t             (ratio_ok assertion 3)
+        #  4: 5000          (count _tscanstat scan 2)
+        #  5: 2             (total_scans assertion 4)
+        #  6: 1000          (count _tscanstat2)
+        #  7: 0             (assertion 5: _tscanstat gone)
+        #  8: 1             (assertion 6: _tscanstat2 still there)
+        #  9: 0             (assertion 7: all gone)
+
+        def _line(idx: int) -> str:
+            return lines[idx] if idx < len(lines) else ""
+
+        self.check_eq("scan_stats: total_scans = 1 after one scan",          _line(1), "1")
+        self.check("scan_stats: batches_scanned = batches_total - batches_pruned",
+                   _line(2) == "t", f"got {_line(2)!r}")
+        self.check("scan_stats: pruning_ratio in [0,1]",
+                   _line(3) == "t", f"got {_line(3)!r}")
+        self.check_eq("scan_stats: total_scans = 2 after second scan",       _line(5), "2")
+        self.check_eq("scan_stats: table-specific reset removes that entry",  _line(7), "0")
+        self.check("scan_stats: table-specific reset leaves other entries",
+                   _line(8).isdigit() and int(_line(8)) > 0, f"got {_line(8)!r}")
+        self.check_eq("scan_stats: global reset clears all entries",          _line(9), "0")
+
+    # ------------------------------------------------ storage_maintenance_auto
+
+    def test_storage_maintenance_auto(self) -> None:
+        self.section("storage_maintenance_auto — auto-scheduler procedure")
+
+        # 1) Procedure exists in pg_proc with prokind='p'
+        result = self.q1("""
+            SELECT prokind::text
+              FROM pg_proc p
+              JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'engine'
+               AND p.proname = 'storage_maintenance_auto'
+        """)
+        self.check_eq("storage_maintenance_auto: exists in catalog as procedure",
+                      result, "p")
+
+        # 2) dry_run=true must not raise an error
+        rc, err = self.exec("CALL engine.storage_maintenance_auto(dry_run=>true)")
+        self.check("storage_maintenance_auto: dry_run=true completes without error",
+                   rc == 0, f"rc={rc} err={err!r}")
+
+        # 3) verbose=true emits the "processed N table(s)" notice (stderr in subprocess)
+        rc, err = self.exec(
+            "CALL engine.storage_maintenance_auto(dry_run=>true, p_verbose=>true)")
+        self.check("storage_maintenance_auto: p_verbose=true completes without error",
+                   rc == 0, f"rc={rc} err={err!r}")
+        self.check("storage_maintenance_auto: p_verbose=true emits processed NOTICE",
+                   "processed" in err, f"err={err!r}")
+
+        # 4) am_filter='colcompress' must not process rowcompress tables
+        rc, err = self.exec(
+            "CALL engine.storage_maintenance_auto("
+            "    dry_run=>true, am_filter=>'colcompress', p_verbose=>true)")
+        self.check("storage_maintenance_auto: am_filter='colcompress' completes",
+                   rc == 0, f"rc={rc} err={err!r}")
+        self.check("storage_maintenance_auto: am_filter='colcompress' emits no rowcompress notice",
+                   "rowcompress" not in err, f"err={err!r}")
+
+        # 5) max_tables=0 processes nothing
+        rc, err = self.exec(
+            "CALL engine.storage_maintenance_auto("
+            "    dry_run=>true, max_tables=>0, p_verbose=>true)")
+        self.check("storage_maintenance_auto: max_tables=0 completes",
+                   rc == 0, f"rc={rc} err={err!r}")
+        self.check("storage_maintenance_auto: max_tables=0 processes 0 tables",
+                   "processed 0 table" in err, f"err={err!r}")
+
     # ------------------------------------------------------------------ upgrade path
 
     def test_upgrade_path(self) -> None:
@@ -1729,14 +1877,14 @@ class TestRunner:
             "SELECT max(version) FROM pg_available_extension_versions "
             "WHERE name = 'storage_engine'"
         )
-        self.check("latest available version = 2.1.0", ver == "2.1.0", f"got {ver!r}")
+        self.check("latest available version = 2.2.0", ver == "2.2.0", f"got {ver!r}")
 
-        # Complete upgrade path from 1.0 to 2.1.0 exists
+        # Complete upgrade path from 1.0 to 2.2.0 exists
         path = self.q1(
             "SELECT path FROM pg_extension_update_paths('storage_engine') "
-            "WHERE source = '1.0' AND target = '2.1.0'"
+            "WHERE source = '1.0' AND target = '2.2.0'"
         )
-        self.check("upgrade path 1.0 → 2.1.0 exists", path != "", f"path={path!r}")
+        self.check("upgrade path 1.0 → 2.2.0 exists", path != "", f"path={path!r}")
 
         # Each individual upgrade step
         steps = [
@@ -1759,6 +1907,7 @@ class TestRunner:
             ("1.3.4", "2.0.0"),
             ("2.0.0", "2.0.1"),
             ("2.0.1", "2.1.0"),
+            ("2.1.0", "2.2.0"),
         ]
         for src, tgt in steps:
             p = self.q1(
@@ -1796,6 +1945,8 @@ class TestRunner:
         self.test_storage_health()
         self.test_colcompress_merge_incremental()
         self.test_rowcompress_merge_incremental()
+        self.test_rowcompress_scan_stats()
+        self.test_storage_maintenance_auto()
         self.test_upgrade_path()
 
         self.teardown()

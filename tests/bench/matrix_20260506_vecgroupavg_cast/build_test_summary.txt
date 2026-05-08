@@ -1,0 +1,15 @@
+=== PG15 (port 5436) ===
+PG15: PASS       PG@5436: [32mALL 165 TESTS PASSED[0m
+
+=== PG16 (port 5434) ===
+PG16: FAIL       PG@5434: [31m3 FAILED[0m / 164 total
+
+=== PG17 (port 5435) ===
+PG17: FAIL       PG@5435: [31m3 FAILED[0m / 164 total
+
+=== PG18 (port 5432) ===
+PG18: FAIL     FAILED
+
+=== PG19 (port 5433) ===
+PG19: FAIL       PG@5433: [31m3 FAILED[0m / 164 total
+

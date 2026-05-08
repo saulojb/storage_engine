@@ -1,0 +1,36 @@
+-- heap (table: events_heap) --
+Q1 count(*): 143.780 ms | samples=[155.971, 143.78, 85.143]
+Q2 SUM/AVG numeric+double: 176.354 ms | samples=[172.874, 178.519, 176.354]
+Q3 GROUP BY country (10): 224.917 ms | samples=[230.243, 224.917, 216.341]
+Q4 GROUP BY event_type+p95: 641.224 ms | samples=[649.095, 641.224, 632.684]
+Q5 date range 1 month: 23.455 ms | samples=[35.982, 23.455, 20.992]
+Q6 JSONB @> GIN: 254.231 ms | samples=[252.234, 263.109, 254.231]
+Q7 JSONB key + GROUP BY: 409.362 ms | samples=[416.743, 408.725, 409.362]
+Q8 array @> GIN: 204.402 ms | samples=[204.402, 213.642, 203.843]
+Q9 LIKE text scan: 154.346 ms | samples=[175.211, 154.346, 154.238]
+Q10 heavy multi-agg: 907.271 ms | samples=[915.923, 907.271, 902.879]
+
+-- colcompress (table: events_col) --
+Q1 count(*): 6.108 ms | samples=[6.497, 5.898, 6.108]
+Q2 SUM/AVG numeric+double: 134.628 ms | samples=[139.298, 134.358, 134.628]
+Q3 GROUP BY country (10): 156.833 ms | samples=[158.255, 155.834, 156.833]
+Q4 GROUP BY event_type+p95: 565.108 ms | samples=[572.193, 565.108, 560.541]
+Q5 date range 1 month: 21.062 ms | samples=[20.945, 21.062, 21.745]
+Q6 JSONB @> GIN: 208.981 ms | samples=[212.136, 208.981, 203.949]
+Q7 JSONB key + GROUP BY: 343.037 ms | samples=[344.056, 342.203, 343.037]
+Q8 array @> GIN: 143.276 ms | samples=[146.876, 142.078, 143.276]
+Q9 LIKE text scan: 98.598 ms | samples=[99.989, 98.58, 98.598]
+Q10 heavy multi-agg: 874.486 ms | samples=[869.335, 874.486, 937.399]
+
+-- rowcompress (table: events_row) --
+Q1 count(*): 336.649 ms | samples=[384.647, 329.637, 336.649]
+Q2 SUM/AVG numeric+double: 382.342 ms | samples=[382.342, 383.261, 374.792]
+Q3 GROUP BY country (10): 407.002 ms | samples=[407.002, 404.706, 408.41]
+Q4 GROUP BY event_type+p95: 872.266 ms | samples=[878.387, 869.606, 872.266]
+Q5 date range 1 month: 63.381 ms | samples=[58.261, 64.424, 63.381]
+Q6 JSONB @> GIN: 340.669 ms | samples=[340.669, 339.478, 357.246]
+Q7 JSONB key + GROUP BY: 553.768 ms | samples=[553.748, 553.768, 558.516]
+Q8 array @> GIN: 286.869 ms | samples=[280.894, 286.869, 287.113]
+Q9 LIKE text scan: 355.011 ms | samples=[354.325, 356.646, 355.011]
+Q10 heavy multi-agg: 1092.579 ms | samples=[1096.362, 1092.579, 1082.652]
+

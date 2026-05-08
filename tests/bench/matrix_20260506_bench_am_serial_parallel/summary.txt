@@ -1,0 +1,9 @@
+=== PG15 (port 5436) ===
+PG15 SERIAL: FAIL (dist/tests/bench/matrix_20260506_bench_am_serial_parallel/serial_15.log)
+PG15 PARALLEL: FAIL (dist/tests/bench/matrix_20260506_bench_am_serial_parallel/parallel_15.log)
+
+=== PG16 (port 5434) ===
+PG16 SERIAL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel/results_serial_16.csv)
+PG16 PARALLEL: PASS (dist/tests/bench/matrix_20260506_bench_am_serial_parallel/results_parallel_16.csv)
+
+=== PG17 (port 5435) ===

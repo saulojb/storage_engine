@@ -1,0 +1,43 @@
+============================================================
+ Benchmark — PostgreSQL 16  •  1 000 000 rows
+ Runs per query: 3   JIT: off   Parallelism: off
+============================================================
+
+── heap  (db: bench_am  table: events_heap) ─────────────────────────
+  Q1 count(*)                          39.860 ms
+  Q2 SUM/AVG numeric+double            175.940 ms
+  Q3 GROUP BY country (10)             221.094 ms
+  Q4 GROUP BY event_type+p95           622.502 ms
+  Q5 date range 1 month                19.952 ms
+  Q6 JSONB @> GIN                      268.758 ms
+  Q7 JSONB key + GROUP BY              383.985 ms
+  Q8 array @> GIN                      217.687 ms
+  Q9 LIKE text scan                    168.590 ms
+  Q10 heavy multi-agg                  2114.624 ms
+
+── colcompress  (db: bench_am  table: events_col) ─────────────────────────
+  Q1 count(*)                          5.087 ms
+  Q2 SUM/AVG numeric+double            132.520 ms
+  Q3 GROUP BY country (10)             155.624 ms
+  Q4 GROUP BY event_type+p95           548.034 ms
+  Q5 date range 1 month                19.470 ms
+  Q6 JSONB @> GIN                      210.415 ms
+  Q7 JSONB key + GROUP BY              334.327 ms
+  Q8 array @> GIN                      138.401 ms
+  Q9 LIKE text scan                    117.425 ms
+  Q10 heavy multi-agg                  2115.686 ms
+
+── rowcompress  (db: bench_am  table: events_row) ─────────────────────────
+  Q1 count(*)                          326.688 ms
+  Q2 SUM/AVG numeric+double            381.238 ms
+  Q3 GROUP BY country (10)             429.949 ms
+  Q4 GROUP BY event_type+p95           790.220 ms
+  Q5 date range 1 month                63.527 ms
+  Q6 JSONB @> GIN                      356.610 ms
+  Q7 JSONB key + GROUP BY              571.017 ms
+  Q8 array @> GIN                      282.707 ms
+  Q9 LIKE text scan                    349.094 ms
+  Q10 heavy multi-agg                  2390.107 ms
+
+Results saved → /home/saulo/Projetos/storage_engine/dist/tests/bench/matrix_20260430/results_serial_pg16.csv
+Generate chart: python3 /home/saulo/Projetos/storage_engine/dist/tests/bench/chart.py /home/saulo/Projetos/storage_engine/dist/tests/bench/matrix_20260430/results_serial_pg16.csv

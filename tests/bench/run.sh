@@ -49,7 +49,7 @@ declare -a QUERIES=(
   "SELECT metadata->>'campaign',COUNT(*),SUM(amount) FROM __TBL__ WHERE metadata ? 'campaign' GROUP BY 1 ORDER BY 3 DESC NULLS LAST"
   "SELECT COUNT(*),AVG(price) FROM __TBL__ WHERE tags @> ARRAY['tag_5']"
   "SELECT COUNT(*),SUM(amount) FROM __TBL__ WHERE url LIKE '/page/1%'"
-  "SELECT browser,is_mobile,COUNT(*),SUM(amount),AVG(amount),MIN(amount),MAX(amount),SUM(price*quantity),AVG(duration_ms),COUNT(DISTINCT user_id),SUM(CASE WHEN event_type='purchase' THEN amount END) FROM __TBL__ GROUP BY browser,is_mobile ORDER BY COUNT(*) DESC"
+  "SELECT browser,is_mobile,COUNT(*),SUM(amount),AVG(amount),MIN(amount),MAX(amount),SUM(price*quantity),AVG(duration_ms),COUNT(DISTINCT country_code),SUM(CASE WHEN event_type='purchase' THEN amount END) FROM __TBL__ GROUP BY browser,is_mobile ORDER BY COUNT(*) DESC"
 )
 
 declare -A AM_TARGETS=(

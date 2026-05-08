@@ -73,6 +73,8 @@
 #include "catalog/objectaccess.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "funcapi.h"
+#include "utils/tuplestore.h"
 
 #if PG_VERSION_NUM >= PG_VERSION_16
 #include "storage/relfilelocator.h"
@@ -92,6 +94,8 @@
 #include "engine/engine_tableam.h"
 #include "engine/engine_version_compat.h"
 #include "engine/rowcompress.h"
+#include "commands/defrem.h"
+#include "nodes/parsenodes.h"
 
 
 /* ================================================================
@@ -177,6 +181,7 @@ typedef struct RowCompressScanDesc
 	/* Batch-level pruning: set by rowcompress_set_pushdown_clauses() */
 	RCPruningCtx  *pruningCtx;     /* NULL = pruning disabled for this scan */
 	int64          batchesPruned;  /* number of batches skipped via pruning */
+	int            batchesTotal;   /* total batches in batchList at scan start */
 
 #if PG_VERSION_NUM < PG_VERSION_18
 	struct TBMIterateResult *tbmres;
@@ -282,7 +287,8 @@ typedef struct IndexFetchRowCompressData
 #define Anum_rowcompress_options_compression_level 4
 #define Anum_rowcompress_options_pruning_attnum    5
 #define Anum_rowcompress_options_index_scan        6
-#define Natts_rowcompress_options                  6
+#define Anum_rowcompress_options_orderby           7
+#define Natts_rowcompress_options                  7
 
 
 /* ================================================================
@@ -296,6 +302,24 @@ static MemoryContext  RCWriteStateContext = NULL;
 static object_access_hook_type PrevRCObjectAccessHook = NULL;
 static void RCObjectAccessHook(ObjectAccessType access, Oid classId,
 								Oid objectId, int subId, void *arg);
+
+/*
+ * Per-table scan statistics — accumulated in session memory,
+ * keyed by relation OID.  Reset on session end or via
+ * engine.rowcompress_reset_scan_stats().
+ */
+typedef struct RCScanStatsEntry
+{
+	Oid   relid;           /* hash key — must be first */
+	int64 totalScans;
+	int64 batchesTotal;    /* sum of list_length(batchList) across all scans */
+	int64 batchesPruned;   /* sum of batchesPruned across all scans */
+} RCScanStatsEntry;
+
+static HTAB         *RCScanStatsHash = NULL;
+static MemoryContext RCScanStatsCtx  = NULL;
+
+static void RCAccumulateScanStats(Oid relid, int batchesTotal, int64 batchesPruned);
 
 
 /* ================================================================
@@ -926,6 +950,11 @@ RCInitOptions(Oid relationId)
 		CompressionTypeStr(ROWCOMPRESS_DEFAULT_COMPRESSION));
 	values[Anum_rowcompress_options_compression_level - 1]  = Int32GetDatum(ROWCOMPRESS_DEFAULT_COMPRESSION_LEVEL);
 
+	/* nullable columns default to NULL */
+	nulls[Anum_rowcompress_options_pruning_attnum - 1] = true;
+	nulls[Anum_rowcompress_options_index_scan - 1]     = true;
+	nulls[Anum_rowcompress_options_orderby - 1]        = true;
+
 	Relation optRel  = table_open(RCOptionsRelationId(), RowExclusiveLock);
 	TupleDesc tupdesc = RelationGetDescr(optRel);
 	HeapTuple tuple   = heap_form_tuple(tupdesc, values, nulls);
@@ -948,6 +977,7 @@ RCReadOptions(Oid relationId, RowCompressOptions *options)
 	options->compression      = ROWCOMPRESS_DEFAULT_COMPRESSION;
 	options->compressionLevel = ROWCOMPRESS_DEFAULT_COMPRESSION_LEVEL;
 	options->indexScan        = false;
+	options->orderby          = NULL;
 
 	Oid optOid = RCOptionsRelationId();
 	if (!OidIsValid(optOid))
@@ -1010,6 +1040,16 @@ RCReadOptions(Oid relationId, RowCompressOptions *options)
 										 tupdesc, &isNull);
 			if (!isNull)
 				options->indexScan = DatumGetBool(isDatum);
+		}
+
+		/* Read orderby (nullable text, added in v2.2.0) */
+		options->orderby = NULL;
+		if (tupdesc->natts >= Anum_rowcompress_options_orderby)
+		{
+			Datum obDatum = heap_getattr(tup, Anum_rowcompress_options_orderby,
+									 tupdesc, &isNull);
+			if (!isNull)
+				options->orderby = text_to_cstring(DatumGetTextPP(obDatum));
 		}
 	}
 
@@ -1087,6 +1127,11 @@ RCSetOptions(Oid relationId, const RowCompressOptions *options)
 		values[Anum_rowcompress_options_index_scan - 1] = BoolGetDatum(true);
 	else
 		nulls[Anum_rowcompress_options_index_scan - 1]  = true;
+
+	if (options->orderby != NULL && options->orderby[0] != '\0')
+		values[Anum_rowcompress_options_orderby - 1] = CStringGetTextDatum(options->orderby);
+	else
+		nulls[Anum_rowcompress_options_orderby - 1]  = true;
 
 	Relation  optRel  = table_open(RCOptionsRelationId(), RowExclusiveLock);
 	TupleDesc tupdesc = RelationGetDescr(optRel);
@@ -1849,6 +1894,7 @@ RCReadOptions(RelationGetRelid(relation), &scan->options);
 
 scan->batchList        = RCGetBatches(scan->storageId);
 scan->currentBatchCell = list_head(scan->batchList);
+scan->batchesTotal     = list_length(scan->batchList);
 
 scan->batchData         = NULL;
 scan->rowOffsets        = NULL;
@@ -1888,6 +1934,11 @@ static void
 rowcompress_endscan(TableScanDesc sscan)
 {
 RowCompressScanDesc *scan = (RowCompressScanDesc *) sscan;
+
+	/* Accumulate session-level scan stats before scanContext is destroyed */
+	RCAccumulateScanStats(RelationGetRelid(scan->rc_base.rs_rd),
+						  scan->batchesTotal, scan->batchesPruned);
+
 	if (scan->bitmapFetch)
 		rowcompress_index_fetch_end((IndexFetchTableData *) scan->bitmapFetch);
 
@@ -3423,6 +3474,130 @@ static const TableAmRoutine rowcompress_methods = {
  * ================================================================ */
 
 /*
+ * ApplyRowcompressWithOptions — apply WITH clause options from a CREATE TABLE
+ * statement to a newly created rowcompress table.
+ *
+ * Called from ColumnarProcessUtility after the standard utility has already
+ * created the table (with the options list stripped to avoid PostgreSQL's
+ * "unrecognized parameter" error for unknown reloption names).
+ *
+ * Accepted option names: batch_size, compression, compression_level,
+ *   pruning_column, index_scan, orderby.
+ */
+void
+ApplyRowcompressWithOptions(Oid relid, List *defElemOptions)
+{
+	if (defElemOptions == NIL)
+		return;
+
+	RowCompressOptions options = { 0 };
+	if (!RCReadOptions(relid, &options))
+		ereport(ERROR, (errmsg("unable to read current options for rowcompress table")));
+
+	Relation rel = table_open(relid, AccessShareLock);
+
+	ListCell *lc;
+	foreach(lc, defElemOptions)
+	{
+		DefElem *def = (DefElem *) lfirst(lc);
+		const char *name = def->defname;
+
+		if (strcmp(name, "batch_size") == 0)
+		{
+			options.batchSize = (int32) strtol(defGetString(def), NULL, 10);
+			if (options.batchSize < ROWCOMPRESS_BATCH_SIZE_MIN ||
+				options.batchSize > ROWCOMPRESS_BATCH_SIZE_MAX)
+				ereport(ERROR, (errmsg("batch_size out of range"),
+								errhint("batch_size must be between %d and %d",
+										ROWCOMPRESS_BATCH_SIZE_MIN,
+										ROWCOMPRESS_BATCH_SIZE_MAX)));
+		}
+		else if (strcmp(name, "compression") == 0)
+		{
+			options.compression = ParseCompressionType(defGetString(def));
+			if (options.compression == COMPRESSION_TYPE_INVALID)
+				ereport(ERROR, (errmsg("unknown compression type: \"%s\"",
+									   defGetString(def))));
+		}
+		else if (strcmp(name, "compression_level") == 0)
+		{
+			options.compressionLevel = (int) strtol(defGetString(def), NULL, 10);
+			if (options.compressionLevel < COMPRESSION_LEVEL_MIN ||
+				options.compressionLevel > COMPRESSION_LEVEL_MAX)
+				ereport(ERROR, (errmsg("compression_level out of range"),
+								errhint("compression_level must be between %d and %d",
+										COMPRESSION_LEVEL_MIN, COMPRESSION_LEVEL_MAX)));
+		}
+		else if (strcmp(name, "pruning_column") == 0)
+		{
+			char *colNameStr = defGetString(def);
+			if (colNameStr[0] == '\0')
+			{
+				options.pruningAttnum = 0;
+			}
+			else
+			{
+				TupleDesc td = RelationGetDescr(rel);
+				int16 attno = 0;
+				for (int i = 0; i < td->natts; i++)
+				{
+					Form_pg_attribute a = TupleDescAttr(td, i);
+					if (!a->attisdropped &&
+						strcmp(NameStr(a->attname), colNameStr) == 0)
+					{
+						attno = a->attnum;
+						break;
+					}
+				}
+				if (attno == 0)
+					ereport(ERROR,
+							(errmsg("column \"%s\" does not exist in table \"%s\"",
+									colNameStr, RelationGetRelationName(rel))));
+				Form_pg_attribute pattr = TupleDescAttr(td, attno - 1);
+				TypeCacheEntry *tc = lookup_type_cache(pattr->atttypid,
+													   TYPECACHE_CMP_PROC_FINFO);
+				if (!OidIsValid(tc->cmp_proc))
+					ereport(ERROR,
+							(errmsg("column \"%s\" has type %s which has no btree comparator",
+									colNameStr, format_type_be(pattr->atttypid))));
+				options.pruningAttnum = attno;
+			}
+		}
+		else if (strcmp(name, "index_scan") == 0)
+		{
+			options.indexScan = defGetBoolean(def);
+		}
+		else if (strcmp(name, "orderby") == 0)
+		{
+			char *obStr = defGetString(def);
+			options.orderby = (obStr[0] != '\0') ? obStr : NULL;
+			if (options.orderby != NULL)
+			{
+				StringInfoData chkbuf;
+				initStringInfo(&chkbuf);
+				appendStringInfo(&chkbuf, "SELECT 1 ORDER BY %s", options.orderby);
+#if PG_VERSION_NUM >= PG_VERSION_14
+				raw_parser(chkbuf.data, RAW_PARSE_DEFAULT);
+#else
+				raw_parser(chkbuf.data);
+#endif
+				pfree(chkbuf.data);
+			}
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("unrecognized rowcompress option: \"%s\"", name)));
+		}
+	}
+
+	table_close(rel, AccessShareLock);
+	RCSetOptions(relid, &options);
+}
+
+
+/*
  * alter_rowcompress_table_set — change options on a rowcompress table.
  *
  * SQL signature:
@@ -3570,6 +3745,33 @@ alter_rowcompress_table_set(PG_FUNCTION_ARGS)
 								options.indexScan ? "true" : "false")));
 	}
 
+	/* orderby => not null: "col1 ASC, col2 DESC" or "" to clear */
+	if (!PG_ARGISNULL(6))
+	{
+		text *orderbyText = PG_GETARG_TEXT_PP(6);
+		char *orderbyStr  = text_to_cstring(orderbyText);
+
+		/* empty string clears the orderby */
+		options.orderby = (orderbyStr[0] != '\0') ? orderbyStr : NULL;
+
+		/* validate SQL syntax eagerly so callers fail fast */
+		if (options.orderby != NULL)
+		{
+			StringInfoData chkbuf;
+			initStringInfo(&chkbuf);
+			appendStringInfo(&chkbuf, "SELECT 1 ORDER BY %s", options.orderby);
+#if PG_VERSION_NUM >= PG_VERSION_14
+			raw_parser(chkbuf.data, RAW_PARSE_DEFAULT);
+#else
+			raw_parser(chkbuf.data);
+#endif
+			pfree(chkbuf.data);
+		}
+
+		ereport(DEBUG1, (errmsg("setting orderby to %s",
+							options.orderby ? options.orderby : "(none)")));
+	}
+
 	RCSetOptions(relationId, &options);
 
 	table_close(rel, NoLock);
@@ -3649,6 +3851,13 @@ alter_rowcompress_table_reset(PG_FUNCTION_ARGS)
 		ereport(DEBUG1, (errmsg("resetting index_scan to false")));
 	}
 
+	/* orderby => true: reset to NULL (no sort) */
+	if (!PG_ARGISNULL(5) && PG_GETARG_BOOL(5))
+	{
+		options.orderby = NULL;
+		ereport(DEBUG1, (errmsg("resetting orderby to (none)")));
+	}
+
 	RCSetOptions(relationId, &options);
 
 	table_close(rel, NoLock);
@@ -3726,7 +3935,12 @@ rowcompress_repack(PG_FUNCTION_ARGS)
 	RCSetOptions(relationId, &options);
 
 	resetStringInfo(&buf);
-	appendStringInfo(&buf, "INSERT INTO %s SELECT * FROM %s", qualname, tmpname);
+	if (options.orderby != NULL && options.orderby[0] != '\0')
+		appendStringInfo(&buf,
+			"INSERT INTO %s SELECT * FROM %s ORDER BY %s",
+			qualname, tmpname, options.orderby);
+	else
+		appendStringInfo(&buf, "INSERT INTO %s SELECT * FROM %s", qualname, tmpname);
 	ret = SPI_execute(buf.data, false, 0);
 	if (ret != SPI_OK_INSERT)
 		ereport(ERROR, (errmsg("rowcompress_repack: INSERT failed (code %d)", ret)));
@@ -3742,8 +3956,161 @@ rowcompress_repack(PG_FUNCTION_ARGS)
 	SPI_finish();
 
 	ereport(NOTICE,
-			(errmsg("rowcompress_repack: " UINT64_FORMAT " rows rewritten into %s",
-					rowsRepacked, qualname)));
+			(errmsg("rowcompress_repack: " UINT64_FORMAT " rows rewritten into %s%s",
+					rowsRepacked, qualname,
+					(options.orderby && options.orderby[0]) ? " (globally sorted)" : "")));
+
+	PG_RETURN_VOID();
+}
+
+/* ================================================================
+ * SESSION-LOCAL SCAN STATISTICS
+ * ================================================================ */
+
+/*
+ * RCAccumulateScanStats — update the session-local stats hash for one scan.
+ * Called from rowcompress_endscan before the scan context is freed.
+ */
+static void
+RCAccumulateScanStats(Oid relid, int batchesTotal, int64 batchesPruned)
+{
+	bool found;
+
+	/* Lazy-init the hash and its memory context */
+	if (RCScanStatsHash == NULL)
+	{
+		HASHCTL hctl;
+
+		RCScanStatsCtx = AllocSetContextCreate(TopMemoryContext,
+											   "RowCompress ScanStats",
+											   ALLOCSET_SMALL_SIZES);
+		memset(&hctl, 0, sizeof(hctl));
+		hctl.keysize   = sizeof(Oid);
+		hctl.entrysize = sizeof(RCScanStatsEntry);
+		hctl.hcxt      = RCScanStatsCtx;
+		RCScanStatsHash = hash_create("RowCompress scan stats",
+									  64, &hctl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	RCScanStatsEntry *entry =
+		(RCScanStatsEntry *) hash_search(RCScanStatsHash, &relid, HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->totalScans    = 0;
+		entry->batchesTotal  = 0;
+		entry->batchesPruned = 0;
+	}
+	entry->totalScans    += 1;
+	entry->batchesTotal  += batchesTotal;
+	entry->batchesPruned += batchesPruned;
+}
+
+/*
+ * rowcompress_scan_stats — SRF returning session-local scan statistics.
+ *
+ * Columns: table_name text, total_scans bigint, batches_total bigint,
+ *          batches_scanned bigint, batches_pruned bigint, pruning_ratio float4
+ *
+ * Usage: SELECT * FROM engine.rowcompress_scan_stats();
+ */
+PG_FUNCTION_INFO_V1(rowcompress_scan_stats);
+Datum
+rowcompress_scan_stats(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	if (!rsinfo || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	rsinfo->returnMode = SFRM_Materialize;
+
+	MemoryContext oldctx =
+		MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+
+	TupleDesc tupdesc;
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR, (errmsg("rowcompress_scan_stats: unexpected return type")));
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	Tuplestorestate *tupstore =
+		tuplestore_begin_heap(false, false, work_mem);
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc   = tupdesc;
+
+	if (RCScanStatsHash != NULL)
+	{
+		HASH_SEQ_STATUS   seq;
+		RCScanStatsEntry *entry;
+
+		hash_seq_init(&seq, RCScanStatsHash);
+		while ((entry = (RCScanStatsEntry *) hash_seq_search(&seq)) != NULL)
+		{
+			char *relname = get_rel_name(entry->relid);
+			if (relname == NULL)
+				continue;  /* table was dropped — skip stale entry */
+
+			int64  batchesScanned = entry->batchesTotal - entry->batchesPruned;
+			float4 pruningRatio   = (entry->batchesTotal > 0)
+				? (float4) entry->batchesPruned / (float4) entry->batchesTotal
+				: 0.0f;
+
+			Datum  values[6];
+			bool   nulls[6] = {false, false, false, false, false, false};
+
+			values[0] = CStringGetTextDatum(relname);
+			values[1] = Int64GetDatum(entry->totalScans);
+			values[2] = Int64GetDatum(entry->batchesTotal);
+			values[3] = Int64GetDatum(batchesScanned);
+			values[4] = Int64GetDatum(entry->batchesPruned);
+			values[5] = Float4GetDatum(pruningRatio);
+
+			HeapTuple tup = heap_form_tuple(tupdesc, values, nulls);
+			tuplestore_puttuple(tupstore, tup);
+		}
+	}
+
+	MemoryContextSwitchTo(oldctx);
+
+	return (Datum) 0;
+}
+
+/*
+ * rowcompress_reset_scan_stats — reset session-local scan statistics.
+ *
+ * With table_name = NULL (default): clears stats for all tables.
+ * With table_name specified: clears stats for that table only.
+ *
+ * Usage:
+ *   SELECT engine.rowcompress_reset_scan_stats();
+ *   SELECT engine.rowcompress_reset_scan_stats('my_table'::regclass);
+ */
+PG_FUNCTION_INFO_V1(rowcompress_reset_scan_stats);
+Datum
+rowcompress_reset_scan_stats(PG_FUNCTION_ARGS)
+{
+	if (RCScanStatsHash == NULL)
+		PG_RETURN_VOID();
+
+	if (PG_ARGISNULL(0))
+	{
+		/* Reset all entries */
+		hash_destroy(RCScanStatsHash);
+		RCScanStatsHash = NULL;
+		if (RCScanStatsCtx != NULL)
+		{
+			MemoryContextDelete(RCScanStatsCtx);
+			RCScanStatsCtx = NULL;
+		}
+	}
+	else
+	{
+		/* Reset one table */
+		Oid relid = PG_GETARG_OID(0);
+		hash_search(RCScanStatsHash, &relid, HASH_REMOVE, NULL);
+	}
 
 	PG_RETURN_VOID();
 }

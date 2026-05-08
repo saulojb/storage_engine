@@ -1,5 +1,127 @@
 # CHANGELOG
 
+## 2.2.0
+
+### CREATE TABLE … WITH (options) syntax
+
+Both AMs now accept table options directly in `CREATE TABLE … WITH (…)`, matching
+the syntax of other storage engines:
+
+```sql
+CREATE TABLE events (
+    ts         timestamptz NOT NULL,
+    user_id    bigint,
+    event_type text,
+    value      float8
+) USING colcompress
+  WITH (compression = 'zstd', compression_level = 9, orderby = 'ts ASC');
+
+CREATE TABLE logs (
+    id         bigserial,
+    logged_at  timestamptz NOT NULL,
+    message    text
+) USING rowcompress
+  WITH (batch_size = 5000, compression = 'lz4');
+```
+
+Internally, `ColumnarProcessUtility` intercepts `CreateStmt`, strips the `WITH`
+list so PostgreSQL's reloption machinery does not reject unknown names, lets the
+standard utility create the table, then applies the options via the same code path
+used by `ALTER TABLE SET (…)`. All existing option names and validation rules are
+identical.
+
+### Storage Maintenance — Incremental Merge
+
+New procedures for targeted, low-lock defragmentation:
+
+* **`CALL engine.colcompress_merge_incremental(table, max_stripes => N)`** —
+  rewrites only stripes flagged as dirty (containing deleted rows) rather than the
+  entire table. Acquires `ShareUpdateExclusiveLock` (reads continue unblocked).
+  Fully-dead stripes are cleaned up immediately without rewriting.
+
+* **`CALL engine.rowcompress_merge_incremental(table, max_batches => N)`** —
+  same principle for `rowcompress` batches. Rewrites only batches with
+  `deleted_count > 0`.
+
+### Storage Health and Recommendation Views
+
+* **`engine.storage_health`** — unified view across all `colcompress` and
+  `rowcompress` tables in the database. Exposes `live_rows`, `dirty_units`,
+  `tombstone_rows`, `total_size`, and a `recommended_action` column
+  (`'ok'`, `'run_incremental_merge'`, `'run_full_repack'`). Stale OIDs
+  (tables dropped without `DROP EXTENSION`) are silently excluded via `JOIN
+  pg_class`.
+
+* **`engine.storage_maintenance_recommendation(table)`** — returns the same
+  fields as `storage_health` for a single table. Useful for diagnostic scripts.
+
+### Storage Maintenance Auto-Scheduler
+
+* **`CALL engine.storage_maintenance_auto(dry_run, max_tables, am_filter, p_verbose)`** —
+  iterates `engine.storage_health` and calls the appropriate incremental-merge
+  procedure for every table whose `recommended_action` is not `'ok'`. Can be
+  scheduled via `pg_cron`:
+
+  ```sql
+  SELECT cron.schedule('storage-maint', '*/5 * * * *',
+    $$CALL engine.storage_maintenance_auto(false, NULL, NULL, false)$$);
+  ```
+
+* **Storage maintenance Background Worker** — when `storage_engine` is in
+  `shared_preload_libraries`, a BGW periodically calls
+  `engine.storage_maintenance_auto()` on the configured database, without
+  requiring `pg_cron`. Three new GUCs (all `PGC_SIGHUP`):
+
+  | GUC | Default | Description |
+  |---|---|---|
+  | `storage_engine.maintenance_auto_enabled` | `off` | Master switch for the BGW |
+  | `storage_engine.maintenance_auto_naptime` | `300` (seconds) | Sleep interval between cycles (1–86400) |
+  | `storage_engine.maintenance_auto_database` | `''` | Target database name; empty = BGW is disabled |
+
+  Example `postgresql.conf`:
+  ```
+  shared_preload_libraries = 'storage_engine'
+  storage_engine.maintenance_auto_enabled  = on
+  storage_engine.maintenance_auto_database = 'mydb'
+  storage_engine.maintenance_auto_naptime  = 300
+  ```
+
+### Improved Catalog Views
+
+* **`engine.colcompress_stripes`** — adds `pruning_valid` (bool: whether
+  min/max statistics are still accurate) and `dirty_rows` (count of deleted
+  rows in the stripe), removing the need to manually cross-join `engine.stripe`.
+
+* **`engine.rowcompress_batches`** — adds `table_name`, `deleted_count`, and
+  `pruning_valid`; previously the view did not identify which table each batch
+  belonged to.
+
+### New Functions
+
+* **`engine.rowcompress_scan_stats()`** — session-scoped scan statistics for
+  `rowcompress` tables: batches read/skipped, decompressed bytes, cache hits.
+  Useful for diagnosing query efficiency without `EXPLAIN ANALYZE`.
+
+* **`CALL engine.smart_update(table, set_clause, where_clause, max_stripes)`** —
+  stripe-grouped bulk `UPDATE` for `colcompress` tables. Groups affected rows by
+  stripe, rewrites each stripe in one pass, and avoids the 1-row mini-stripe
+  fragmentation caused by naive `UPDATE … WHERE`.
+
+### Bug Fixes
+
+* **PG15/PG16 build fix** — `utils/snapmgr.h` was not transitively included on
+  PG15/PG16, causing compilation errors for `PushActiveSnapshot`,
+  `GetTransactionSnapshot`, and `PopActiveSnapshot` in
+  `engine_maintenance_bgw.c`. Fixed by adding an explicit include.
+
+### Documentation
+
+* Jekyll GitHub Pages site added under `docs/` (theme: `just-the-docs`).
+  Covers installation, colcompress, rowcompress, use-cases, benchmarks, and
+  SQL reference. Published at <https://saulojb.github.io/storage_engine>.
+
+---
+
 ## 2.1.0
 
 ---

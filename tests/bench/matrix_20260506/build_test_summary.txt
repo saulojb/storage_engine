@@ -1,0 +1,15 @@
+=== PG15 (port 5436) ===
+PG15: FAIL build (see /home/saulo/Projetos/storage_engine/dist/tests/bench/matrix_20260506/build_15.log)
+
+=== PG16 (port 5434) ===
+PG16: FAIL build (see /home/saulo/Projetos/storage_engine/dist/tests/bench/matrix_20260506/build_16.log)
+
+=== PG17 (port 5435) ===
+PG17: PASS   PG@5435: [32mALL 155 TESTS PASSED[0m
+
+=== PG18 (port 5432) ===
+PG18: PASS   PG@5432: [32mALL 155 TESTS PASSED[0m
+
+=== PG19 (port 5433) ===
+PG19: PASS   PG@5433: [32mALL 155 TESTS PASSED[0m
+
