@@ -3,7 +3,7 @@ description: High-performance columnar and row-compressed Table Access Methods f
 baseurl: "/storage_engine"
 url: "https://saulojb.github.io"
 
-remote_theme: just-the-docs/just-the-docs
+theme: just-the-docs
 
 # Theme options
 color_scheme: dark
@@ -44,7 +44,7 @@ callouts:
 # Plugins
 plugins:
   - jekyll-seo-tag
-  - jekyll-remote-theme
+  - jekyll-include-cache
 
 # Exclude from build
 exclude:
