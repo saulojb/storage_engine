@@ -5,9 +5,6 @@ url: "https://saulojb.github.io"
 
 theme: just-the-docs
 
-# Theme options
-color_scheme: dark
-
 # Navigation
 nav_sort: order
 
