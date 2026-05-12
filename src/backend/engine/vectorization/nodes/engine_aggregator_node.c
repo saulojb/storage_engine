@@ -283,6 +283,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/numeric.h"		/* numeric_add, NumericGetDatum */
 #if PG_VERSION_NUM < PG_VERSION_19
 #include "utils/dynahash.h"
 #endif
@@ -5656,7 +5657,6 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 {
 	VectorAggState *vas = (VectorAggState*) css;
 	CustomScan  *cscan = (CustomScan *)css->ss.ps.plan;
-	Agg	*aggNode = (Agg *)linitial(cscan->custom_plans);
 
 	/* Free the exprcontext */
 	ExecFreeExprContext(&css->ss.ps);
@@ -5665,16 +5665,215 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 	ExecClearTuple(css->ss.ps.ps_ResultTupleSlot);
 	ExecClearTuple(css->ss.ss_ScanTupleSlot);
 
+	/*
+	 * VECGAGG_SUM_EXPR mode: custom_plans is empty; VecExprNode data
+	 * is in custom_private.  Bypass ExecAgg entirely.
+	 */
+	if (cscan->custom_plans == NIL && cscan->custom_private != NIL)
+	{
+		ListCell   *lc = list_head(cscan->custom_private);
 
-	vas->aggstate = VExecInitAgg(aggNode, estate, eflags);
+#define READ_INT(dest) \
+	do { \
+		(dest) = DatumGetInt32(((Const *) lfirst(lc))->constvalue); \
+		lc = lnext(cscan->custom_private, lc); \
+	} while (0)
 
-	// HYDRA: add leftree to custom agg
-	outerPlanState(vas) = outerPlanState(vas->aggstate);
+		READ_INT(vas->vecExprNumNodes);
+		READ_INT(vas->vecExprRootIdx);
+		READ_INT(vas->vecExprColType);
+		{
+			int _res_typeoid;
+			READ_INT(_res_typeoid);
+			(void) _res_typeoid;  /* reserved for future use */
+		}
 
-	 /*Initialize result type and projection. */
-	ExecInitResultTypeTL(&vas->css.ss.ps);
+		for (int i = 0; i < vas->vecExprNumNodes; i++)
+		{
+			VecExprNode *n = &vas->vecExprNodes[i];
+			int tmp;
+			READ_INT(tmp); n->is_var   = (bool) tmp;
+			READ_INT(n->slot_idx);
+			READ_INT(n->col_type);
+			READ_INT(n->left);
+			READ_INT(n->right);
+			READ_INT(tmp); n->opfuncid = (Oid) tmp;
+			READ_INT(tmp); n->rettype  = (Oid) tmp;
 
-	vas->css.ss.ps.ps_ResultTupleSlot = vas->aggstate->ss.ps.ps_ResultTupleSlot;
+			n->const_val    = (Datum) 0;
+			n->const_isnull = true;
+
+			get_typlenbyval(n->rettype, &n->rettyplen, &n->retbyval);
+			if (!n->is_var && n->slot_idx != VECEXPR_CONST_SENTINEL &&
+				OidIsValid(n->opfuncid))
+				fmgr_info(n->opfuncid, &n->opfmgr);
+		}
+		/* Constant leaf nodes: count + Const* per VECEXPR_CONST_SENTINEL node */
+		{
+			int num_consts;
+			int ci = 0;
+			READ_INT(num_consts);
+			for (int i = 0;
+				 i < vas->vecExprNumNodes && ci < num_consts;
+				 i++)
+			{
+				VecExprNode *n = &vas->vecExprNodes[i];
+
+				if (n->slot_idx == VECEXPR_CONST_SENTINEL)
+				{
+					Const *c = (Const *) lfirst(lc);
+					lc = lnext(cscan->custom_private, lc);
+					n->const_isnull = c->constisnull;
+					if (!c->constisnull)
+						n->const_val = datumCopy(c->constvalue,
+												 n->retbyval, n->rettyplen);
+					ci++;
+				}
+			}
+		}
+#undef READ_INT
+
+		vas->vecExprActive = true;
+		vas->aggContext    = AllocSetContextCreate(CurrentMemoryContext,
+												  "VecSumExpr",
+												  ALLOCSET_DEFAULT_SIZES);
+		vas->sumFloat8     = 0.0;
+		vas->sumNumeric    = NULL;
+		vas->sumHasValue   = false;
+		vas->done          = false;
+
+		/* Initialize the child ColcompressScan */
+		outerPlanState(css) = ExecInitNode(outerPlan(cscan), estate, eflags);
+
+		/* Initialize result tuple slot */
+		ExecInitResultTypeTL(&vas->css.ss.ps);
+		return;
+	}
+
+	/* Standard VectorizedAgg path: ExecAgg wraps an Agg node */
+	{
+		Agg *aggNode = (Agg *) linitial(cscan->custom_plans);
+
+		vas->aggstate = VExecInitAgg(aggNode, estate, eflags);
+
+		/* HYDRA: add lefttree to custom agg */
+		outerPlanState(vas) = outerPlanState(vas->aggstate);
+
+		/* Initialize result type and projection. */
+		ExecInitResultTypeTL(&vas->css.ss.ps);
+
+		vas->css.ss.ps.ps_ResultTupleSlot = vas->aggstate->ss.ps.ps_ResultTupleSlot;
+	}
+}
+
+
+/*
+ * ExecVecSumExpr — evaluate a VecExprNode tree on each row of every batch
+ * from the child ColcompressScan and accumulate the result.
+ * Returns one result tuple, then NULL on subsequent calls.
+ *
+ * Memory safety: eval_vec_expr_node calls operator functions (e.g. numeric_add,
+ * int4_numeric) that allocate varlena Datums.  Without a temporary context these
+ * intermediates would accumulate in the caller's long-lived memory context and
+ * exhaust memory for large tables.  We evaluate each row inside a small
+ * per-row context (expr_ctx) that is reset after each row; for pass-by-ref
+ * (numeric) results we copy the datum into aggContext before the reset.
+ */
+static TupleTableSlot *
+ExecVecSumExpr(VectorAggState *vas)
+{
+	CustomScanState *css = &vas->css;
+	TupleTableSlot  *result = css->ss.ps.ps_ResultTupleSlot;
+
+	if (vas->done)
+		return ExecClearTuple(result);
+
+	/*
+	 * Temporary context for expression evaluation intermediates.
+	 * Reset after each row so varlena allocations from FunctionCall* inside
+	 * eval_vec_expr_node don't accumulate in the outer memory context.
+	 */
+	MemoryContext expr_ctx = AllocSetContextCreate(vas->aggContext,
+												   "VecSumExprRow",
+												   ALLOCSET_SMALL_SIZES);
+	MemoryContext outer_ctx = CurrentMemoryContext;
+
+	/* Pull all batches from the child scan */
+	for (;;)
+	{
+		TupleTableSlot *outerslot = ExecProcNode(outerPlanState(css));
+
+		if (TupIsNull(outerslot))
+			break;
+
+		{
+			VectorTupleTableSlot *vtts = (VectorTupleTableSlot *) outerslot;
+			int row_i;
+
+			for (row_i = 0; row_i < vtts->dimension; row_i++)
+			{
+				bool   isnull;
+				Datum  val;
+
+				/*
+				 * Evaluate the expression inside expr_ctx so that any varlena
+				 * allocations made by intermediate function calls (casts, ops)
+				 * are confined to expr_ctx and freed at MemoryContextReset.
+				 */
+				MemoryContextReset(expr_ctx);
+				MemoryContextSwitchTo(expr_ctx);
+				val = eval_vec_expr_node(vas->vecExprNodes,
+										 &vas->vecExprNodes[vas->vecExprRootIdx],
+										 outerslot, row_i, &isnull);
+				MemoryContextSwitchTo(outer_ctx);
+
+				if (!isnull)
+				{
+					if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC)
+					{
+						/*
+						 * val points into expr_ctx.  Copy it into aggContext
+						 * before expr_ctx is reset on the next iteration.
+						 */
+						MemoryContext oldctx = MemoryContextSwitchTo(vas->aggContext);
+						Datum val_copy = datumCopy(val, false, -1);
+						if (vas->sumNumeric == NULL)
+							vas->sumNumeric = DatumGetNumeric(val_copy);
+						else
+							vas->sumNumeric = DatumGetNumeric(
+								DirectFunctionCall2(numeric_add,
+													NumericGetDatum(vas->sumNumeric),
+													val_copy));
+						MemoryContextSwitchTo(oldctx);
+					}
+					else
+					{
+						/* float8/int expressions: by-value Datum, no allocation */
+						vas->sumFloat8 += DatumGetFloat8(val);
+					}
+					vas->sumHasValue = true;
+				}
+			}
+		}
+	}
+
+	MemoryContextDelete(expr_ctx);
+
+	vas->done = true;
+
+	/* Emit single result tuple */
+	ExecClearTuple(result);
+	result->tts_isnull[0] = !vas->sumHasValue;
+	if (vas->sumHasValue)
+	{
+		if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC)
+			result->tts_values[0] = NumericGetDatum(vas->sumNumeric);
+		else
+			result->tts_values[0] = Float8GetDatum(vas->sumFloat8);
+	}
+	else
+		result->tts_values[0] = (Datum) 0;
+	return ExecStoreVirtualTuple(result);
 }
 
 
@@ -5682,6 +5881,10 @@ static TupleTableSlot *
 ExecVectorAgg(CustomScanState *node)
 {
 	VectorAggState *vas = (VectorAggState *) node;
+
+	if (vas->vecExprActive)
+		return ExecVecSumExpr(vas);
+
 	return ExecAgg((PlanState *)vas);
 }
 
@@ -5689,14 +5892,29 @@ ExecVectorAgg(CustomScanState *node)
 static void
 EndVectorAgg(CustomScanState *node)
 {
-	ExecEndAgg(((VectorAggState *)node)->aggstate);
+	VectorAggState *vas = (VectorAggState *) node;
+
+	if (vas->vecExprActive)
+	{
+		ExecEndNode(outerPlanState(node));
+		if (vas->aggContext)
+			MemoryContextDelete(vas->aggContext);
+		return;
+	}
+
+	ExecEndAgg(vas->aggstate);
 }
 
 
 static void
 ExplainAggNode(CustomScanState *node, List *ancestors, ExplainState *es)
 {
-	ExplainPropertyText("Engine Vectorized Aggregate", "enabled", es);
+	VectorAggState *vas = (VectorAggState *) node;
+
+	if (vas->vecExprActive)
+		ExplainPropertyText("Engine Vectorized Aggregate", "expr_sum", es);
+	else
+		ExplainPropertyText("Engine Vectorized Aggregate", "enabled", es);
 }
 
 

@@ -885,14 +885,58 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 		}
 	}
 
+	if (IsA(expr, Const))
+	{
+		Const	   *c = (Const *) expr;
+		int			col_type;
+
+		col_type = TypeOidToVecGaggType(c->consttype);
+		if (col_type < 0)
+			return -1;
+
+		if (*num_nodes >= max_nodes)
+			return -1;
+
+		{
+			int			idx = (*num_nodes)++;
+			VecExprNode *n  = &nodes[idx];
+
+			n->is_var   = true;
+			n->slot_idx = VECEXPR_CONST_SENTINEL;
+			n->col_type = col_type;
+			n->left     = -1;
+			n->right    = -1;
+			n->opfuncid = InvalidOid;
+			n->rettype  = c->consttype;
+			return idx;
+		}
+	}
+
 	if (IsA(expr, FuncExpr))
 	{
 		FuncExpr   *f = (FuncExpr *) expr;
 		int			ret_type;
 		int			child_idx;
+		int			nargs = list_length(f->args);
 
-		if (list_length(f->args) != 1)
+		/*
+		 * Multi-arg functions (e.g. numeric(col, typmod, false)) are typmod-only
+		 * casts when all args after the first are Consts.  Treat as passthrough:
+		 * opfuncid=InvalidOid; eval_vec_expr_node returns child value unchanged.
+		 */
+		if (nargs < 1)
 			return -1;
+		if (nargs > 1)
+		{
+			ListCell *tlc;
+			int       ti = 0;
+			foreach(tlc, f->args)
+			{
+				if (ti > 0 && !IsA(lfirst(tlc), Const))
+					return -1;
+				ti++;
+			}
+		}
 
 		ret_type = TypeOidToVecGaggType(f->funcresulttype);
 		if (ret_type < 0)
@@ -915,7 +959,8 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 			n->col_type = ret_type;
 			n->left     = child_idx;
 			n->right    = -1;		/* unary */
-			n->opfuncid = f->funcid;
+			/* passthrough for multi-arg typmod casts (opfuncid=InvalidOid) */
+			n->opfuncid = (nargs == 1) ? f->funcid : InvalidOid;
 			n->rettype  = f->funcresulttype;
 			return idx;
 		}
@@ -1345,6 +1390,172 @@ PlanTreeMutator(Plan *node, void *context)
 					if (PlanHasMixedNumericMoneyAggrefs((Plan *) aggNode))
 						break;
 
+					/*
+					 * VECGAGG_SUM_EXPR: SUM of an arithmetic expression.
+					 * Bypass ExecAgg entirely — ExecVecSumExpr evaluates the
+					 * expression tree per row via eval_vec_expr_node.
+					 * The node is created with custom_plans=NIL so that
+					 * BeginVectorAgg detects this mode at execution time.
+					 */
+					{
+						TargetEntry *_te1 = NULL;
+						Aggref      *_sum_agg = NULL;
+						int          _kind = -1;
+						AttrNumber   _cv = 0;
+						Oid          _ct = InvalidOid;
+						bool         _af8;
+						VecExprNode  _expr_nodes[VECGAGG_EXPR_MAX_NODES];
+						int          _expr_num  = 0;
+						int          _expr_root = -1;
+
+						if (list_length(aggNode->plan.targetlist) == 1)
+						{
+							_te1 = (TargetEntry *) linitial(aggNode->plan.targetlist);
+							if (_te1 != NULL && !_te1->resjunk)
+								ExtractTargetAggref((Node *) _te1->expr, &_sum_agg);
+						}
+
+						if (_sum_agg != NULL &&
+							ClassifyAggref(_sum_agg, aggNode->plan.lefttree,
+										   &_kind, &_cv, &_ct, &_af8,
+										   NULL, NULL, NULL, NULL,
+										   _expr_nodes, &_expr_num, &_expr_root) &&
+							_kind == VECGAGG_SUM_EXPR && _expr_root >= 0)
+						{
+							int _col_type_expr = TypeOidToVecGaggType(_ct);
+
+							/*
+							 * AGGSPLIT safety gate:
+							 *   FLOAT8  — safe in SIMPLE and INITIAL_SERIAL
+							 *   NUMERIC — only safe in SIMPLE (transtype=internal);
+							 *             in INITIAL_SERIAL the worker must emit
+							 *             numeric_serialize bytea — fall back to
+							 *             standard PG (not standard VectorAgg which
+							 *             also can't handle arithmetic expressions).
+							 */
+							if ((_col_type_expr == VECGAGG_TYPE_FLOAT8 &&
+								 (aggNode->aggsplit == AGGSPLIT_SIMPLE ||
+								  aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL)) ||
+								(_col_type_expr == VECGAGG_TYPE_NUMERIC &&
+								 aggNode->aggsplit == AGGSPLIT_SIMPLE))
+							{
+								CustomScan *_exprNode = engine_create_aggregator_node();
+								List       *_priv     = NIL;
+								int         _nconst   = 0;
+
+#define _APPEND_INT(val) \
+	do { \
+		Const *_pc = makeNode(Const); \
+		_pc->consttype   = INT4OID; \
+		_pc->constlen    = sizeof(int32); \
+		_pc->constvalue  = Int32GetDatum((int32)(val)); \
+		_pc->constbyval  = true; \
+		_pc->constisnull = false; \
+		_priv = lappend(_priv, _pc); \
+	} while (0)
+
+								_APPEND_INT(_expr_num);
+								_APPEND_INT(_expr_root);
+								_APPEND_INT(_col_type_expr);
+								_APPEND_INT((int) _ct); /* res_typeoid, reserved */
+
+								for (int _ni = 0; _ni < _expr_num; _ni++)
+								{
+									VecExprNode *_n = &_expr_nodes[_ni];
+									_APPEND_INT((int) _n->is_var);
+									_APPEND_INT(_n->slot_idx);
+									_APPEND_INT(_n->col_type);
+									_APPEND_INT(_n->left);
+									_APPEND_INT(_n->right);
+									_APPEND_INT((int) _n->opfuncid);
+									_APPEND_INT((int) _n->rettype);
+									if (_n->slot_idx == VECEXPR_CONST_SENTINEL)
+										_nconst++;
+								}
+								_APPEND_INT(_nconst);
+
+								/*
+								 * Append the actual Const* nodes for each
+								 * VECEXPR_CONST_SENTINEL leaf (in node-index order).
+								 * BeginVectorAgg reads them back to fill const_val.
+								 */
+								{
+									TargetEntry *_arg_te =
+										(TargetEntry *) linitial(_sum_agg->args);
+									Node *_arg_expr = (Node *) _arg_te->expr;
+
+									/*
+									 * Walk the expr in the same traversal order
+									 * as ExtractArithExprNode to collect Consts.
+									 */
+									Const *_const_buf[VECGAGG_EXPR_MAX_NODES];
+									int    _nc = 0;
+
+									struct { Node *e; } _stk[VECGAGG_EXPR_MAX_NODES * 2];
+									int _stk_top = 0;
+									_stk[_stk_top++].e = _arg_expr;
+									while (_stk_top > 0 && _nc < VECGAGG_EXPR_MAX_NODES)
+									{
+										Node *_e = _stk[--_stk_top].e;
+										while (_e && IsA(_e, RelabelType))
+											_e = (Node *)((RelabelType *)_e)->arg;
+										if (_e == NULL) continue;
+										if (IsA(_e, Const))
+											_const_buf[_nc++] = (Const *) _e;
+										else if (IsA(_e, OpExpr))
+										{
+											OpExpr *_op = (OpExpr *) _e;
+											/* Push right first so left is processed first */
+											if (list_length(_op->args) >= 2)
+												_stk[_stk_top++].e = (Node *) lsecond(_op->args);
+											_stk[_stk_top++].e = (Node *) linitial(_op->args);
+										}
+										else if (IsA(_e, FuncExpr))
+											_stk[_stk_top++].e = (Node *) linitial(((FuncExpr *)_e)->args);
+										/* Var nodes: skip */
+									}
+
+									for (int _ci = 0; _ci < _nc; _ci++)
+										_priv = lappend(_priv, _const_buf[_ci]);
+								}
+
+#undef _APPEND_INT
+
+								_exprNode->custom_private = _priv;
+								/* custom_plans = NIL — VECGAGG_SUM_EXPR mode */
+
+								Plan *_exprPlan = (Plan *) _exprNode;
+								_exprNode->scan.plan.targetlist =
+									CustomBuildTargetList(aggNode->plan.targetlist, INDEX_VAR);
+								_exprNode->custom_scan_tlist = aggNode->plan.targetlist;
+								_exprPlan->startup_cost = aggNode->plan.startup_cost;
+								_exprPlan->total_cost   = aggNode->plan.total_cost;
+								_exprPlan->plan_rows    = aggNode->plan.plan_rows;
+								_exprPlan->plan_width   = aggNode->plan.plan_width;
+								_exprPlan->parallel_aware =
+									aggNode->plan.lefttree->parallel_aware;
+
+								planTreeContext->vectorizedAggregation = true;
+								planTreeContext->vectorizedAggStarOnly  = false;
+
+								node->lefttree = PlanTreeMutator(node->lefttree, context);
+								_exprPlan->lefttree = node->lefttree;
+
+								return (Plan *) _exprNode;
+							}
+							else
+							{
+								/*
+								 * Expression is VECGAGG_SUM_EXPR but AGGSPLIT gate
+								 * blocked it (e.g. NUMERIC in AGGSPLIT_INITIAL_SERIAL).
+								 * Standard VectorAgg cannot handle arithmetic expressions
+								 * on VectorTupleTableSlot either — fall back to PG.
+								 */
+								break;
+							}
+						}
+					}
+
 					vectorizedAggNode = engine_create_aggregator_node();
 
 					FLATCOPY(newAgg, aggNode, Agg);
@@ -1387,8 +1598,8 @@ PlanTreeMutator(Plan *node, void *context)
 					planTreeContext->vectorizedAggregation = true;
 					planTreeContext->vectorizedAggStarOnly = PlanAllAggrefsAreStar((Plan *) newAgg);
 
-					PlanTreeMutator(node->lefttree, context);
-					PlanTreeMutator(node->righttree, context);
+					node->lefttree  = PlanTreeMutator(node->lefttree, context);
+					node->righttree = PlanTreeMutator(node->righttree, context);
 					planTreeContext->vectorizedAggStarOnly = oldVectorizedAggStarOnly;
 
 					vectorizedAggNode->scan.plan.lefttree = node->lefttree;

@@ -59,8 +59,8 @@ static void   EndVecGroupAgg(CustomScanState *node);
 static void   ReScanVecGroupAgg(CustomScanState *node);
 static void   ExplainVecGroupAgg(CustomScanState *node, List *ancestors,
 								 ExplainState *es);
-static Datum  eval_vec_expr_node(VecExprNode *nodes, VecExprNode *cur,
-								  TupleTableSlot *batch_slot, int row_i, bool *isnull);
+Datum  eval_vec_expr_node(VecExprNode *nodes, VecExprNode *cur,
+						  TupleTableSlot *batch_slot, int row_i, bool *isnull);
 
 static CustomScanMethods VecGroupAggScanMethods = {
 	"StorageEngineVectorGroupAgg",
@@ -448,12 +448,19 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
  * Returns the result Datum and sets *isnull.  Any NULL input propagates
  * as NULL output (SQL 3-valued logic).
  */
-static Datum
+Datum
 eval_vec_expr_node(VecExprNode *nodes, VecExprNode *cur,
 				   TupleTableSlot *batch_slot, int row_i, bool *isnull)
 {
 	if (cur->is_var)
 	{
+		/* Constant leaf (Const node in expression, value set at Begin time) */
+		if (cur->slot_idx == VECEXPR_CONST_SENTINEL)
+		{
+			*isnull = cur->const_isnull;
+			return cur->const_val;
+		}
+
 		VectorColumn *col = (VectorColumn *) batch_slot->tts_values[cur->slot_idx];
 
 		if (col == NULL)
@@ -502,8 +509,10 @@ eval_vec_expr_node(VecExprNode *nodes, VecExprNode *cur,
 		}
 		else
 		{
-			/* Unary operator (type cast) */
+			/* Unary operator (type cast) — passthrough when opfuncid=InvalidOid */
 			*isnull = false;
+			if (!OidIsValid(cur->opfuncid))
+				return lval;
 			return FunctionCall1(&cur->opfmgr, lval);
 		}
 	}

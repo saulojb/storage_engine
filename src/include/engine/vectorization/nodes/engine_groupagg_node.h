@@ -57,21 +57,30 @@
  */
 #define VECGAGG_EXPR_MAX_NODES 12
 
+/*
+ * Special slot_idx value for constant leaf nodes in VecExprNode.
+ * The constant value is stored in const_val / const_isnull at runtime.
+ */
+#define VECEXPR_CONST_SENTINEL (-2)
+
 typedef struct VecExprNode
 {
 	bool	is_var;		/* true = Var leaf, false = operator */
 	/* Var leaf */
-	int		slot_idx;	/* 0-based batch slot index (-1 for op nodes) */
+	int		slot_idx;	/* 0-based batch slot index; VECEXPR_CONST_SENTINEL for Const */
 	int		col_type;	/* VECGAGG_TYPE_* of this node's result */
 	/* Operator node */
 	int		left;		/* index of left child (-1 for Var nodes) */
 	int		right;		/* index of right child (-1 for Var/unary nodes) */
-	Oid		opfuncid;	/* C function OID for the operator (0 for Var) */
+	Oid		opfuncid;	/* C function OID for the operator (InvalidOid = passthrough) */
 	Oid		rettype;	/* return type OID of this node */
 	/* Runtime only (loaded in BeginVecGroupAgg, not serialized) */
 	FmgrInfo opfmgr;	/* pre-loaded operator function info */
 	bool	retbyval;
 	int16	rettyplen;
+	/* Constant leaf: value loaded at runtime from serialized Const node */
+	Datum	const_val;
+	bool	const_isnull;
 } VecExprNode;
 
 /*
@@ -198,6 +207,8 @@ typedef struct VecGroupAggState
 
 	/* Memory context for accumulator data */
 	MemoryContext		agg_context;
+	/* Short-lived context for expression evaluation intermediates (per-row reset) */
+	MemoryContext		expr_eval_ctx;
 	ExprContext			numeric_fake_aggexpr;
 	AggState			numeric_fake_aggstate;
 
@@ -229,5 +240,8 @@ extern CustomScan *engine_create_groupagg_node(int num_keys,
 extern bool engine_is_groupagg_node(Plan *plan);
 extern void engine_groupagg_enable_sort_output(CustomScan *cscan);
 extern void engine_register_groupagg_node(void);
+extern Datum eval_vec_expr_node(VecExprNode *nodes, VecExprNode *cur,
+								TupleTableSlot *batch_slot, int row_i,
+								bool *isnull);
 
 #endif /* ENGINE_GROUPAGG_NODE_H */
