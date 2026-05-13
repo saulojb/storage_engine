@@ -1407,26 +1407,49 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 				/*
 				 * Plain sum(col): ClassifyAggref set *out_col_varattno = dummy
 				 * (the scan-level attno).  Convert to slot index.
-				 *
-				 * NOTE: NUMERIC SUM_COL in AGGSPLIT_INITIAL_SERIAL is not
-				 * supported: the partial-state for parallel numeric sum is an
-				 * internal NumericAggState (serialized as bytea), not a raw
-				 * Numeric.  Reject here; the gate falls back to standard PG.
 				 */
 				if (dummy == 0)
 					return -1;
 				int cvt = TypeOidToVecGaggType(ct);
 				if (cvt < 0)
 					return -1;
-				if (cvt == VECGAGG_TYPE_NUMERIC &&
-					aggsplit == AGGSPLIT_INITIAL_SERIAL)
-					return -1;
 				int col_slot = VarAttnoToSlotIdx(child_plan, dummy);
 				if (col_slot < 0)
 					return -1;
-				mt_kind[slot_idx]          = VMSEXPR_SUM_COL;
-				mt_col_type[slot_idx]      = cvt;
-				mt_sum_col_slot[slot_idx]  = col_slot;
+
+				if (cvt == VECGAGG_TYPE_NUMERIC &&
+					aggsplit == AGGSPLIT_INITIAL_SERIAL)
+				{
+					/*
+					 * NUMERIC SUM_COL in the parallel worker (INITIAL_SERIAL):
+					 * the partial-state protocol requires numeric_avg_accum +
+					 * numeric_serialize, which the VMSEXPR_SUM_EXPR path already
+					 * handles correctly.  Downgrade to VMSEXPR_SUM_EXPR with a
+					 * single Var-leaf expression node pointing at the column slot.
+					 */
+					if (mt_expr_num[slot_idx] != 0)
+						return -1;
+					VecExprNode *vn = &mt_nodes[slot_idx][0];
+					memset(vn, 0, sizeof(*vn));
+					vn->is_var       = true;
+					vn->slot_idx     = col_slot;
+					vn->col_type     = VECGAGG_TYPE_NUMERIC;
+					vn->left         = -1;
+					vn->right        = -1;
+					vn->opfuncid     = InvalidOid;
+					vn->rettype      = NUMERICOID;
+					vn->const_isnull = true;
+					mt_kind[slot_idx]      = VMSEXPR_SUM_EXPR;
+					mt_col_type[slot_idx]  = VECGAGG_TYPE_NUMERIC;
+					mt_expr_num[slot_idx]  = 1;
+					mt_expr_root[slot_idx] = 0;
+				}
+				else
+				{
+					mt_kind[slot_idx]         = VMSEXPR_SUM_COL;
+					mt_col_type[slot_idx]     = cvt;
+					mt_sum_col_slot[slot_idx] = col_slot;
+				}
 			}
 			else
 				return -1;	/* unsupported Aggref kind */
