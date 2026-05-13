@@ -2,66 +2,6 @@
 
 ## 2.3.0
 
-### chcompress Table AM (experimental)
-
-`chcompress` is a new experimental Table Access Method backed by the embedded
-[chDB](https://github.com/chdb-io/chdb) ClickHouse engine, loaded at runtime via
-`dlopen`.  The AM is fully registered alongside `colcompress` and `rowcompress` and
-can be used with standard DDL:
-
-```sql
-CREATE TABLE events_ch (
-    ts         timestamptz NOT NULL,
-    user_id    bigint,
-    amount     numeric(15,4)
-) USING chcompress;
-
-INSERT INTO events_ch SELECT * FROM events_col;
-```
-
-The `chcompress` scan path emits a controlled `FEATURE_NOT_SUPPORTED` error while
-full ClickHouse query routing is under development; all write paths and DDL work
-correctly.
-
-Key implementation details:
-
-* **Lazy chDB initialisation** — `relation_set_new_filelocator` is a no-op;
-  `se_chdb_ensure_table()` is called from the first INSERT callback.  This prevents
-  the C++ global-state crash (SIGABRT) that occurred when chDB was initialised inside
-  a freshly forked PostgreSQL worker during `CREATE TABLE`.
-
-* **Static `TableAmRoutine`** — the handler returns a pointer to a `static const
-  TableAmRoutine chcompress_methods` structure in the `.data` segment rather than
-  using `makeNode()`.  This prevents a SIGSEGV that occurred when chDB's C++ allocator
-  reused the freed `CacheMemoryContext` block that had held the `makeNode()`-allocated
-  struct, overwriting the function-pointer table with `.dynamic` section data from
-  `librt.so.1`.
-
-* **Non-streaming scan** — the scan callback uses `se_chdb_query()` to fetch the
-  full result in one call.  The streaming multi-chunk API caused SIGABRT with tables
-  larger than ~100 rows due to a misuse of the chDB streaming API; streaming
-  optimisation is deferred to a later release.
-
-* **Signal handler isolation** — chDB installs its own signal handlers on init;
-  `chdb_set_signal_handlers_enabled(false)` is called after every chDB operation
-  to restore PostgreSQL's signal environment.
-
-* **PG15–PG19 compatibility** — all `TableAmRoutine` callbacks in
-  `chcompress_tableam.c` carry version guards covering 13 separate API changes
-  across PostgreSQL 15–19:
-  - `tuple_insert` / `multi_insert`: `uint32 options` + `BulkInsertStateData *` (PG19)
-  - `tuple_delete`: `changingPart` parameter removed (PG19)
-  - `tuple_update`: three-way split (PG15 `bool *`, PG16–18 `TU_UpdateIndexes *`, PG19 `uint32 options`)
-  - `relation_vacuum`: `const VacuumParams *` (PG19)
-  - `relation_set_new_filelocator` / `relation_copy_data`: `RelFileLocator` (PG16+) vs `RelFileNode` (PG15)
-  - `relation_copy_for_cluster`: `Snapshot snapshot` parameter (PG19)
-  - `scan_analyze_next_block`: `ReadStream *` (PG17+) vs `BlockNumber + BufferAccessStrategy` (PG15–16)
-  - `scan_analyze_next_tuple`: `OldestXmin` removed (PG19)
-  - Bitmap scan: `scan_bitmap_next_block` + `scan_bitmap_next_tuple(scan, TBMIterateResult*, slot)` on PG15–17; single `scan_bitmap_next_tuple(scan, slot, *recheck, *lossy_pages, *exact_pages)` on PG18+
-  - `index_fetch_begin`: `uint32 flags` (PG19)
-
----
-
 ### VecAgg — `sum(expression)` vectorization (`VECGAGG_SUM_EXPR`)
 
 `StorageEngineVectorAgg` can now vectorize simple arithmetic expressions inside
