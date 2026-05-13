@@ -21,6 +21,8 @@
 #include "postgres.h"
 
 #include <dlfcn.h>
+
+#include "pg_version_constants.h"
 #include <sys/stat.h>
 
 #include "access/heapam.h"
@@ -493,9 +495,15 @@ se_chdb_ensure_table(Relation rel)
  * INSERT
  * ----------------------------------------------------------------------- */
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+static void
+chcompress_tuple_insert(Relation relation, TupleTableSlot *slot,
+						CommandId cid, uint32 options, BulkInsertStateData *bistate)
+#else
 static void
 chcompress_tuple_insert(Relation relation, TupleTableSlot *slot,
 						CommandId cid, int options, BulkInsertState bistate)
+#endif
 {
 	se_chdb_ensure_table(relation);
 	ExecMaterializeSlot(slot);
@@ -509,9 +517,15 @@ chcompress_tuple_insert(Relation relation, TupleTableSlot *slot,
 	slot->tts_tid = (ItemPointerData){ .ip_blkid = {0xff, 0xff}, .ip_posid = 1 };
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+static void
+chcompress_multi_insert(Relation relation, TupleTableSlot **slots, int nslots,
+						CommandId cid, uint32 options, BulkInsertStateData *bistate)
+#else
 static void
 chcompress_multi_insert(Relation relation, TupleTableSlot **slots, int nslots,
 						CommandId cid, int options, BulkInsertState bistate)
+#endif
 {
 	if (nslots == 0)
 		return;
@@ -714,21 +728,42 @@ chcompress_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
  * DML stubs
  * ----------------------------------------------------------------------- */
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+static TM_Result
+chcompress_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
+						uint32 options, Snapshot snapshot, Snapshot crosscheck,
+						bool wait, TM_FailureData *tmfd)
+#else
 static TM_Result
 chcompress_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 						Snapshot snapshot, Snapshot crosscheck, bool wait,
 						TM_FailureData *tmfd, bool changingPart)
+#endif
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("chcompress: DELETE is not supported"),
 					errhint("Use CollapsingMergeTree engine with a sign column.")));
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+static TM_Result
+chcompress_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
+						CommandId cid, uint32 options, Snapshot snapshot,
+						Snapshot crosscheck, bool wait, TM_FailureData *tmfd,
+						LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
+#elif PG_VERSION_NUM >= PG_VERSION_16
 static TM_Result
 chcompress_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 						CommandId cid, Snapshot snapshot, Snapshot crosscheck,
 						bool wait, TM_FailureData *tmfd,
 						LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
+#else
+static TM_Result
+chcompress_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
+						CommandId cid, Snapshot snapshot, Snapshot crosscheck,
+						bool wait, TM_FailureData *tmfd,
+						LockTupleMode *lockmode, bool *update_indexes)
+#endif
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("chcompress: UPDATE is not supported"),
@@ -749,9 +784,15 @@ chcompress_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
  * VACUUM
  * ----------------------------------------------------------------------- */
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+static void
+chcompress_relation_vacuum(Relation rel, const VacuumParams *params,
+						   BufferAccessStrategy bstrategy)
+#else
 static void
 chcompress_relation_vacuum(Relation rel, struct VacuumParams *params,
 						   BufferAccessStrategy bstrategy)
+#endif
 {
 	char *ch_table = se_chdb_ch_table_name(RelationGetRelid(rel));
 	char *sql = psprintf("OPTIMIZE TABLE %s FINAL", ch_table);
@@ -764,12 +805,21 @@ chcompress_relation_vacuum(Relation rel, struct VacuumParams *params,
  * DDL callbacks
  * ----------------------------------------------------------------------- */
 
+#if PG_VERSION_NUM >= PG_VERSION_16
 static void
 chcompress_relation_set_new_filelocator(Relation rel,
 										const RelFileLocator *newrlocator,
 										char persistence,
 										TransactionId *freezeXid,
 										MultiXactId *minmulti)
+#else
+static void
+chcompress_relation_set_new_filenode(Relation rel,
+									 const RelFileNode *newrnode,
+									 char persistence,
+									 TransactionId *freezeXid,
+									 MultiXactId *minmulti)
+#endif
 {
 	/*
 	 * We intentionally do NOT create the ClickHouse table here.  Loading
@@ -792,9 +842,26 @@ chcompress_relation_nontransactional_truncate(Relation rel)
 	se_chdb_truncate_table(RelationGetRelid(rel));
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_16
 static void
 chcompress_relation_copy_data(Relation rel, const RelFileLocator *newrlocator) { }
+#else
+static void
+chcompress_relation_copy_data(Relation rel, const RelFileNode *newrnode) { }
+#endif
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+static void
+chcompress_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
+									 Relation OldIndex, bool use_sort,
+									 TransactionId OldestXmin,
+									 Snapshot snapshot,
+									 TransactionId *xid_cutoff,
+									 MultiXactId *multi_cutoff,
+									 double *num_tuples,
+									 double *tups_vacuumed,
+									 double *tups_recently_dead)
+#else
 static void
 chcompress_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 									 Relation OldIndex, bool use_sort,
@@ -804,6 +871,7 @@ chcompress_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 									 double *num_tuples,
 									 double *tups_vacuumed,
 									 double *tups_recently_dead)
+#endif
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("chcompress: CLUSTER is not supported")));
@@ -885,20 +953,46 @@ chcompress_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
  * Analyze
  * ----------------------------------------------------------------------- */
 
+#if PG_VERSION_NUM >= PG_VERSION_17
 static bool
 chcompress_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
 { return false; }
+#else
+static bool
+chcompress_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
+								   BufferAccessStrategy bstrategy)
+{ return false; }
+#endif
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+static bool
+chcompress_scan_analyze_next_tuple(TableScanDesc scan,
+								   double *liverows, double *deadrows,
+								   TupleTableSlot *slot)
+{ return false; }
+#else
 static bool
 chcompress_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 								   double *liverows, double *deadrows,
 								   TupleTableSlot *slot)
 { return false; }
+#endif
 
 /* -----------------------------------------------------------------------
  * Bitmap scan (PG18 API)
  * ----------------------------------------------------------------------- */
 
+#if PG_VERSION_NUM < PG_VERSION_18
+static bool
+chcompress_scan_bitmap_next_block(TableScanDesc scan,
+								  struct TBMIterateResult *tbmres)
+{ return false; }
+static bool
+chcompress_scan_bitmap_next_tuple(TableScanDesc scan,
+								  struct TBMIterateResult *tbmres,
+								  TupleTableSlot *slot)
+{ return false; }
+#else
 static bool
 chcompress_scan_bitmap_next_tuple(TableScanDesc scan,
 								  TupleTableSlot *slot,
@@ -906,6 +1000,7 @@ chcompress_scan_bitmap_next_tuple(TableScanDesc scan,
 								  uint64 *lossy_pages,
 								  uint64 *exact_pages)
 { return false; }
+#endif
 
 /* -----------------------------------------------------------------------
  * Sample scan
@@ -940,8 +1035,13 @@ chcompress_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
  * Index (not supported)
  * ----------------------------------------------------------------------- */
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+static IndexFetchTableData *
+chcompress_index_fetch_begin(Relation rel, uint32 flags)
+#else
 static IndexFetchTableData *
 chcompress_index_fetch_begin(Relation rel)
+#endif
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("chcompress: index scan not supported")));
@@ -1027,13 +1127,20 @@ chcompress_handler(PG_FUNCTION_ARGS)
 	amroutine->tuple_satisfies_snapshot           = chcompress_tuple_satisfies_snapshot;
 	amroutine->index_delete_tuples                = chcompress_index_delete_tuples;
 
+#if PG_VERSION_NUM >= PG_VERSION_16
 	amroutine->relation_set_new_filelocator       = chcompress_relation_set_new_filelocator;
+#else
+	amroutine->relation_set_new_filenode          = chcompress_relation_set_new_filenode;
+#endif
 	amroutine->relation_nontransactional_truncate = chcompress_relation_nontransactional_truncate;
 	amroutine->relation_copy_data                 = chcompress_relation_copy_data;
 	amroutine->relation_copy_for_cluster          = chcompress_relation_copy_for_cluster;
 	amroutine->relation_vacuum                    = chcompress_relation_vacuum;
 	amroutine->scan_analyze_next_block            = chcompress_scan_analyze_next_block;
 	amroutine->scan_analyze_next_tuple            = chcompress_scan_analyze_next_tuple;
+#if PG_VERSION_NUM < PG_VERSION_18
+	amroutine->scan_bitmap_next_block             = chcompress_scan_bitmap_next_block;
+#endif
 	amroutine->scan_bitmap_next_tuple             = chcompress_scan_bitmap_next_tuple;
 	amroutine->scan_sample_next_block             = chcompress_scan_sample_next_block;
 	amroutine->scan_sample_next_tuple             = chcompress_scan_sample_next_tuple;
