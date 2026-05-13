@@ -9,6 +9,7 @@ Covers:
   - Sort key (orderby) option
   - Vectorized aggregates — correctness (VEC OFF == VEC ON) for every type
       smallint, integer, bigint, float8, numeric, money, date
+  - VECGAGG_SUM_EXPR — sum(col OP expr): numeric serial, float8 serial+parallel
   - count(*) and count(col)
   - NULL handling (empty table, all-NULL column, mixed NULLs)
   - EXPLAIN plan verification (StorageEngineVectorAgg node)
@@ -533,6 +534,81 @@ class TestRunner:
                     "SELECT min(val) FROM _tagg_date")
         self.agg_ok("max(date)",
                     "SELECT max(val) FROM _tagg_date")
+
+    # ------------------------------------------------------------------ VECGAGG_SUM_EXPR
+
+    def test_vecgagg_sum_expr(self) -> None:
+        """VECGAGG_SUM_EXPR: vectorized SUM of arithmetic expressions."""
+        self.section("Vectorized SUM of Arithmetic Expressions (VECGAGG_SUM_EXPR)")
+
+        self.exec("""
+            DROP TABLE IF EXISTS _texpr;
+            CREATE TABLE _texpr (
+                amount  numeric(14, 4),
+                price   double precision
+            ) USING colcompress;
+            INSERT INTO _texpr
+                SELECT
+                    (i * 1.2345)::numeric(14, 4),
+                    i * 0.9876
+                FROM generate_series(1, 100000) i;
+        """)
+
+        # --- correctness: VEC OFF == VEC ON (serial, numeric) ---
+        self.agg_ok("sum(numeric + int_const): VEC==OFF",
+                    "SELECT sum(amount + 1) FROM _texpr")
+        self.agg_ok("sum(numeric + numeric_const): VEC==OFF",
+                    "SELECT sum(amount + 0.5) FROM _texpr")
+        self.agg_ok("sum(numeric + float8::numeric): VEC==OFF",
+                    "SELECT sum(amount + price::numeric) FROM _texpr")
+
+        # --- correctness: float8 expressions ---
+        self.agg_ok("sum(float8 + int_const): VEC==OFF",
+                    "SELECT round(sum(price + 1)::numeric, 4) FROM _texpr")
+        self.agg_ok("sum(float8 + float8): VEC==OFF",
+                    "SELECT round(sum(price + price)::numeric, 4) FROM _texpr")
+        self.agg_ok("sum(float8 * const): VEC==OFF",
+                    "SELECT round(sum(price * 2.0)::numeric, 4) FROM _texpr")
+
+        # --- EXPLAIN shows expr_sum when vectorized (serial, enable_vectorization=on) ---
+        plan_numeric = self.q(
+            "SET storage_engine.enable_vectorization=on; "
+            "SET max_parallel_workers_per_gather=0; "
+            "EXPLAIN SELECT sum(amount + 1) FROM _texpr"
+        )
+        self.check("sum(numeric+const) serial: EXPLAIN shows 'expr_sum'",
+                   "expr_sum" in plan_numeric, plan_numeric[:400])
+
+        plan_float8 = self.q(
+            "SET storage_engine.enable_vectorization=on; "
+            "SET max_parallel_workers_per_gather=0; "
+            "EXPLAIN SELECT sum(price + 1.0) FROM _texpr"
+        )
+        self.check("sum(float8+const) serial: EXPLAIN shows 'expr_sum'",
+                   "expr_sum" in plan_float8, plan_float8[:400])
+
+        # --- parallel: numeric falls back to PG (correct result, no crash) ---
+        out, rc, err = self._run(
+            "SET storage_engine.enable_vectorization=on; "
+            "SELECT sum(amount + 1) FROM _texpr"
+        )
+        self.check("sum(numeric+const) parallel: no crash",
+                   rc == 0, err[:200] if err else out[:200])
+
+        out, rc, err = self._run(
+            "SET storage_engine.enable_vectorization=on; "
+            "SELECT sum(amount + price::numeric) FROM _texpr"
+        )
+        self.check("sum(numeric+float8::numeric) parallel: no crash",
+                   rc == 0, err[:200] if err else out[:200])
+
+        # --- parallel: float8 must still be vectorized (expr_sum) ---
+        plan_f8_par = self.q(
+            "SET storage_engine.enable_vectorization=on; "
+            "EXPLAIN SELECT sum(price + 1.0) FROM _texpr"
+        )
+        self.check("sum(float8+const) parallel: EXPLAIN shows 'expr_sum'",
+                   "expr_sum" in plan_f8_par, plan_f8_par[:400])
 
     # ------------------------------------------------------------------ multi-column
 
@@ -1937,6 +2013,7 @@ class TestRunner:
         self.test_vect_numeric_aggregates()
         self.test_vect_money_aggregates()
         self.test_vect_date_aggregates()
+        self.test_vecgagg_sum_expr()
         self.test_multi_column_aggregates()
         self.test_null_handling()
         self.test_explain_plan()

@@ -5687,6 +5687,7 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 			READ_INT(_res_typeoid);
 			(void) _res_typeoid;  /* reserved for future use */
 		}
+		READ_INT(vas->vecExprAggsplit);
 
 		for (int i = 0; i < vas->vecExprNumNodes; i++)
 		{
@@ -5741,6 +5742,31 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 		vas->sumNumeric    = NULL;
 		vas->sumHasValue   = false;
 		vas->done          = false;
+
+		/* Partial NUMERIC: pre-load accum + serialize functions by name */
+		vas->numericPartialState     = (Datum) 0;
+		vas->numericPartialStateNull = true;
+		/* Initialize fake AggState for numeric_avg_accum context check */
+		MemSet(&vas->numericFakeAggState, 0, sizeof(AggState));
+		MemSet(&vas->numericFakeAggExpr,  0, sizeof(ExprContext));
+		vas->numericFakeAggExpr.ecxt_per_tuple_memory = vas->aggContext;
+		((Node *) &vas->numericFakeAggState)->type = T_AggState;
+		vas->numericFakeAggState.curaggcontext = &vas->numericFakeAggExpr;
+
+		if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC &&
+			vas->vecExprAggsplit == (int) AGGSPLIT_INITIAL_SERIAL)
+		{
+			Oid accum_oid  = fmgr_internal_function("numeric_avg_accum");
+			Oid serial_oid = fmgr_internal_function("numeric_avg_serialize");
+
+			if (!OidIsValid(accum_oid))
+				elog(ERROR, "VecSumExpr: cannot find numeric_avg_accum");
+			if (!OidIsValid(serial_oid))
+				elog(ERROR, "VecSumExpr: cannot find numeric_avg_serialize");
+
+			fmgr_info_cxt(accum_oid,  &vas->numericAvgAccumFn,  vas->aggContext);
+			fmgr_info_cxt(serial_oid, &vas->numericSerializeFn, vas->aggContext);
+		}
 
 		/* Initialize the child ColcompressScan */
 		outerPlanState(css) = ExecInitNode(outerPlan(cscan), estate, eflags);
@@ -5829,9 +5855,35 @@ ExecVecSumExpr(VectorAggState *vas)
 
 				if (!isnull)
 				{
-					if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC)
+					if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC &&
+						vas->vecExprAggsplit == (int) AGGSPLIT_INITIAL_SERIAL)
 					{
 						/*
+						 * Parallel partial mode: accumulate via numeric_avg_accum.
+						 * val is in expr_ctx; copy into aggContext before reset.
+						 * Use LOCAL_FCINFO + T_AggState context so that
+						 * AggCheckCallContext returns non-NULL inside the function.
+						 */
+						MemoryContext oldctx = MemoryContextSwitchTo(vas->aggContext);
+						Datum val_copy = datumCopy(val, false, -1);
+						{
+							LOCAL_FCINFO(fcinfo_accum, 2);
+							InitFunctionCallInfoData(*fcinfo_accum,
+								&vas->numericAvgAccumFn, 2, InvalidOid,
+								(Node *) &vas->numericFakeAggState, NULL);
+							fcinfo_accum->args[0].value  = vas->numericPartialState;
+							fcinfo_accum->args[0].isnull = vas->numericPartialStateNull;
+							fcinfo_accum->args[1].value  = val_copy;
+							fcinfo_accum->args[1].isnull = false;
+							vas->numericPartialState     = FunctionCallInvoke(fcinfo_accum);
+							vas->numericPartialStateNull = false;
+						}
+						MemoryContextSwitchTo(oldctx);
+					}
+					else if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC)
+					{
+						/*
+						 * Serial mode: simple numeric sum.
 						 * val points into expr_ctx.  Copy it into aggContext
 						 * before expr_ctx is reset on the next iteration.
 						 */
@@ -5866,7 +5918,23 @@ ExecVecSumExpr(VectorAggState *vas)
 	result->tts_isnull[0] = !vas->sumHasValue;
 	if (vas->sumHasValue)
 	{
-		if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC)
+		if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC &&
+			vas->vecExprAggsplit == (int) AGGSPLIT_INITIAL_SERIAL)
+		{
+			/*
+			 * Partial parallel mode: serialize the internal state to bytea.
+			 * The Gather node will pass this to numeric_deserialize +
+			 * numeric_avg_combine on the coordinator.
+			 */
+			LOCAL_FCINFO(fcinfo_ser, 1);
+			InitFunctionCallInfoData(*fcinfo_ser,
+				&vas->numericSerializeFn, 1, InvalidOid,
+				(Node *) &vas->numericFakeAggState, NULL);
+			fcinfo_ser->args[0].value  = vas->numericPartialState;
+			fcinfo_ser->args[0].isnull = vas->numericPartialStateNull;
+			result->tts_values[0] = FunctionCallInvoke(fcinfo_ser);
+		}
+		else if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC)
 			result->tts_values[0] = NumericGetDatum(vas->sumNumeric);
 		else
 			result->tts_values[0] = Float8GetDatum(vas->sumFloat8);

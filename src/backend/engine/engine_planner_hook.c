@@ -183,6 +183,26 @@ PlanHasMixedNumericMoneyAggrefs(Plan *plan)
 	return ctx.foundNumericAgg && ctx.foundMoneyAgg;
 }
 
+/*
+ * FindFirstAggref_walker — finds the first Aggref node at any depth in an
+ * expression tree.  Used to detect whether a plain-aggregate targetlist entry
+ * has an aggregate with an arithmetic expression input (sum(price + 1)),
+ * even when the Aggref is buried inside a multi-arg outer function
+ * (e.g. round(sum(price+1)::numeric, 4)).
+ */
+static bool
+FindFirstAggref_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		*((Aggref **) context) = (Aggref *) node;
+		return true;	/* stop at first found */
+	}
+	return expression_tree_walker(node, FindFirstAggref_walker, context);
+}
+
 #if PG_VERSION_NUM < PG_VERSION_16
 static bool
 PlanHasNumericAggrefs(Plan *plan)
@@ -1427,17 +1447,15 @@ PlanTreeMutator(Plan *node, void *context)
 							/*
 							 * AGGSPLIT safety gate:
 							 *   FLOAT8  — safe in SIMPLE and INITIAL_SERIAL
-							 *   NUMERIC — only safe in SIMPLE (transtype=internal);
-							 *             in INITIAL_SERIAL the worker must emit
-							 *             numeric_serialize bytea — fall back to
-							 *             standard PG (not standard VectorAgg which
-							 *             also can't handle arithmetic expressions).
+							 *   NUMERIC — safe in SIMPLE and INITIAL_SERIAL
+							 *             In INITIAL_SERIAL the executor accumulates
+							 *             via numeric_avg_accum then emits bytea via
+							 *             numeric_serialize — compatible with Gather.
 							 */
-							if ((_col_type_expr == VECGAGG_TYPE_FLOAT8 &&
-								 (aggNode->aggsplit == AGGSPLIT_SIMPLE ||
-								  aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL)) ||
-								(_col_type_expr == VECGAGG_TYPE_NUMERIC &&
-								 aggNode->aggsplit == AGGSPLIT_SIMPLE))
+							if ((_col_type_expr == VECGAGG_TYPE_FLOAT8 ||
+								 _col_type_expr == VECGAGG_TYPE_NUMERIC) &&
+								(aggNode->aggsplit == AGGSPLIT_SIMPLE ||
+								 aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL))
 							{
 								CustomScan *_exprNode = engine_create_aggregator_node();
 								List       *_priv     = NIL;
@@ -1458,6 +1476,7 @@ PlanTreeMutator(Plan *node, void *context)
 								_APPEND_INT(_expr_root);
 								_APPEND_INT(_col_type_expr);
 								_APPEND_INT((int) _ct); /* res_typeoid, reserved */
+								_APPEND_INT((int) aggNode->aggsplit); /* aggsplit mode */
 
 								for (int _ni = 0; _ni < _expr_num; _ni++)
 								{
@@ -1554,6 +1573,55 @@ PlanTreeMutator(Plan *node, void *context)
 								break;
 							}
 						}
+					}
+
+					/*
+					 * Safety gate: the regular VectorAgg path runs ExpressionMutator
+					 * which replaces operators inside Aggref args with their vectorized
+					 * counterparts (e.g. float8pl → engine.vfloat8pl).  Those functions
+					 * expect arg[1] to be a VectorColumn*, not a scalar Datum.
+					 *
+					 * When an Aggref's input is an arithmetic expression rather than a
+					 * plain Var (e.g. sum(price + 1) wrapped in round(…::numeric, 4)),
+					 * ExpressionMutator substitutes vfloat8pl for the inner float8pl,
+					 * then at execution time the scalar constant is cast to VectorColumn*
+					 * and dereferenced → SIGSEGV.
+					 *
+					 * The correct path for such expressions is VECGAGG_SUM_EXPR (handled
+					 * above).  If VECGAGG_SUM_EXPR was not triggered (e.g. because the
+					 * Aggref is buried inside a multi-arg wrapper like round()), detect
+					 * the arithmetic-expression input here and fall back to PG standard.
+					 */
+					{
+						bool _has_expr_agg = false;
+						ListCell *_guard_lc;
+
+						foreach (_guard_lc, aggNode->plan.targetlist)
+						{
+							TargetEntry *_guard_te = (TargetEntry *) lfirst(_guard_lc);
+
+							if (_guard_te->resjunk)
+								continue;
+
+							Aggref *_found_agg = NULL;
+							(void) FindFirstAggref_walker((Node *) _guard_te->expr,
+														  &_found_agg);
+
+							if (_found_agg != NULL && list_length(_found_agg->args) == 1)
+							{
+								TargetEntry *_agg_arg_te =
+									(TargetEntry *) linitial(_found_agg->args);
+
+								if (_agg_arg_te != NULL && !IsA(_agg_arg_te->expr, Var))
+								{
+									_has_expr_agg = true;
+									break;
+								}
+							}
+						}
+
+						if (_has_expr_agg)
+							break;	/* arithmetic expr in agg — fall back to PG standard */
 					}
 
 					vectorizedAggNode = engine_create_aggregator_node();

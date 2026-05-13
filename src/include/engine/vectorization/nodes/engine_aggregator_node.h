@@ -30,12 +30,30 @@ typedef struct VectorAggState
 	int				vecExprNumNodes;
 	int				vecExprRootIdx;
 	int				vecExprColType;		/* VECGAGG_TYPE_* of expression result */
+	int				vecExprAggsplit;	/* AggSplit value (AGGSPLIT_SIMPLE or INITIAL_SERIAL) */
 
 	/* Accumulators for ExecVecSumExpr */
 	float8			sumFloat8;
 	Numeric			sumNumeric;
 	bool			sumHasValue;
 	bool			done;
+
+	/*
+	 * Parallel NUMERIC partial aggregate: accumulate via numeric_avg_accum
+	 * then emit bytea via numeric_serialize.
+	 * numericPartialState is the internal AggState opaque pointer.
+	 */
+	Datum			numericPartialState;	/* internal state from numeric_avg_accum */
+	bool			numericPartialStateNull;
+	FmgrInfo		numericAvgAccumFn;		/* numeric_avg_accum(internal, numeric) */
+	FmgrInfo		numericSerializeFn;		/* numeric_serialize(internal)          */
+
+	/*
+	 * Fake AggState/ExprContext so that numeric_avg_accum passes
+	 * AggCheckCallContext (it inspects fcinfo->context->type == T_AggState).
+	 */
+	AggState		numericFakeAggState;
+	ExprContext		numericFakeAggExpr;
 
 	/* Memory context for accumulation (numeric datums) */
 	MemoryContext	aggContext;
