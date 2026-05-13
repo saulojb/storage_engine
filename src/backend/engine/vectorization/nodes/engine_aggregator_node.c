@@ -5700,17 +5700,31 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 			if (first_int == VECGAGG_MULTI_MAGIC)
 			{
 				/*
-				 * Multi-target mode: N sum(expr) and/or count(*) targets.
+				 * Multi-target mode: N accumulator slots + M output expressions.
+				 * Format:
+				 *   [MULTI_MAGIC][aggsplit][n_slots][n_outputs]
+				 *   per slot: [kind][col_type][sum_col_slot_idx][expr_num][expr_root]
+				 *              [7 ints per VecExprNode][n_consts][Const*...]
+				 *   per output: [num_pae_nodes][root_pae_idx]
+				 *                per node: [kind][left][right][slot_idx][opfuncid][rettype][const_isnull]
+				 *                          + Const* for VPAE_CONST non-null values
 				 */
+				int n_slots, n_outputs;
 				READ_INT(vas->vecMultiAggsplit);
-				READ_INT(vas->vecMultiNumTargets);
+				READ_INT(n_slots);
+				READ_INT(n_outputs);
 
-				for (int ti = 0; ti < vas->vecMultiNumTargets; ti++)
+				vas->vecMultiNumTargets  = n_slots;
+				vas->vecMultiNumOutputs  = n_outputs;
+				vas->vecMultiHasPostAgg  = false;
+
+				for (int ti = 0; ti < n_slots; ti++)
 				{
 					VecMultiExprTarget *tgt = &vas->vecMultiTargets[ti];
 
 					READ_INT(tgt->kind);
 					READ_INT(tgt->col_type);
+					READ_INT(tgt->sum_col_slot_idx);
 					READ_INT(tgt->expr_num_nodes);
 					READ_INT(tgt->expr_root_idx);
 
@@ -5733,7 +5747,7 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 							fmgr_info(n->opfuncid, &n->opfmgr);
 					}
 
-					/* Const leaf nodes for this target */
+					/* Const leaf nodes for SUM_EXPR slots */
 					{
 						int num_consts;
 						int ci = 0;
@@ -5759,6 +5773,7 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 
 					/* Initialize accumulators */
 					tgt->sum_float8            = 0.0;
+					tgt->sum_int64             = 0;
 					tgt->sum_numeric           = NULL;
 					tgt->count                 = 0;
 					tgt->has_value             = false;
@@ -5767,13 +5782,63 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 					tgt->numeric_partial_null  = true;
 				}
 
+				/* Deserialize output expression trees */
+				for (int oi = 0; oi < n_outputs; oi++)
+				{
+					VecMultiOutput *out = &vas->vecMultiOutputs[oi];
+					int num_pae_nodes;
+					READ_INT(num_pae_nodes);
+					READ_INT(out->root_idx);
+					out->num_nodes = num_pae_nodes;
+
+					for (int pni = 0; pni < num_pae_nodes; pni++)
+					{
+						VecPostAggNode *pn = &out->nodes[pni];
+						int tmp;
+						READ_INT(tmp); pn->kind     = (int8) tmp;
+						READ_INT(tmp); pn->left     = (int8) tmp;
+						READ_INT(tmp); pn->right    = (int8) tmp;
+						READ_INT(tmp); pn->slot_idx = (int8) tmp;
+						READ_INT(tmp); pn->opfuncid = (Oid) tmp;
+						READ_INT(tmp); pn->rettype  = (Oid) tmp;
+						READ_INT(tmp); pn->const_isnull = (tmp != 0);
+						pn->const_ptr = NULL;
+						pn->const_val = (Datum) 0;
+
+						get_typlenbyval(pn->rettype, &pn->rettyplen, &pn->retbyval);
+
+						if (pn->kind == VPAE_OP && OidIsValid(pn->opfuncid))
+							fmgr_info(pn->opfuncid, &pn->opfmgr);
+
+						if (pn->kind == VPAE_CONST && !pn->const_isnull)
+						{
+							/* Retrieve the original Const* from the plan list */
+							Const *c = (Const *) lfirst(lc);
+							lc = lnext(cscan->custom_private, lc);
+							pn->const_val = datumCopy(c->constvalue,
+													  pn->retbyval,
+													  pn->rettyplen);
+						}
+
+						/* Any VPAE_SLOT output means post-agg mode applies */
+						if (pn->kind == VPAE_OP || pn->kind == VPAE_CONST)
+							vas->vecMultiHasPostAgg = true;
+					}
+
+					/*
+					 * If the single output node is a bare VPAE_SLOT referencing
+					 * slot[i], this output is trivial (no arithmetic needed).
+					 * vecMultiHasPostAgg stays false unless an OP or CONST appears.
+					 */
+				}
+
 				/* Pre-load numeric partial functions for NUMERIC SUM_EXPR targets */
 				if (vas->vecMultiAggsplit == (int) AGGSPLIT_INITIAL_SERIAL)
 				{
 					Oid accum_oid  = InvalidOid;
 					Oid serial_oid = InvalidOid;
 
-					for (int ti = 0; ti < vas->vecMultiNumTargets; ti++)
+					for (int ti = 0; ti < n_slots; ti++)
 					{
 						VecMultiExprTarget *tgt = &vas->vecMultiTargets[ti];
 						if (tgt->kind != VMSEXPR_SUM_EXPR ||
@@ -5912,6 +5977,57 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 
 
 /*
+ * eval_post_agg_scalar — evaluate one node of a VecMultiOutput tree.
+ *
+ * slot_vals[]/slot_nulls[] contain the finalized accumulator values, one per
+ * vecMultiTargets[] slot.  Returns the computed Datum and sets *isnull.
+ */
+static Datum
+eval_post_agg_scalar(VecMultiOutput *out, int node_idx,
+					 Datum *slot_vals, bool *slot_nulls,
+					 bool *isnull)
+{
+	VecPostAggNode *n = &out->nodes[node_idx];
+
+	switch (n->kind)
+	{
+		case VPAE_SLOT:
+			*isnull = slot_nulls[(int) n->slot_idx];
+			return slot_vals[(int) n->slot_idx];
+
+		case VPAE_CONST:
+			*isnull = n->const_isnull;
+			return n->const_val;
+
+		case VPAE_OP:
+		{
+			bool   lnull;
+			Datum  lval = eval_post_agg_scalar(out, (int) n->left,
+											   slot_vals, slot_nulls, &lnull);
+			if (lnull) { *isnull = true; return (Datum) 0; }
+
+			if (n->right >= 0)
+			{
+				bool   rnull;
+				Datum  rval = eval_post_agg_scalar(out, (int) n->right,
+												   slot_vals, slot_nulls, &rnull);
+				if (rnull) { *isnull = true; return (Datum) 0; }
+				*isnull = false;
+				return FunctionCall2(&n->opfmgr, lval, rval);
+			}
+			/* unary (FuncExpr cast) */
+			*isnull = false;
+			return FunctionCall1(&n->opfmgr, lval);
+		}
+
+		default:
+			*isnull = true;
+			return (Datum) 0;
+	}
+}
+
+
+/*
  * ExecVecMultiSumExpr — multi-target vectorized aggregation.
  * Handles N simultaneous sum(expr) and/or count(*) targets in one pass over
  * the child ColcompressScan batches.  Returns a single N-column result tuple.
@@ -5949,6 +6065,58 @@ ExecVecMultiSumExpr(VectorAggState *vas)
 				if (tgt->kind == VMSEXPR_COUNT_STAR)
 				{
 					tgt->count++;
+					tgt->has_value = true;
+					continue;
+				}
+
+				if (tgt->kind == VMSEXPR_SUM_COL)
+				{
+					/* Direct VectorColumn read — no expression evaluation */
+					VectorColumn *col = (VectorColumn *)
+						outerslot->tts_values[tgt->sum_col_slot_idx];
+					if (col == NULL || col->isnull[row_i])
+						continue;
+					int8 *rawptr = (int8 *) col->value +
+								   (int) col->columnTypeLen * row_i;
+					Datum val = fetch_att(rawptr,
+										  col->columnIsVal,
+										  col->columnTypeLen);
+					if (tgt->col_type == VECGAGG_TYPE_NUMERIC)
+					{
+						MemoryContext oldctx =
+							MemoryContextSwitchTo(vas->aggContext);
+						Datum val_copy = datumCopy(val, false, -1);
+						if (tgt->sum_numeric == NULL)
+							tgt->sum_numeric = DatumGetNumeric(val_copy);
+						else
+							tgt->sum_numeric = DatumGetNumeric(
+								DirectFunctionCall2(numeric_add,
+									NumericGetDatum(tgt->sum_numeric),
+									val_copy));
+						MemoryContextSwitchTo(oldctx);
+					}
+					else if (tgt->col_type == VECGAGG_TYPE_FLOAT8 ||
+							 tgt->col_type == VECGAGG_TYPE_FLOAT4)
+					{
+						float8 fval;
+						if (col->columnTypeLen == 4)
+							fval = (float8) DatumGetFloat4(val);
+						else
+							fval = DatumGetFloat8(val);
+						tgt->sum_float8 += fval;
+					}
+					else
+					{
+						/* INT4/INT8/money → accumulate as int64 */
+						int64 ival;
+						switch (col->columnTypeLen)
+						{
+							case 2:  ival = (int64) DatumGetInt16(val); break;
+							case 4:  ival = (int64) DatumGetInt32(val); break;
+							default: ival = DatumGetInt64(val); break;
+						}
+						tgt->sum_int64 += ival;
+					}
 					tgt->has_value = true;
 					continue;
 				}
@@ -6017,8 +6185,12 @@ ExecVecMultiSumExpr(VectorAggState *vas)
 	MemoryContextDelete(expr_ctx);
 	vas->done = true;
 
-	/* Emit N-column result tuple */
-	ExecClearTuple(result);
+	/* ----------------------------------------------------------------
+	 * Build slot_vals[] / slot_nulls[]: finalized value for each
+	 * accumulator slot.  These are then consumed by the output phase.
+	 * ---------------------------------------------------------------- */
+	Datum slot_vals [VECGAGG_MULTI_MAX_TARGETS];
+	bool  slot_nulls[VECGAGG_MULTI_MAX_TARGETS];
 
 	for (int ti = 0; ti < ntgts; ti++)
 	{
@@ -6026,13 +6198,13 @@ ExecVecMultiSumExpr(VectorAggState *vas)
 
 		if (tgt->kind == VMSEXPR_COUNT_STAR)
 		{
-			result->tts_isnull[ti] = false;
-			result->tts_values[ti] = Int64GetDatum(tgt->count);
+			slot_vals [ti] = Int64GetDatum(tgt->count);
+			slot_nulls[ti] = false;
 		}
 		else if (!tgt->has_value)
 		{
-			result->tts_isnull[ti] = true;
-			result->tts_values[ti] = (Datum) 0;
+			slot_vals [ti] = (Datum) 0;
+			slot_nulls[ti] = true;
 		}
 		else if (tgt->col_type == VECGAGG_TYPE_NUMERIC &&
 				 tgt->aggsplit == (int) AGGSPLIT_INITIAL_SERIAL)
@@ -6043,18 +6215,57 @@ ExecVecMultiSumExpr(VectorAggState *vas)
 				(Node *) &vas->numericFakeAggState, NULL);
 			fcinfo_ser->args[0].value  = tgt->numeric_partial_state;
 			fcinfo_ser->args[0].isnull = tgt->numeric_partial_null;
-			result->tts_isnull[ti] = false;
-			result->tts_values[ti] = FunctionCallInvoke(fcinfo_ser);
+			slot_vals [ti] = FunctionCallInvoke(fcinfo_ser);
+			slot_nulls[ti] = false;
 		}
 		else if (tgt->col_type == VECGAGG_TYPE_NUMERIC)
 		{
-			result->tts_isnull[ti] = false;
-			result->tts_values[ti] = NumericGetDatum(tgt->sum_numeric);
+			slot_vals [ti] = NumericGetDatum(tgt->sum_numeric);
+			slot_nulls[ti] = false;
+		}
+		else if (tgt->col_type == VECGAGG_TYPE_INT4 ||
+				 tgt->col_type == VECGAGG_TYPE_INT8)
+		{
+			slot_vals [ti] = Int64GetDatum(tgt->sum_int64);
+			slot_nulls[ti] = false;
 		}
 		else
 		{
-			result->tts_isnull[ti] = false;
-			result->tts_values[ti] = Float8GetDatum(tgt->sum_float8);
+			/* FLOAT8 / FLOAT4 */
+			slot_vals [ti] = Float8GetDatum(tgt->sum_float8);
+			slot_nulls[ti] = false;
+		}
+	}
+
+	/* ----------------------------------------------------------------
+	 * Emit output columns.
+	 * When vecMultiHasPostAgg is false (all outputs are bare VPAE_SLOT),
+	 * output[oi].nodes[0].slot_idx gives the slot directly.
+	 * When true, evaluate the full VecPostAggNode tree.
+	 * ---------------------------------------------------------------- */
+	int nouts = vas->vecMultiNumOutputs;
+
+	/* Emit N-column result tuple */
+	ExecClearTuple(result);
+
+	for (int oi = 0; oi < nouts; oi++)
+	{
+		if (!vas->vecMultiHasPostAgg)
+		{
+			/* Trivial: output[oi] is a single VPAE_SLOT */
+			VecMultiOutput *out = &vas->vecMultiOutputs[oi];
+			int si = (int) out->nodes[0].slot_idx;
+			result->tts_values[oi] = slot_vals [si];
+			result->tts_isnull[oi] = slot_nulls[si];
+		}
+		else
+		{
+			bool   isnull;
+			Datum  val = eval_post_agg_scalar(&vas->vecMultiOutputs[oi],
+											  vas->vecMultiOutputs[oi].root_idx,
+											  slot_vals, slot_nulls, &isnull);
+			result->tts_values[oi] = val;
+			result->tts_isnull[oi] = isnull;
 		}
 	}
 
