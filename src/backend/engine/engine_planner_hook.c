@@ -1576,6 +1576,206 @@ PlanTreeMutator(Plan *node, void *context)
 					}
 
 					/*
+					 * VECGAGG_MULTI_EXPR: multiple SUM(expr) and/or COUNT(*)
+					 * targets in the same plain aggregate.
+					 *
+					 * Engage when ALL non-resjunk TL entries are direct Aggrefs
+					 * at the root classified as VECGAGG_SUM_EXPR or
+					 * VECGAGG_COUNT_STAR, and at least one is VECGAGG_SUM_EXPR
+					 * (otherwise the standard VectorAgg path handles it).
+					 */
+					{
+						bool     _mt_ok       = true;
+						bool     _mt_has_expr = false;
+						int      _mt_num      = 0;
+						int      _mt_kind     [VECGAGG_MULTI_MAX_TARGETS];
+						int      _mt_col_type [VECGAGG_MULTI_MAX_TARGETS];
+						VecExprNode _mt_nodes [VECGAGG_MULTI_MAX_TARGETS]
+											  [VECGAGG_EXPR_MAX_NODES];
+						int      _mt_expr_num [VECGAGG_MULTI_MAX_TARGETS];
+						int      _mt_expr_root[VECGAGG_MULTI_MAX_TARGETS];
+						Aggref  *_mt_aggrefs  [VECGAGG_MULTI_MAX_TARGETS];
+						ListCell *_mt_lc2;
+
+						/* Only for 2+ entries and supported aggsplit */
+						if (list_length(aggNode->plan.targetlist) < 2 ||
+							(aggNode->aggsplit != AGGSPLIT_SIMPLE &&
+							 aggNode->aggsplit != AGGSPLIT_INITIAL_SERIAL))
+							_mt_ok = false;
+
+						if (_mt_ok)
+						{
+							foreach (_mt_lc2, aggNode->plan.targetlist)
+							{
+								TargetEntry *_mt_te =
+									(TargetEntry *) lfirst(_mt_lc2);
+								int        _mt_ki     = -1;
+								Oid        _mt_ct     = InvalidOid;
+								bool       _mt_af8    = false;
+								AttrNumber _mt_dummy_attno = 0;
+
+								if (_mt_te->resjunk)
+									continue;
+								if (_mt_num >= VECGAGG_MULTI_MAX_TARGETS)
+									{ _mt_ok = false; break; }
+								/* Root must be a direct Aggref */
+								if (!IsA(_mt_te->expr, Aggref))
+									{ _mt_ok = false; break; }
+
+								Aggref *_mt_agg = (Aggref *) _mt_te->expr;
+								_mt_aggrefs[_mt_num]   = _mt_agg;
+								_mt_expr_num[_mt_num]  = 0;
+								_mt_expr_root[_mt_num] = -1;
+
+								if (!ClassifyAggref(_mt_agg,
+													aggNode->plan.lefttree,
+													&_mt_ki, &_mt_dummy_attno,
+													&_mt_ct, &_mt_af8,
+													NULL, NULL, NULL, NULL,
+													_mt_nodes[_mt_num],
+													&_mt_expr_num[_mt_num],
+													&_mt_expr_root[_mt_num]))
+									{ _mt_ok = false; break; }
+
+								if (_mt_ki == VECGAGG_SUM_EXPR)
+								{
+									int _mt_cvt = TypeOidToVecGaggType(_mt_ct);
+									if (_mt_cvt != VECGAGG_TYPE_FLOAT8 &&
+										_mt_cvt != VECGAGG_TYPE_NUMERIC)
+										{ _mt_ok = false; break; }
+									_mt_kind    [_mt_num] = VMSEXPR_SUM_EXPR;
+									_mt_col_type[_mt_num] = _mt_cvt;
+									_mt_has_expr = true;
+								}
+								else if (_mt_ki == VECGAGG_COUNT_STAR)
+								{
+									_mt_kind    [_mt_num] = VMSEXPR_COUNT_STAR;
+									_mt_col_type[_mt_num] = VECGAGG_TYPE_INT8;
+								}
+								else
+									{ _mt_ok = false; break; }
+
+								_mt_num++;
+							}
+						}
+
+						if (_mt_ok && _mt_has_expr && _mt_num >= 2)
+						{
+							CustomScan *_mtNode = engine_create_aggregator_node();
+							List       *_mtPriv = NIL;
+
+#define _MAPP_INT(val) \
+	do { \
+		Const *_pc = makeNode(Const); \
+		_pc->consttype   = INT4OID; \
+		_pc->constlen    = sizeof(int32); \
+		_pc->constvalue  = Int32GetDatum((int32)(val)); \
+		_pc->constbyval  = true; \
+		_pc->constisnull = false; \
+		_mtPriv = lappend(_mtPriv, _pc); \
+	} while (0)
+
+							_MAPP_INT(VECGAGG_MULTI_MAGIC);
+							_MAPP_INT((int) aggNode->aggsplit);
+							_MAPP_INT(_mt_num);
+
+							for (int _ti = 0; _ti < _mt_num; _ti++)
+							{
+								_MAPP_INT(_mt_kind[_ti]);
+								_MAPP_INT(_mt_col_type[_ti]);
+								_MAPP_INT(_mt_expr_num[_ti]);
+								_MAPP_INT(_mt_expr_root[_ti]);
+
+								for (int _ni = 0; _ni < _mt_expr_num[_ti]; _ni++)
+								{
+									VecExprNode *_n = &_mt_nodes[_ti][_ni];
+									_MAPP_INT((int) _n->is_var);
+									_MAPP_INT(_n->slot_idx);
+									_MAPP_INT(_n->col_type);
+									_MAPP_INT(_n->left);
+									_MAPP_INT(_n->right);
+									_MAPP_INT((int) _n->opfuncid);
+									_MAPP_INT((int) _n->rettype);
+								}
+
+								/* Collect Const* leaves for this target */
+								{
+									int    _mt_nc = 0;
+									Const *_mt_cb[VECGAGG_EXPR_MAX_NODES];
+
+									if (_mt_kind[_ti] == VMSEXPR_SUM_EXPR &&
+										list_length(_mt_aggrefs[_ti]->args) == 1)
+									{
+										TargetEntry *_mt_at =
+											(TargetEntry *)
+											linitial(_mt_aggrefs[_ti]->args);
+										Node *_mt_ae = (Node *) _mt_at->expr;
+										struct { Node *e; }
+											_stk[VECGAGG_EXPR_MAX_NODES * 2];
+										int _stk_top = 0;
+										_stk[_stk_top++].e = _mt_ae;
+										while (_stk_top > 0 &&
+											   _mt_nc < VECGAGG_EXPR_MAX_NODES)
+										{
+											Node *_e = _stk[--_stk_top].e;
+											while (_e && IsA(_e, RelabelType))
+												_e = (Node *)
+													((RelabelType *)_e)->arg;
+											if (_e == NULL) continue;
+											if (IsA(_e, Const))
+												_mt_cb[_mt_nc++] = (Const *) _e;
+											else if (IsA(_e, OpExpr))
+											{
+												OpExpr *_op = (OpExpr *) _e;
+												if (list_length(_op->args) >= 2)
+													_stk[_stk_top++].e =
+														(Node *) lsecond(_op->args);
+												_stk[_stk_top++].e =
+													(Node *) linitial(_op->args);
+											}
+											else if (IsA(_e, FuncExpr))
+												_stk[_stk_top++].e =
+													(Node *) linitial(
+														((FuncExpr *)_e)->args);
+										}
+									}
+									_MAPP_INT(_mt_nc);
+									for (int _ci = 0; _ci < _mt_nc; _ci++)
+										_mtPriv = lappend(_mtPriv, _mt_cb[_ci]);
+								}
+							}
+
+#undef _MAPP_INT
+
+							_mtNode->custom_private = _mtPriv;
+							/* custom_plans = NIL — multi-target VECGAGG mode */
+
+							Plan *_mtPlan = (Plan *) _mtNode;
+							_mtNode->scan.plan.targetlist =
+								CustomBuildTargetList(
+									aggNode->plan.targetlist, INDEX_VAR);
+							_mtNode->custom_scan_tlist =
+								aggNode->plan.targetlist;
+							_mtPlan->startup_cost =
+								aggNode->plan.startup_cost;
+							_mtPlan->total_cost   = aggNode->plan.total_cost;
+							_mtPlan->plan_rows    = aggNode->plan.plan_rows;
+							_mtPlan->plan_width   = aggNode->plan.plan_width;
+							_mtPlan->parallel_aware =
+								aggNode->plan.lefttree->parallel_aware;
+
+							planTreeContext->vectorizedAggregation = true;
+							planTreeContext->vectorizedAggStarOnly  = false;
+
+							node->lefttree =
+								PlanTreeMutator(node->lefttree, context);
+							_mtPlan->lefttree = node->lefttree;
+
+							return (Plan *) _mtNode;
+						}
+					}
+
+					/*
 					 * Safety gate: the regular VectorAgg path runs ExpressionMutator
 					 * which replaces operators inside Aggref args with their vectorized
 					 * counterparts (e.g. float8pl → engine.vfloat8pl).  Those functions

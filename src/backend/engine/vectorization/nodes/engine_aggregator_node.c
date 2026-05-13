@@ -5666,8 +5666,9 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 	ExecClearTuple(css->ss.ss_ScanTupleSlot);
 
 	/*
-	 * VECGAGG_SUM_EXPR mode: custom_plans is empty; VecExprNode data
-	 * is in custom_private.  Bypass ExecAgg entirely.
+	 * VECGAGG_SUM_EXPR / VECGAGG_MULTI_EXPR mode:
+	 * custom_plans is empty; VecExprNode data is in custom_private.
+	 * Bypass ExecAgg entirely.
 	 */
 	if (cscan->custom_plans == NIL && cscan->custom_private != NIL)
 	{
@@ -5679,94 +5680,211 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 		lc = lnext(cscan->custom_private, lc); \
 	} while (0)
 
-		READ_INT(vas->vecExprNumNodes);
-		READ_INT(vas->vecExprRootIdx);
-		READ_INT(vas->vecExprColType);
-		{
-			int _res_typeoid;
-			READ_INT(_res_typeoid);
-			(void) _res_typeoid;  /* reserved for future use */
-		}
-		READ_INT(vas->vecExprAggsplit);
-
-		for (int i = 0; i < vas->vecExprNumNodes; i++)
-		{
-			VecExprNode *n = &vas->vecExprNodes[i];
-			int tmp;
-			READ_INT(tmp); n->is_var   = (bool) tmp;
-			READ_INT(n->slot_idx);
-			READ_INT(n->col_type);
-			READ_INT(n->left);
-			READ_INT(n->right);
-			READ_INT(tmp); n->opfuncid = (Oid) tmp;
-			READ_INT(tmp); n->rettype  = (Oid) tmp;
-
-			n->const_val    = (Datum) 0;
-			n->const_isnull = true;
-
-			get_typlenbyval(n->rettype, &n->rettyplen, &n->retbyval);
-			if (!n->is_var && n->slot_idx != VECEXPR_CONST_SENTINEL &&
-				OidIsValid(n->opfuncid))
-				fmgr_info(n->opfuncid, &n->opfmgr);
-		}
-		/* Constant leaf nodes: count + Const* per VECEXPR_CONST_SENTINEL node */
-		{
-			int num_consts;
-			int ci = 0;
-			READ_INT(num_consts);
-			for (int i = 0;
-				 i < vas->vecExprNumNodes && ci < num_consts;
-				 i++)
-			{
-				VecExprNode *n = &vas->vecExprNodes[i];
-
-				if (n->slot_idx == VECEXPR_CONST_SENTINEL)
-				{
-					Const *c = (Const *) lfirst(lc);
-					lc = lnext(cscan->custom_private, lc);
-					n->const_isnull = c->constisnull;
-					if (!c->constisnull)
-						n->const_val = datumCopy(c->constvalue,
-												 n->retbyval, n->rettyplen);
-					ci++;
-				}
-			}
-		}
-#undef READ_INT
-
-		vas->vecExprActive = true;
-		vas->aggContext    = AllocSetContextCreate(CurrentMemoryContext,
-												  "VecSumExpr",
-												  ALLOCSET_DEFAULT_SIZES);
-		vas->sumFloat8     = 0.0;
-		vas->sumNumeric    = NULL;
-		vas->sumHasValue   = false;
-		vas->done          = false;
-
-		/* Partial NUMERIC: pre-load accum + serialize functions by name */
-		vas->numericPartialState     = (Datum) 0;
-		vas->numericPartialStateNull = true;
-		/* Initialize fake AggState for numeric_avg_accum context check */
+		/*
+		 * Create shared aggContext and fake AggState for both single-target
+		 * and multi-target numeric partial accumulation paths.
+		 */
+		vas->aggContext = AllocSetContextCreate(CurrentMemoryContext,
+												"VecSumExpr",
+												ALLOCSET_DEFAULT_SIZES);
 		MemSet(&vas->numericFakeAggState, 0, sizeof(AggState));
 		MemSet(&vas->numericFakeAggExpr,  0, sizeof(ExprContext));
 		vas->numericFakeAggExpr.ecxt_per_tuple_memory = vas->aggContext;
 		((Node *) &vas->numericFakeAggState)->type = T_AggState;
 		vas->numericFakeAggState.curaggcontext = &vas->numericFakeAggExpr;
 
-		if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC &&
-			vas->vecExprAggsplit == (int) AGGSPLIT_INITIAL_SERIAL)
 		{
-			Oid accum_oid  = fmgr_internal_function("numeric_avg_accum");
-			Oid serial_oid = fmgr_internal_function("numeric_avg_serialize");
+			int first_int;
+			READ_INT(first_int);
 
-			if (!OidIsValid(accum_oid))
-				elog(ERROR, "VecSumExpr: cannot find numeric_avg_accum");
-			if (!OidIsValid(serial_oid))
-				elog(ERROR, "VecSumExpr: cannot find numeric_avg_serialize");
+			if (first_int == VECGAGG_MULTI_MAGIC)
+			{
+				/*
+				 * Multi-target mode: N sum(expr) and/or count(*) targets.
+				 */
+				READ_INT(vas->vecMultiAggsplit);
+				READ_INT(vas->vecMultiNumTargets);
 
-			fmgr_info_cxt(accum_oid,  &vas->numericAvgAccumFn,  vas->aggContext);
-			fmgr_info_cxt(serial_oid, &vas->numericSerializeFn, vas->aggContext);
+				for (int ti = 0; ti < vas->vecMultiNumTargets; ti++)
+				{
+					VecMultiExprTarget *tgt = &vas->vecMultiTargets[ti];
+
+					READ_INT(tgt->kind);
+					READ_INT(tgt->col_type);
+					READ_INT(tgt->expr_num_nodes);
+					READ_INT(tgt->expr_root_idx);
+
+					for (int i = 0; i < tgt->expr_num_nodes; i++)
+					{
+						VecExprNode *n = &tgt->expr_nodes[i];
+						int tmp;
+						READ_INT(tmp); n->is_var   = (bool) tmp;
+						READ_INT(n->slot_idx);
+						READ_INT(n->col_type);
+						READ_INT(n->left);
+						READ_INT(n->right);
+						READ_INT(tmp); n->opfuncid = (Oid) tmp;
+						READ_INT(tmp); n->rettype  = (Oid) tmp;
+						n->const_val    = (Datum) 0;
+						n->const_isnull = true;
+						get_typlenbyval(n->rettype, &n->rettyplen, &n->retbyval);
+						if (!n->is_var && n->slot_idx != VECEXPR_CONST_SENTINEL &&
+							OidIsValid(n->opfuncid))
+							fmgr_info(n->opfuncid, &n->opfmgr);
+					}
+
+					/* Const leaf nodes for this target */
+					{
+						int num_consts;
+						int ci = 0;
+						READ_INT(num_consts);
+						for (int i = 0;
+							 i < tgt->expr_num_nodes && ci < num_consts;
+							 i++)
+						{
+							VecExprNode *n = &tgt->expr_nodes[i];
+							if (n->slot_idx == VECEXPR_CONST_SENTINEL)
+							{
+								Const *c = (Const *) lfirst(lc);
+								lc = lnext(cscan->custom_private, lc);
+								n->const_isnull = c->constisnull;
+								if (!c->constisnull)
+									n->const_val = datumCopy(c->constvalue,
+															 n->retbyval,
+															 n->rettyplen);
+								ci++;
+							}
+						}
+					}
+
+					/* Initialize accumulators */
+					tgt->sum_float8            = 0.0;
+					tgt->sum_numeric           = NULL;
+					tgt->count                 = 0;
+					tgt->has_value             = false;
+					tgt->aggsplit              = vas->vecMultiAggsplit;
+					tgt->numeric_partial_state = (Datum) 0;
+					tgt->numeric_partial_null  = true;
+				}
+
+				/* Pre-load numeric partial functions for NUMERIC SUM_EXPR targets */
+				if (vas->vecMultiAggsplit == (int) AGGSPLIT_INITIAL_SERIAL)
+				{
+					Oid accum_oid  = InvalidOid;
+					Oid serial_oid = InvalidOid;
+
+					for (int ti = 0; ti < vas->vecMultiNumTargets; ti++)
+					{
+						VecMultiExprTarget *tgt = &vas->vecMultiTargets[ti];
+						if (tgt->kind != VMSEXPR_SUM_EXPR ||
+							tgt->col_type != VECGAGG_TYPE_NUMERIC)
+							continue;
+						if (!OidIsValid(accum_oid))
+						{
+							accum_oid  = fmgr_internal_function(
+												"numeric_avg_accum");
+							serial_oid = fmgr_internal_function(
+												"numeric_avg_serialize");
+							if (!OidIsValid(accum_oid) || !OidIsValid(serial_oid))
+								elog(ERROR,
+									 "VecMultiSumExpr: numeric partial fns missing");
+						}
+						fmgr_info_cxt(accum_oid,  &tgt->numeric_avg_accum_fn,
+									  vas->aggContext);
+						fmgr_info_cxt(serial_oid, &tgt->numeric_serialize_fn,
+									  vas->aggContext);
+					}
+				}
+
+				vas->vecMultiActive = true;
+				vas->done           = false;
+			}
+			else
+			{
+				/*
+				 * Single-target VECGAGG_SUM_EXPR: first_int is vecExprNumNodes.
+				 */
+				vas->vecExprNumNodes = first_int;
+				READ_INT(vas->vecExprRootIdx);
+				READ_INT(vas->vecExprColType);
+				{
+					int _res_typeoid;
+					READ_INT(_res_typeoid);
+					(void) _res_typeoid;  /* reserved for future use */
+				}
+				READ_INT(vas->vecExprAggsplit);
+
+				for (int i = 0; i < vas->vecExprNumNodes; i++)
+				{
+					VecExprNode *n = &vas->vecExprNodes[i];
+					int tmp;
+					READ_INT(tmp); n->is_var   = (bool) tmp;
+					READ_INT(n->slot_idx);
+					READ_INT(n->col_type);
+					READ_INT(n->left);
+					READ_INT(n->right);
+					READ_INT(tmp); n->opfuncid = (Oid) tmp;
+					READ_INT(tmp); n->rettype  = (Oid) tmp;
+
+					n->const_val    = (Datum) 0;
+					n->const_isnull = true;
+
+					get_typlenbyval(n->rettype, &n->rettyplen, &n->retbyval);
+					if (!n->is_var && n->slot_idx != VECEXPR_CONST_SENTINEL &&
+						OidIsValid(n->opfuncid))
+						fmgr_info(n->opfuncid, &n->opfmgr);
+				}
+				/* Constant leaf nodes */
+				{
+					int num_consts;
+					int ci = 0;
+					READ_INT(num_consts);
+					for (int i = 0;
+						 i < vas->vecExprNumNodes && ci < num_consts;
+						 i++)
+					{
+						VecExprNode *n = &vas->vecExprNodes[i];
+						if (n->slot_idx == VECEXPR_CONST_SENTINEL)
+						{
+							Const *c = (Const *) lfirst(lc);
+							lc = lnext(cscan->custom_private, lc);
+							n->const_isnull = c->constisnull;
+							if (!c->constisnull)
+								n->const_val = datumCopy(c->constvalue,
+														 n->retbyval, n->rettyplen);
+							ci++;
+						}
+					}
+				}
+
+				vas->vecExprActive = true;
+				vas->sumFloat8     = 0.0;
+				vas->sumNumeric    = NULL;
+				vas->sumHasValue   = false;
+				vas->done          = false;
+
+				vas->numericPartialState     = (Datum) 0;
+				vas->numericPartialStateNull = true;
+
+				if (vas->vecExprColType == VECGAGG_TYPE_NUMERIC &&
+					vas->vecExprAggsplit == (int) AGGSPLIT_INITIAL_SERIAL)
+				{
+					Oid accum_oid  = fmgr_internal_function("numeric_avg_accum");
+					Oid serial_oid = fmgr_internal_function("numeric_avg_serialize");
+
+					if (!OidIsValid(accum_oid))
+						elog(ERROR, "VecSumExpr: cannot find numeric_avg_accum");
+					if (!OidIsValid(serial_oid))
+						elog(ERROR, "VecSumExpr: cannot find numeric_avg_serialize");
+
+					fmgr_info_cxt(accum_oid,  &vas->numericAvgAccumFn,
+								  vas->aggContext);
+					fmgr_info_cxt(serial_oid, &vas->numericSerializeFn,
+								  vas->aggContext);
+				}
+			}
 		}
+#undef READ_INT
 
 		/* Initialize the child ColcompressScan */
 		outerPlanState(css) = ExecInitNode(outerPlan(cscan), estate, eflags);
@@ -5790,6 +5908,157 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 
 		vas->css.ss.ps.ps_ResultTupleSlot = vas->aggstate->ss.ps.ps_ResultTupleSlot;
 	}
+}
+
+
+/*
+ * ExecVecMultiSumExpr — multi-target vectorized aggregation.
+ * Handles N simultaneous sum(expr) and/or count(*) targets in one pass over
+ * the child ColcompressScan batches.  Returns a single N-column result tuple.
+ */
+static TupleTableSlot *
+ExecVecMultiSumExpr(VectorAggState *vas)
+{
+	CustomScanState *css    = &vas->css;
+	TupleTableSlot  *result = css->ss.ps.ps_ResultTupleSlot;
+	int              ntgts  = vas->vecMultiNumTargets;
+
+	if (vas->done)
+		return ExecClearTuple(result);
+
+	MemoryContext expr_ctx = AllocSetContextCreate(vas->aggContext,
+												   "VecMultiExprRow",
+												   ALLOCSET_SMALL_SIZES);
+	MemoryContext outer_ctx = CurrentMemoryContext;
+
+	/* Pull all batches from child ColcompressScan */
+	for (;;)
+	{
+		TupleTableSlot *outerslot = ExecProcNode(outerPlanState(css));
+		if (TupIsNull(outerslot))
+			break;
+
+		VectorTupleTableSlot *vtts = (VectorTupleTableSlot *) outerslot;
+
+		for (int row_i = 0; row_i < vtts->dimension; row_i++)
+		{
+			for (int ti = 0; ti < ntgts; ti++)
+			{
+				VecMultiExprTarget *tgt = &vas->vecMultiTargets[ti];
+
+				if (tgt->kind == VMSEXPR_COUNT_STAR)
+				{
+					tgt->count++;
+					tgt->has_value = true;
+					continue;
+				}
+
+				/* VMSEXPR_SUM_EXPR: evaluate expression tree */
+				bool  isnull;
+				Datum val;
+
+				MemoryContextReset(expr_ctx);
+				MemoryContextSwitchTo(expr_ctx);
+				val = eval_vec_expr_node(tgt->expr_nodes,
+										 &tgt->expr_nodes[tgt->expr_root_idx],
+										 outerslot, row_i, &isnull);
+				MemoryContextSwitchTo(outer_ctx);
+
+				if (!isnull)
+				{
+					if (tgt->col_type == VECGAGG_TYPE_NUMERIC &&
+						tgt->aggsplit == (int) AGGSPLIT_INITIAL_SERIAL)
+					{
+						MemoryContext oldctx =
+							MemoryContextSwitchTo(vas->aggContext);
+						Datum val_copy = datumCopy(val, false, -1);
+						{
+							LOCAL_FCINFO(fcinfo_accum, 2);
+							InitFunctionCallInfoData(*fcinfo_accum,
+								&tgt->numeric_avg_accum_fn, 2, InvalidOid,
+								(Node *) &vas->numericFakeAggState, NULL);
+							fcinfo_accum->args[0].value  =
+								tgt->numeric_partial_state;
+							fcinfo_accum->args[0].isnull =
+								tgt->numeric_partial_null;
+							fcinfo_accum->args[1].value  = val_copy;
+							fcinfo_accum->args[1].isnull = false;
+							tgt->numeric_partial_state   =
+								FunctionCallInvoke(fcinfo_accum);
+							tgt->numeric_partial_null    = false;
+						}
+						MemoryContextSwitchTo(oldctx);
+					}
+					else if (tgt->col_type == VECGAGG_TYPE_NUMERIC)
+					{
+						MemoryContext oldctx =
+							MemoryContextSwitchTo(vas->aggContext);
+						Datum val_copy = datumCopy(val, false, -1);
+						if (tgt->sum_numeric == NULL)
+							tgt->sum_numeric = DatumGetNumeric(val_copy);
+						else
+							tgt->sum_numeric = DatumGetNumeric(
+								DirectFunctionCall2(
+									numeric_add,
+									NumericGetDatum(tgt->sum_numeric),
+									val_copy));
+						MemoryContextSwitchTo(oldctx);
+					}
+					else
+					{
+						tgt->sum_float8 += DatumGetFloat8(val);
+					}
+					tgt->has_value = true;
+				}
+			}
+		}
+	}
+
+	MemoryContextDelete(expr_ctx);
+	vas->done = true;
+
+	/* Emit N-column result tuple */
+	ExecClearTuple(result);
+
+	for (int ti = 0; ti < ntgts; ti++)
+	{
+		VecMultiExprTarget *tgt = &vas->vecMultiTargets[ti];
+
+		if (tgt->kind == VMSEXPR_COUNT_STAR)
+		{
+			result->tts_isnull[ti] = false;
+			result->tts_values[ti] = Int64GetDatum(tgt->count);
+		}
+		else if (!tgt->has_value)
+		{
+			result->tts_isnull[ti] = true;
+			result->tts_values[ti] = (Datum) 0;
+		}
+		else if (tgt->col_type == VECGAGG_TYPE_NUMERIC &&
+				 tgt->aggsplit == (int) AGGSPLIT_INITIAL_SERIAL)
+		{
+			LOCAL_FCINFO(fcinfo_ser, 1);
+			InitFunctionCallInfoData(*fcinfo_ser,
+				&tgt->numeric_serialize_fn, 1, InvalidOid,
+				(Node *) &vas->numericFakeAggState, NULL);
+			fcinfo_ser->args[0].value  = tgt->numeric_partial_state;
+			fcinfo_ser->args[0].isnull = tgt->numeric_partial_null;
+			result->tts_isnull[ti] = false;
+			result->tts_values[ti] = FunctionCallInvoke(fcinfo_ser);
+		}
+		else if (tgt->col_type == VECGAGG_TYPE_NUMERIC)
+		{
+			result->tts_isnull[ti] = false;
+			result->tts_values[ti] = NumericGetDatum(tgt->sum_numeric);
+		}
+		else
+		{
+			result->tts_isnull[ti] = false;
+			result->tts_values[ti] = Float8GetDatum(tgt->sum_float8);
+		}
+	}
+
+	return ExecStoreVirtualTuple(result);
 }
 
 
@@ -5950,6 +6219,8 @@ ExecVectorAgg(CustomScanState *node)
 {
 	VectorAggState *vas = (VectorAggState *) node;
 
+	if (vas->vecMultiActive)
+		return ExecVecMultiSumExpr(vas);
 	if (vas->vecExprActive)
 		return ExecVecSumExpr(vas);
 
@@ -5962,7 +6233,7 @@ EndVectorAgg(CustomScanState *node)
 {
 	VectorAggState *vas = (VectorAggState *) node;
 
-	if (vas->vecExprActive)
+	if (vas->vecMultiActive || vas->vecExprActive)
 	{
 		ExecEndNode(outerPlanState(node));
 		if (vas->aggContext)
@@ -5979,7 +6250,9 @@ ExplainAggNode(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	VectorAggState *vas = (VectorAggState *) node;
 
-	if (vas->vecExprActive)
+	if (vas->vecMultiActive)
+		ExplainPropertyText("Engine Vectorized Aggregate", "multi_expr", es);
+	else if (vas->vecExprActive)
 		ExplainPropertyText("Engine Vectorized Aggregate", "expr_sum", es);
 	else
 		ExplainPropertyText("Engine Vectorized Aggregate", "enabled", es);
