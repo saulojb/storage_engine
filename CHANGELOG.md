@@ -1,5 +1,175 @@
 # CHANGELOG
 
+## 2.3.0
+
+### chcompress Table AM (experimental)
+
+`chcompress` is a new experimental Table Access Method backed by the embedded
+[chDB](https://github.com/chdb-io/chdb) ClickHouse engine, loaded at runtime via
+`dlopen`.  The AM is fully registered alongside `colcompress` and `rowcompress` and
+can be used with standard DDL:
+
+```sql
+CREATE TABLE events_ch (
+    ts         timestamptz NOT NULL,
+    user_id    bigint,
+    amount     numeric(15,4)
+) USING chcompress;
+
+INSERT INTO events_ch SELECT * FROM events_col;
+```
+
+The `chcompress` scan path emits a controlled `FEATURE_NOT_SUPPORTED` error while
+full ClickHouse query routing is under development; all write paths and DDL work
+correctly.
+
+Key implementation details:
+
+* **Lazy chDB initialisation** — `relation_set_new_filelocator` is a no-op;
+  `se_chdb_ensure_table()` is called from the first INSERT callback.  This prevents
+  the C++ global-state crash (SIGABRT) that occurred when chDB was initialised inside
+  a freshly forked PostgreSQL worker during `CREATE TABLE`.
+
+* **Static `TableAmRoutine`** — the handler returns a pointer to a `static const
+  TableAmRoutine chcompress_methods` structure in the `.data` segment rather than
+  using `makeNode()`.  This prevents a SIGSEGV that occurred when chDB's C++ allocator
+  reused the freed `CacheMemoryContext` block that had held the `makeNode()`-allocated
+  struct, overwriting the function-pointer table with `.dynamic` section data from
+  `librt.so.1`.
+
+* **Non-streaming scan** — the scan callback uses `se_chdb_query()` to fetch the
+  full result in one call.  The streaming multi-chunk API caused SIGABRT with tables
+  larger than ~100 rows due to a misuse of the chDB streaming API; streaming
+  optimisation is deferred to a later release.
+
+* **Signal handler isolation** — chDB installs its own signal handlers on init;
+  `chdb_set_signal_handlers_enabled(false)` is called after every chDB operation
+  to restore PostgreSQL's signal environment.
+
+* **PG15–PG19 compatibility** — all `TableAmRoutine` callbacks in
+  `chcompress_tableam.c` carry version guards covering 13 separate API changes
+  across PostgreSQL 15–19:
+  - `tuple_insert` / `multi_insert`: `uint32 options` + `BulkInsertStateData *` (PG19)
+  - `tuple_delete`: `changingPart` parameter removed (PG19)
+  - `tuple_update`: three-way split (PG15 `bool *`, PG16–18 `TU_UpdateIndexes *`, PG19 `uint32 options`)
+  - `relation_vacuum`: `const VacuumParams *` (PG19)
+  - `relation_set_new_filelocator` / `relation_copy_data`: `RelFileLocator` (PG16+) vs `RelFileNode` (PG15)
+  - `relation_copy_for_cluster`: `Snapshot snapshot` parameter (PG19)
+  - `scan_analyze_next_block`: `ReadStream *` (PG17+) vs `BlockNumber + BufferAccessStrategy` (PG15–16)
+  - `scan_analyze_next_tuple`: `OldestXmin` removed (PG19)
+  - Bitmap scan: `scan_bitmap_next_block` + `scan_bitmap_next_tuple(scan, TBMIterateResult*, slot)` on PG15–17; single `scan_bitmap_next_tuple(scan, slot, *recheck, *lossy_pages, *exact_pages)` on PG18+
+  - `index_fetch_begin`: `uint32 flags` (PG19)
+
+---
+
+### VecAgg — `sum(expression)` vectorization (`VECGAGG_SUM_EXPR`)
+
+`StorageEngineVectorAgg` can now vectorize simple arithmetic expressions inside
+`SUM`, avoiding the fallback to the PostgreSQL standard executor for the most common
+sum-with-expression shapes:
+
+```sql
+-- column + column (same or castable types)
+SELECT sum(amount + price::numeric) FROM events_col;
+
+-- column + integer constant
+SELECT sum(amount + 1) FROM events_col;
+
+-- column * column
+SELECT sum(price * quantity) FROM events_col;
+```
+
+`ExtractArithExprNode()` (planner hook) decomposes the `OpExpr` / `FuncExpr` tree
+into a compact `VecExprNode` chain stored in `custom_private`.  At execution time,
+`eval_vec_expr_node()` evaluates the chain per-row using pre-resolved `fmgr_info`
+entries — one `FunctionCall1` / `FunctionCall2` per node, no `ExprState` overhead.
+
+**Restrictions:**
+- Restricted to `AGGSPLIT_SIMPLE` (serial plans).  In parallel workers
+  (`AGGSPLIT_INITIAL_SERIAL`), `sum(numeric)` transition type is `internal`
+  (serialized via `numeric_serialize`); emitting a plain `numeric` value there
+  would cause the `Finalize Aggregate` node to crash on deserialisation.  Parallel
+  NUMERIC vectorisation is planned for a future release.
+- Aggrefs whose argument is not a direct `Var` or simple `OpExpr(Var, Var/Const)`
+  (e.g. `round(sum(col), 4)` wrapping the whole `Aggref`) fall back to the standard
+  executor; a planner-level guard detects this via `FindFirstAggref_walker`.
+
+---
+
+### VecAgg — post-aggregation arithmetic (`VECGAGG_MULTI_EXPR`)
+
+Expressions that combine multiple aggregate results at the projection level are now
+handled without crashing or falling back:
+
+```sql
+SELECT sum(amount) + count(*) FROM events_col;
+SELECT sum(amount) * 2 FROM events_col;
+```
+
+The planner hook detects a `TargetEntry` whose expression is an `OpExpr` / `FuncExpr`
+with one or more `Aggref` leaves and rewrites the whole projection as a
+`VECGAGG_MULTI_EXPR` target, evaluated after all per-column accumulators finish.
+
+---
+
+### avg(int8) parallel correctness
+
+`AVG` on `bigint` columns in parallel plans now emits the correct PostgreSQL
+transition state.
+
+`avg(int8)` uses `aggtransfn = int8_avg_accum` with `aggtranstype = internal` and
+`aggserialfn = int8_avg_serialize` (OID 2786).  The prior implementation called
+`int4_avg_accum` paths, which use `bigint[]` state — incompatible with the
+`Finalize Aggregate` deserialiser.
+
+Fix: the planner hook resolves the correct `aggtransfn` OID via
+`SearchSysCache1(AGGFNOID, aggref->aggfnoid)` and stores it in `custom_private`
+alongside `use_int8_avg_path = true` for `INT8` targets in
+`AGGSPLIT_INITIAL_SERIAL` plans.  The executor accumulates via the resolved transfn
+and emits the result through `int8_avg_serialize → bytea`, which `Finalize
+Aggregate` deserialises correctly.
+
+---
+
+### Bug Fixes
+
+* **`PlanTreeMutator` return value discarded** (`engine_planner_hook.c`) —
+  `PlanTreeMutator(node->lefttree, context)` was called but its return value was
+  discarded in two locations: the `VECGAGG_SUM_EXPR` path (line ~1690) and the
+  regular vectorized-agg path (line ~1782).  The un-mutated child scan returned a
+  plain `TupleTableSlot`; downstream code cast it to `VectorTupleTableSlot` and
+  read `vtts->dimension` as garbage, producing billions-iteration loops that
+  corrupted the stack and triggered `____longjmp_chk` SIGSEGV.
+
+* **`FunctionCall1` called with multi-argument `FuncExpr`** (`engine_planner_hook.c`,
+  `engine_groupagg_node.c`) — typmod-cast functions such as `numeric(col, typmod,
+  isexplicit)` have three arguments.  `ExtractArithExprNode` stored the function OID
+  into the `VecExprNode`; `eval_vec_expr_node` then called `FunctionCall1` with only
+  one argument, corrupting the call stack.  Fix: `opfuncid = (nargs == 1) ? f->funcid
+  : InvalidOid`; executor treats `InvalidOid` as a passthrough (identity) node.
+
+* **`round(sum(col), 4)` pattern crashes with vectorization enabled** —
+  when an `Aggref` is wrapped in a scalar expression at the `TargetEntry` level (e.g.
+  `round(sum(price + 1)::numeric, 4)`), the planner hook now detects the presence of
+  non-direct-Aggref targets via `FindFirstAggref_walker` and falls back to the
+  standard executor before invoking `engine_create_aggregator_node()`.  Previously,
+  `vfloat8pl` was called with a scalar constant instead of a `VectorColumn *`,
+  causing SIGSEGV.
+
+---
+
+### Test Suite
+
+* Regression suite expanded to **292/293 tests** across all five supported versions:
+  - PG15 (port 5436): **293 tests** (includes additional upgrade-path coverage)
+  - PG16–PG19: **292 tests** each
+* New test group `test_vecgagg_sum_expr` added: covers `sum(col OP const)`,
+  `sum(col OP col)`, `sum(col::numeric OP col)`, and post-agg projection shapes with
+  vectorization on and off.
+* PG19 (port 5433) added to the full test matrix for the first time.
+
+---
+
 ## 2.2.0
 
 ### CREATE TABLE … WITH (options) syntax

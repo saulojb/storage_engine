@@ -1,7 +1,7 @@
 {
    "name": "storage_engine",
-   "abstract": "Columnar (colcompress) and row-compressed (rowcompress) Table AMs for PostgreSQL with vectorized GROUP BY aggregation, parallel scan, and zone-map pruning",
-   "description": "storage_engine v2.0 introduces StorageEngineVectorGroupAgg — a vectorized GROUP BY aggregate executor that replaces HashAggregate/GroupAggregate with a batch-oriented HTAB pipeline for COUNT, SUM, MIN, MAX, and AVG over colcompress tables, including parallel partial mode on PG 15–19. The extension also provides colcompress (columnar, MergeTree-style sort key, stripe and chunk-level min/max pruning, parallel DSM scan) and rowcompress (batch-compressed rows, parallel work-stealing scan). Both AMs use zstd by default and coexist safely with heap tables. All catalog objects live in the engine schema; C symbols use the se_ prefix.",
+   "abstract": "Columnar (colcompress), row-compressed (rowcompress), and ClickHouse-backed (chcompress) Table AMs for PostgreSQL with vectorized aggregation, parallel scan, and zone-map pruning",
+   "description": "storage_engine v2.3 adds chcompress, an experimental Table AM backed by the embedded chDB ClickHouse engine, alongside continued enhancements to colcompress and rowcompress. The vectorized aggregate path (StorageEngineVectorAgg) now supports sum(expression) — including sum(col OP col), sum(col + const), and sum(col::numeric OP col) — via VECGAGG_SUM_EXPR, and post-aggregation projection arithmetic via VECGAGG_MULTI_EXPR. avg(int8) in parallel plans is now correct. Multiple SIGSEGV crash fixes were applied to the planner hook and aggregate executor. All three AMs are validated on PostgreSQL 15–19 (PG15: 293 tests; PG16–PG19: 292 tests each). All catalog objects live in the engine schema; C symbols use the se_ prefix.",
    "version": "2.3.0",
    "release_status": "stable",
    "maintainer": [
@@ -10,7 +10,7 @@
    "license": "agpl_3",
    "provides": {
       "storage_engine": {
-         "abstract": "colcompress and rowcompress Table AMs with vectorized GROUP BY aggregation (v2.0), parallel scan, and zone-map pruning",
+         "abstract": "colcompress, rowcompress, and chcompress Table AMs with vectorized aggregation (v2.3), parallel scan, and zone-map pruning",
          "file": "src/backend/engine/sql/storage_engine--1.0.sql",
          "docfile": "README.md",
          "version": "2.3.0"
@@ -54,6 +54,9 @@
       "rowcompress",
       "zstd",
       "lz4",
-      "HTAP"
+      "HTAP",
+      "chcompress",
+      "clickhouse",
+      "chdb"
    ]
 }
