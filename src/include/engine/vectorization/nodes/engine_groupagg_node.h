@@ -233,6 +233,7 @@ typedef struct VecGroupAggState
 	/* Per-group hash table */
 	HTAB			   *group_htab;
 	int					num_groups;
+	int				max_groups;
 
 	/* 0-based position of each GROUP BY key in the output result tuple */
 	int					key_result_attnum[VECGROUPAGG_MAX_KEYS];
@@ -281,6 +282,7 @@ extern CustomScan *engine_create_groupagg_node(int num_keys,
 											   bool key_is_consts[],
 											   Const *key_consts[],
 											   int key_result_atts[],
+									   int max_groups,
 											   bool sort_output,
 											   int aggsplit_mode,
 											   int num_targets,

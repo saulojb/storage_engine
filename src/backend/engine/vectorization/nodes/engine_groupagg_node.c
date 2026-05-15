@@ -733,12 +733,12 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 		int			ki, i;
 		MemoryContext	oldctx;
 
-		if (state->num_groups >= engine_vecgroupagg_max_groups)
+		if (state->num_groups >= state->max_groups)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("VectorGroupAgg: too many distinct groups (limit %d); "
 							"increase storage_engine.vecgroupagg_max_groups to raise the limit",
-							engine_vecgroupagg_max_groups)));
+							state->max_groups)));
 
 		/*
 		 * For by-reference key types, make stable copies in agg_context.
@@ -1896,6 +1896,7 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 	 *   [4*num_keys+1]  num_targets
 	 *   [4*num_keys+2]  sort_output
 	 *   [4*num_keys+3]  aggsplit_mode
+	 *   [4*num_keys+4]  max_groups
 	 *   [Const nodes for ki where key_is_consts[ki]=true, in order]
 	 *   [8 Ints per target: kind, col_type, col_attnum, result_attnum,
 	 *    avg_input_as_float8, result_typeoid, use_int8_avg_path, avg_transfn_oid,
@@ -1922,6 +1923,7 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 	state->sort_output  = (bool) PRIV_INT(list_nth(priv, 4 * state->num_keys + 2));
 	state->is_partial_serial =
 		(PRIV_INT(list_nth(priv, 4 * state->num_keys + 3)) == (int) AGGSPLIT_INITIAL_SERIAL);
+	state->max_groups = PRIV_INT(list_nth(priv, 4 * state->num_keys + 4));
 
 	/* Initialize per-key type info */
 	for (ki = 0; ki < state->num_keys; ki++)
@@ -1935,7 +1937,7 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 	}
 
 	/* Const key values (optional, one per const key in order) */
-	target_idx = 4 * state->num_keys + 4;	/* first slot after the 4 fixed ints */
+	target_idx = 4 * state->num_keys + 5;	/* first slot after the fixed ints */
 	for (ki = 0; ki < state->num_keys; ki++)
 	{
 		if (state->key_is_const[ki])
@@ -2281,7 +2283,8 @@ ExplainVecGroupAgg(CustomScanState *css, List *ancestors, ExplainState *es)
  *   [3*num_keys+1..4*num_keys] key_result_atts[ki]
  *   [4*num_keys+1]  num_targets
  *   [4*num_keys+2]  sort_output
- *   [4*num_keys+3]  aggsplit_mode
+	 *   [4*num_keys+3]  aggsplit_mode
+	 *   [4*num_keys+4]  max_groups
  *   [Const nodes for each ki where key_is_consts[ki]=true, in order]
  *   [12 items per target: 11 ints + 1 Const:
  *    kind, col_type, col_attnum, result_attnum,
@@ -2295,6 +2298,7 @@ engine_create_groupagg_node(int num_keys,
 							bool key_is_consts[],
 							Const *key_consts[],
 							int key_result_atts[],
+							int max_groups,
 							bool sort_output,
 							int aggsplit_mode,
 							int num_targets,
@@ -2328,6 +2332,7 @@ engine_create_groupagg_node(int num_keys,
 	MKINT(num_targets);
 	MKINT((int) sort_output);
 	MKINT(aggsplit_mode);
+	MKINT(max_groups);
 
 	/* Const key values (in order, only for const keys) */
 	for (ki = 0; ki < num_keys; ki++)
