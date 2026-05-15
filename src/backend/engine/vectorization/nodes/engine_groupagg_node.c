@@ -46,8 +46,377 @@
 #include "utils/numeric.h"		/* NUMERICOID numeric conversion */
 
 #include "engine/engine_customscan.h"
+#include "engine/engine.h"
 #include "engine/vectorization/engine_vector_types.h"
 #include "engine/vectorization/nodes/engine_groupagg_node.h"
+
+/* ----------------------------------------------------------------
+ *  __int128 fast-path for VECGAGG_SUM_EXPR NUMERIC expressions
+ *
+ *  We access the NUMERIC varlena header bits directly using the stable
+ *  internal layout that has been unchanged since PostgreSQL 9.6:
+ *
+ *    Offset VARHDRSZ+0: uint16 n_header / n_sign_dscale
+ *      bit 15 set  → short form  (dscale in bits 12..7, weight in 10..0)
+ *      bit 15+14 set → special (NaN / Inf)
+ *      otherwise   → long form   (dscale in bits 13..0)
+ *    Offset VARHDRSZ+2 (long form only): int16 n_weight
+ *    Remaining bytes: int16 digits[] in base-10000
+ *
+ *  These definitions mirror PostgreSQL's internal numeric.c — we use our
+ *  own SE_* prefix to avoid conflicts with any future public exposure.
+ * ---------------------------------------------------------------- */
+
+#define SE_NUMERIC_HDR(num)        (*((const uint16 *)((const char *)(num) + VARHDRSZ)))
+#define SE_NUMERIC_IS_SHORT(num)   ((SE_NUMERIC_HDR(num) & 0x8000) != 0)
+#define SE_NUMERIC_IS_SPECIAL(num) ((SE_NUMERIC_HDR(num) & 0xC000) == 0xC000)
+#define SE_NUMERIC_IS_NEG_SHORT(num)  ((SE_NUMERIC_HDR(num) & 0x2000) != 0)
+#define SE_NUMERIC_IS_NEG_LONG(num)   ((SE_NUMERIC_HDR(num) & 0x4000) != 0)
+#define SE_NUMERIC_IS_NEG(num) \
+    (SE_NUMERIC_IS_SHORT(num) ? SE_NUMERIC_IS_NEG_SHORT(num) \
+                               : SE_NUMERIC_IS_NEG_LONG(num))
+
+/* dscale: number of decimal places stored */
+#define SE_NUMERIC_DSCALE_SHORT(num)  ((int32)((SE_NUMERIC_HDR(num) & 0x1F80) >> 7))
+#define SE_NUMERIC_DSCALE_LONG(num)   ((int32)(SE_NUMERIC_HDR(num) & 0x3FFF))
+#define SE_NUMERIC_DSCALE(num) \
+    (SE_NUMERIC_IS_SHORT(num) ? SE_NUMERIC_DSCALE_SHORT(num) \
+                               : SE_NUMERIC_DSCALE_LONG(num))
+
+/* weight: base-10000 exponent of first digit */
+#define SE_NUMERIC_WEIGHT_SHORT(num) \
+    (((SE_NUMERIC_HDR(num) & 0x1000) ? \
+      (int)((SE_NUMERIC_HDR(num) & 0x03FF) - 0x0400) : \
+      (int)((SE_NUMERIC_HDR(num) & 0x03FF))))
+#define SE_NUMERIC_WEIGHT_LONG(num) \
+    ((int)(*((const int16 *)((const char *)(num) + VARHDRSZ + 2))))
+#define SE_NUMERIC_WEIGHT(num) \
+    (SE_NUMERIC_IS_SHORT(num) ? SE_NUMERIC_WEIGHT_SHORT(num) \
+                               : SE_NUMERIC_WEIGHT_LONG(num))
+
+/* These macros are used only for Const handling in ExtractArithExprNode
+ * (4-byte varlena header constants from plan tree).  Variable columns
+ * are read via numeric_datum_to_i128 which handles both header forms. */
+#define SE_NUMERIC_HDR_SIZE_SHORT  (VARHDRSZ + 2)   /* hdr word only */
+#define SE_NUMERIC_HDR_SIZE_LONG   (VARHDRSZ + 4)   /* hdr word + weight int16 */
+#define SE_NUMERIC_HDR_SIZE(num) \
+    (SE_NUMERIC_IS_SHORT(num) ? SE_NUMERIC_HDR_SIZE_SHORT \
+                               : SE_NUMERIC_HDR_SIZE_LONG)
+#define SE_NUMERIC_NDIGITS(num) \
+    ((int)((VARSIZE(num) - SE_NUMERIC_HDR_SIZE(num)) / sizeof(int16)))
+#define SE_NUMERIC_DIGITS(num) \
+    ((const int16 *)((const char *)(num) + SE_NUMERIC_HDR_SIZE(num)))
+
+/*
+ * Powers of 10 as __int128, indexed 0..38.
+ * pow10_i128[i] = 10^i.
+ */
+static const __int128 pow10_i128[39] = {
+	(__int128)1,
+	(__int128)10,
+	(__int128)100,
+	(__int128)1000,
+	(__int128)10000,
+	(__int128)100000,
+	(__int128)1000000,
+	(__int128)10000000,
+	(__int128)100000000,
+	(__int128)1000000000,
+	(__int128)10000000000LL,
+	(__int128)100000000000LL,
+	(__int128)1000000000000LL,
+	(__int128)10000000000000LL,
+	(__int128)100000000000000LL,
+	(__int128)1000000000000000LL,
+	(__int128)10000000000000000LL,
+	(__int128)100000000000000000LL,
+	(__int128)1000000000000000000LL,
+	(__int128)10000000000000000000ULL,
+	(__int128)10000000000000000000ULL * 10,
+	(__int128)10000000000000000000ULL * 100,
+	(__int128)10000000000000000000ULL * 1000,
+	(__int128)10000000000000000000ULL * 10000,
+	(__int128)10000000000000000000ULL * 100000,
+	(__int128)10000000000000000000ULL * 1000000,
+	(__int128)10000000000000000000ULL * 10000000,
+	(__int128)10000000000000000000ULL * 100000000,
+	(__int128)10000000000000000000ULL * 1000000000,
+	(__int128)10000000000000000000ULL * 10000000000LL,
+	(__int128)10000000000000000000ULL * 100000000000LL,
+	(__int128)10000000000000000000ULL * 1000000000000LL,
+	(__int128)10000000000000000000ULL * 10000000000000LL,
+	(__int128)10000000000000000000ULL * 100000000000000LL,
+	(__int128)10000000000000000000ULL * 1000000000000000LL,
+	(__int128)10000000000000000000ULL * 10000000000000000LL,
+	(__int128)10000000000000000000ULL * 100000000000000000LL,
+	(__int128)10000000000000000000ULL * 1000000000000000000LL,
+	(__int128)10000000000000000000ULL * 10000000000000000000ULL,
+};
+
+/*
+ * Convert a NUMERIC datum to __int128 at the given target_scale.
+ *
+ * Handles both 1-byte and 4-byte varlena headers (VARATT_IS_SHORT).
+ * The returned value represents: round(numeric_value * 10^target_scale)
+ *
+ * Returns true on success; false if the value is NaN/Inf, the result
+ * would not fit in __int128, or target_scale is negative/implausible.
+ */
+static bool
+numeric_datum_to_i128(Datum d, int32 target_scale, __int128 *result)
+{
+	const char	   *raw = DatumGetPointer(d);
+	const char	   *nhdr_ptr;	/* pointer to NUMERIC header word */
+	uint32			total_size;	/* total varlena size in bytes */
+	uint16			nhdr;		/* NUMERIC header word */
+	bool			is_num_short;
+	bool			is_special;
+	bool			neg;
+	int				weight;
+	int				ndigits;
+	const int16	   *digits;
+	__int128		acc = 0;
+	int				i;
+
+	/* Determine varlena header size and locate NUMERIC data */
+	if (VARATT_IS_SHORT(raw))
+	{
+		nhdr_ptr   = raw + 1;
+		total_size = VARSIZE_SHORT(raw);
+	}
+	else
+	{
+		nhdr_ptr   = raw + VARHDRSZ;
+		total_size = VARSIZE(raw);
+	}
+
+	nhdr        = *((const uint16 *) nhdr_ptr);
+	is_num_short = (nhdr & 0x8000) != 0;
+	is_special   = (nhdr & 0xC000) == 0xC000;
+
+	if (is_special)
+		return false;	/* NaN / Inf */
+
+	if (target_scale < 0 || target_scale > 38)
+		return false;
+
+	if (is_num_short)
+	{
+		/* NUMERIC short form: sign/dscale/weight all in nhdr */
+		neg    = (nhdr & 0x2000) != 0;
+		/* weight: bit 6 = sign bit, bits 5..0 = magnitude */
+		weight = (nhdr & 0x0040)
+			? (int)((nhdr & 0x003F) - 0x0040)
+			: (int) (nhdr & 0x003F);
+		/* digits follow the 2-byte NUMERIC header */
+		digits  = (const int16 *)(nhdr_ptr + 2);
+		ndigits = (int)(total_size - (nhdr_ptr - raw) - 2) / (int)sizeof(int16);
+	}
+	else
+	{
+		/* NUMERIC long form: nhdr + int16 weight + digits */
+		neg    = (nhdr & 0x4000) != 0;
+		weight = (int)(*((const int16 *)(nhdr_ptr + 2)));
+		digits  = (const int16 *)(nhdr_ptr + 4);
+		ndigits = (int)(total_size - (nhdr_ptr - raw) - 4) / (int)sizeof(int16);
+	}
+
+	for (i = 0; i < ndigits; i++)
+	{
+		/*
+		 * digit[i] contributes: digits[i] * 10000^(weight-i)
+		 * At target_scale: contribution = digits[i] * 10^(4*(weight-i) + target_scale)
+		 */
+		int exp = 4 * (weight - i) + target_scale;
+
+		if (exp >= 35)
+			return false;	/* would overflow __int128 (9999 * 10^34 > 10^38) */
+
+		if (exp >= 0)
+		{
+			acc += (__int128) digits[i] * pow10_i128[exp];
+		}
+		else if (exp >= -3)
+		{
+			/* Round last fractional base-10000 digit */
+			int32 divisor = (int32) pow10_i128[-exp];
+			acc += (digits[i] + divisor / 2) / divisor;
+		}
+		/* exp < -3: below target precision, ignore */
+	}
+
+	*result = neg ? -acc : acc;
+	return true;
+}
+
+/*
+ * Convert an __int128 value (representing actual_value * 10^scale) to a
+ * NUMERIC Datum with exactly 'scale' decimal places.
+ *
+ * The returned Datum is palloc'd in the current memory context.
+ */
+static Datum
+i128_to_numeric_datum(__int128 val, int32 scale)
+{
+	char		tmp[52];	/* reversed digit buffer */
+	char		buf[52];	/* final string */
+	int			pos = 0;
+	bool		neg;
+	typedef unsigned __int128 u128;
+	u128		uval;
+	int			digit_count = 0;
+	int			i;
+
+	neg  = (val < 0);
+	uval = neg ? (u128)(-val) : (u128) val;
+
+	/* Emit digits LSB→MSB, inserting decimal point after 'scale' digits */
+	do {
+		tmp[pos++] = '0' + (char)(uval % 10);
+		uval /= 10;
+		digit_count++;
+		if (digit_count == scale && scale > 0)
+			tmp[pos++] = '.';
+	} while (uval > 0 || digit_count < scale);
+
+	/* Ensure an integer part exists after the decimal point */
+	if (scale > 0 && tmp[pos - 1] == '.')
+		tmp[pos++] = '0';
+
+	if (neg)
+		tmp[pos++] = '-';
+
+	/* Reverse into buf */
+	for (i = 0; i < pos; i++)
+		buf[i] = tmp[pos - 1 - i];
+	buf[pos] = '\0';
+
+	return DirectFunctionCall3(numeric_in,
+							   CStringGetDatum(buf),
+							   ObjectIdGetDatum(InvalidOid),
+							   Int32GetDatum(-1));
+}
+
+/*
+ * Recursively evaluate a VecExprNode tree using __int128 arithmetic.
+ *
+ * The returned value is in units of (actual_value * 10^cur->fixed_scale).
+ * Returns false if any NULL is encountered or if the fast path is
+ * inapplicable (fixed_scale < 0, unsupported type, etc.).
+ */
+static bool
+eval_vec_expr_node_i128(VecExprNode *nodes, VecExprNode *cur,
+						TupleTableSlot *batch_slot, int row_i,
+						__int128 *result)
+{
+	if (cur->fixed_scale < 0)
+		return false;
+
+	if (cur->is_var)
+	{
+		/* Constant leaf */
+		if (cur->slot_idx == VECEXPR_CONST_SENTINEL)
+		{
+			if (cur->const_isnull)
+				return false;
+
+			if (cur->col_type == VECGAGG_TYPE_INT4)
+			{
+				*result = (__int128) DatumGetInt32(cur->const_val);
+				return true;
+			}
+			if (cur->col_type == VECGAGG_TYPE_INT8)
+			{
+				*result = (__int128) DatumGetInt64(cur->const_val);
+				return true;
+			}
+			if (cur->col_type == VECGAGG_TYPE_NUMERIC)
+				return numeric_datum_to_i128(cur->const_val,
+											 cur->fixed_scale, result);
+			return false;
+		}
+
+		/* Variable leaf: read from VectorColumn batch */
+		{
+			VectorColumn *col = (VectorColumn *) batch_slot->tts_values[cur->slot_idx];
+
+			if (col == NULL || col->isnull[row_i])
+				return false;
+
+			{
+				int8 *rawptr = (int8 *) col->value +
+							   (int) col->columnTypeLen * row_i;
+				Datum val    = fetch_att(rawptr, col->columnIsVal,
+										 col->columnTypeLen);
+
+				if (cur->col_type == VECGAGG_TYPE_INT4)
+				{
+					*result = (__int128) DatumGetInt32(val);
+					return true;
+				}
+				if (cur->col_type == VECGAGG_TYPE_INT8)
+				{
+					*result = (__int128) DatumGetInt64(val);
+					return true;
+				}
+				if (cur->col_type == VECGAGG_TYPE_NUMERIC)
+					return numeric_datum_to_i128(val, cur->fixed_scale, result);
+				return false;
+			}
+		}
+	}
+	else
+	{
+		/* Operator node */
+		__int128 lval;
+
+		if (!eval_vec_expr_node_i128(nodes, &nodes[cur->left],
+									 batch_slot, row_i, &lval))
+			return false;
+
+		if (cur->right >= 0)
+		{
+			/* Binary operator */
+			__int128	rval;
+			int			ls = nodes[cur->left].fixed_scale;
+			int			rs = nodes[cur->right].fixed_scale;
+
+			if (!eval_vec_expr_node_i128(nodes, &nodes[cur->right],
+										 batch_slot, row_i, &rval))
+				return false;
+
+			switch (cur->op_type)
+			{
+				case SE_OPTYPE_MUL:
+					/* result_scale = ls + rs = cur->fixed_scale */
+					*result = lval * rval;
+					return true;
+
+				case SE_OPTYPE_ADD:
+				case SE_OPTYPE_SUB:
+					/* Align to max(ls, rs) = cur->fixed_scale */
+					if (ls < rs && (rs - ls) < 39)
+						lval *= pow10_i128[rs - ls];
+					else if (rs < ls && (ls - rs) < 39)
+						rval *= pow10_i128[ls - rs];
+
+					*result = (cur->op_type == SE_OPTYPE_ADD)
+						? lval + rval
+						: lval - rval;
+					return true;
+
+				default:
+					return false;
+			}
+		}
+		else
+		{
+			/* Unary cast (SE_OPTYPE_CAST): passthrough for scale-compatible casts */
+			*result = lval;
+			return true;
+		}
+	}
+}
 
 /* ----------------------------------------------------------------
  *  Custom scan method forward declarations
@@ -364,11 +733,12 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 		int			ki, i;
 		MemoryContext	oldctx;
 
-		if (state->num_groups >= VECGROUPAGG_MAX_GROUPS)
+		if (state->num_groups >= engine_vecgroupagg_max_groups)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("VectorGroupAgg: too many distinct groups (limit %d)",
-							VECGROUPAGG_MAX_GROUPS)));
+					 errmsg("VectorGroupAgg: too many distinct groups (limit %d); "
+							"increase storage_engine.vecgroupagg_max_groups to raise the limit",
+							engine_vecgroupagg_max_groups)));
 
 		/*
 		 * For by-reference key types, make stable copies in agg_context.
@@ -404,6 +774,8 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 			entry->numeric_state_acc[i]	= (Datum) 0;
 			entry->acc_isnull[i]		= true;
 			entry->distinct_htab[i]		= NULL;
+			entry->i128_acc[i]			= (__int128) 0;
+			entry->i128_overflow[i]		= false;
 
 			/* For COUNT(DISTINCT col), create a per-group hash set */
 			if (state->targets[i].agg_kind == VECGAGG_COUNT_DISTINCT)
@@ -863,66 +1235,77 @@ accumulate_value(VecGroupAggState *state, VecGroupEntry *entry,
 }
 
 /*
- * Comparison context for qsort-based sorted emission (single-key only).
- * Only used when sort_output=true and num_keys==1.
+ * Comparison function for qsort-based sorted emission.
+ * Supports any number of GROUP BY keys; key type info comes from the entry
+ * itself (ea->k.key_type[ki]), so no global state is needed.
  */
-static int	g_sort_key_type;	/* set before qsort call */
-
 static int
 vecgroup_entry_cmp(const void *a, const void *b)
 {
 	const VecGroupEntry *ea = *(const VecGroupEntry **) a;
 	const VecGroupEntry *eb = *(const VecGroupEntry **) b;
+	int					ki;
+	int					num_keys = ea->k.num_keys;
 
-	/* NULLs sort last */
-	if (ea->k.isnull[0] && eb->k.isnull[0])
-		return 0;
-	if (ea->k.isnull[0])
-		return 1;
-	if (eb->k.isnull[0])
-		return -1;
-
-	switch (g_sort_key_type)
+	for (ki = 0; ki < num_keys; ki++)
 	{
-		case VECGAGG_TYPE_INT4:
-		{
-			int64 va = DatumGetInt32(ea->k.key[0]);
-			int64 vb = DatumGetInt32(eb->k.key[0]);
-			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
-		}
-		case VECGAGG_TYPE_INT8:
-		{
-			int64 va = DatumGetInt64(ea->k.key[0]);
-			int64 vb = DatumGetInt64(eb->k.key[0]);
-			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
-		}
-		case VECGAGG_TYPE_FLOAT4:
-		{
-			float4 va = DatumGetFloat4(ea->k.key[0]);
-			float4 vb = DatumGetFloat4(eb->k.key[0]);
-			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
-		}
-		case VECGAGG_TYPE_FLOAT8:
-		{
-			float8 va = DatumGetFloat8(ea->k.key[0]);
-			float8 vb = DatumGetFloat8(eb->k.key[0]);
-			return (va < vb) ? -1 : (va > vb) ? 1 : 0;
-		}
-		case VECGAGG_TYPE_BPCHAR:
-		case VECGAGG_TYPE_TEXT:
-		{
-			int	 lena = ea->k.text_len[0];
-			int	 lenb = eb->k.text_len[0];
-			int	 minlen = (lena < lenb) ? lena : lenb;
-			int	 cmp = memcmp(ea->k.text_key[0], eb->k.text_key[0], minlen);
+		/* NULLs sort last */
+		if (ea->k.isnull[ki] && eb->k.isnull[ki])
+			continue;
+		if (ea->k.isnull[ki])
+			return 1;
+		if (eb->k.isnull[ki])
+			return -1;
 
-			if (cmp != 0)
-				return cmp;
-			return (lena < lenb) ? -1 : (lena > lenb) ? 1 : 0;
+		switch (ea->k.key_type[ki])
+		{
+			case VECGAGG_TYPE_INT4:
+			{
+				int64 va = DatumGetInt32(ea->k.key[ki]);
+				int64 vb = DatumGetInt32(eb->k.key[ki]);
+				if (va != vb) return (va < vb) ? -1 : 1;
+				break;
+			}
+			case VECGAGG_TYPE_INT8:
+			{
+				int64 va = DatumGetInt64(ea->k.key[ki]);
+				int64 vb = DatumGetInt64(eb->k.key[ki]);
+				if (va != vb) return (va < vb) ? -1 : 1;
+				break;
+			}
+			case VECGAGG_TYPE_FLOAT4:
+			{
+				float4 va = DatumGetFloat4(ea->k.key[ki]);
+				float4 vb = DatumGetFloat4(eb->k.key[ki]);
+				if (va != vb) return (va < vb) ? -1 : 1;
+				break;
+			}
+			case VECGAGG_TYPE_FLOAT8:
+			{
+				float8 va = DatumGetFloat8(ea->k.key[ki]);
+				float8 vb = DatumGetFloat8(eb->k.key[ki]);
+				if (va != vb) return (va < vb) ? -1 : 1;
+				break;
+			}
+			case VECGAGG_TYPE_BPCHAR:
+			case VECGAGG_TYPE_TEXT:
+			{
+				int	 lena = ea->k.text_len[ki];
+				int	 lenb = eb->k.text_len[ki];
+				int	 minlen = (lena < lenb) ? lena : lenb;
+				int	 cmp = memcmp(ea->k.text_key[ki], eb->k.text_key[ki], minlen);
+
+				if (cmp != 0)
+					return cmp;
+				if (lena != lenb)
+					return (lena < lenb) ? -1 : 1;
+				break;
+			}
+			default:
+				break;
 		}
-		default:
-			return 0;
 	}
+	return 0;
 }
 
 /*
@@ -993,6 +1376,65 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 			VecGroupAggTarget *tgt = &state->targets[t];
 			Datum	val = (Datum) 0;
 			bool	val_null = true;
+
+			/*
+			 * __int128 fast path for VECGAGG_SUM_EXPR with a known fixed
+			 * decimal scale.  Evaluates the expression without any palloc and
+			 * accumulates the result in i128_acc[t].  Falls back to the
+			 * standard NUMERIC path on overflow or if fixed_scale < 0.
+			 */
+			if (tgt->agg_kind == VECGAGG_SUM_EXPR &&
+				tgt->expr_num_nodes > 0 &&
+				tgt->expr_result_scale >= 0 &&
+				tgt->result_typeoid == NUMERICOID &&
+				!entry->i128_overflow[t])
+			{
+				__int128	expr_val;
+				bool		i128_ok;
+
+				i128_ok = eval_vec_expr_node_i128(
+					tgt->expr_nodes,
+					&tgt->expr_nodes[tgt->expr_root_idx],
+					slot, i, &expr_val);
+
+				if (i128_ok)
+				{
+					__int128 new_acc = entry->i128_acc[t] + expr_val;
+					bool ovfl = (expr_val > 0 && new_acc < entry->i128_acc[t]) ||
+								(expr_val < 0 && new_acc > entry->i128_acc[t]);
+
+					if (!ovfl)
+					{
+						entry->i128_acc[t]   = new_acc;
+						entry->acc_isnull[t] = false;
+						continue;	/* fast path: no further processing */
+					}
+
+					/* Overflow: flush i128_acc → numeric_state_acc and fall through */
+					entry->i128_overflow[t] = true;
+					{
+						ensure_numeric_fmgr(state);
+						MemoryContext oldctx =
+							MemoryContextSwitchTo(state->agg_context);
+						Datum acc_numeric =
+							i128_to_numeric_datum(entry->i128_acc[t],
+												  tgt->expr_result_scale);
+						entry->numeric_state_acc[t] =
+							call_numeric_binary_fmgr(
+								&state->numeric_avg_accum_fmgr,
+								entry->numeric_state_acc[t],
+								entry->numeric_state_acc[t] == (Datum) 0,
+								acc_numeric, false,
+								(Node *) &state->numeric_fake_aggstate);
+						MemoryContextSwitchTo(oldctx);
+					}
+					/* fall through: continue with NUMERIC path for this row */
+				}
+				else
+				{
+					continue;	/* NULL result: skip */
+				}
+			}
 
 			if (tgt->agg_kind == VECGAGG_SUM_EXPR && tgt->expr_num_nodes > 0)
 			{
@@ -1093,11 +1535,37 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 	for (int ki = 0; ki < state->num_keys; ki++)
 	{
 		int kra = state->key_result_attnum[ki];
-		if (kra >= 0 && kra < natt)
+
+		if (kra < 0 || kra >= natt)
+			continue;
+
+		if (entry->k.isnull[ki])
+		{
+			slot->tts_values[kra] = (Datum) 0;
+			slot->tts_isnull[kra] = true;
+			continue;
+		}
+
+		if (state->key_col_type[ki] == VECGAGG_TYPE_BPCHAR ||
+			state->key_col_type[ki] == VECGAGG_TYPE_TEXT)
+		{
+			/*
+			 * For varlena text keys, entry->k.key[ki] points into the
+			 * VectorColumn batch buffer that was freed after Phase 1.
+			 * Reconstruct a stable Datum from the inline text_key copy.
+			 */
+			int    len  = entry->k.text_len[ki];
+			text  *copy = (text *) palloc(VARHDRSZ + len);
+
+			SET_VARSIZE(copy, VARHDRSZ + len);
+			memcpy(VARDATA(copy), entry->k.text_key[ki], len);
+			slot->tts_values[kra] = PointerGetDatum(copy);
+		}
+		else
 		{
 			slot->tts_values[kra] = entry->k.key[ki];
-			slot->tts_isnull[kra] = entry->k.isnull[ki];
 		}
+		slot->tts_isnull[kra] = false;
 	}
 
 	/* Aggregate result atts */
@@ -1140,32 +1608,94 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 			case VECGAGG_MAX:
 					if (tgt->result_typeoid == NUMERICOID)
 					{
-						if (state->is_partial_serial &&
-							(tgt->agg_kind == VECGAGG_SUM || tgt->agg_kind == VECGAGG_SUM_EXPR))
+					/*
+					 * __int128 fast emit path for VECGAGG_SUM_EXPR.
+					 * For parallel workers (is_partial_serial=true) we must
+					 * emit a serialized numeric_avg_accum state (bytea), not a
+					 * raw NUMERIC, so the Finalize step can combine results.
+					 */
+					if (tgt->agg_kind == VECGAGG_SUM_EXPR &&
+						tgt->expr_result_scale >= 0 &&
+						!entry->i128_overflow[t])
+					{
+						if (state->is_partial_serial)
 						{
+							/*
+							 * Parallel worker: build a one-row
+							 * numeric_avg_accum state from the i128 sum and
+							 * serialize it to bytea.
+							 * The i128 fast path never calls ensure_numeric_fmgr
+							 * during accumulation, so we must ensure fmgrs are
+							 * initialized here before using them.
+							 */
+							ensure_numeric_fmgr(state);
+							MemoryContext oldctx =
+								MemoryContextSwitchTo(state->agg_context);
+							Datum i128_numeric =
+								i128_to_numeric_datum(entry->i128_acc[t],
+													  tgt->expr_result_scale);
+							Datum state_tmp =
+								call_numeric_binary_fmgr(
+									&state->numeric_avg_accum_fmgr,
+									(Datum) 0, true,
+									i128_numeric, false,
+									(Node *) &state->numeric_fake_aggstate);
 							slot->tts_values[ra] =
 								call_numeric_unary_fmgr(
 									&state->numeric_avg_serialize_fmgr,
-									entry->numeric_state_acc[t],
-									entry->numeric_state_acc[t] == (Datum) 0,
+									state_tmp, false,
 									(Node *) &state->numeric_fake_aggstate);
-						}
-						else if (tgt->agg_kind == VECGAGG_SUM ||
-								 tgt->agg_kind == VECGAGG_SUM_EXPR)
-						{
-							slot->tts_values[ra] =
-								call_numeric_unary_fmgr(
-									&state->numeric_sum_fmgr,
-									entry->numeric_state_acc[t],
-									entry->numeric_state_acc[t] == (Datum) 0,
-									(Node *) &state->numeric_fake_aggstate);
+							MemoryContextSwitchTo(oldctx);
 						}
 						else
 						{
-							slot->tts_values[ra] = entry->numeric_acc[t];
+							/* Serial or non-partial: emit raw NUMERIC */
+							slot->tts_values[ra] =
+								i128_to_numeric_datum(entry->i128_acc[t],
+													  tgt->expr_result_scale);
 						}
 						break;
 					}
+
+					if (state->is_partial_serial &&
+						(tgt->agg_kind == VECGAGG_SUM || tgt->agg_kind == VECGAGG_SUM_EXPR))
+					{
+						/* Non-i128 fallback (overflow): serialize the internal
+						 * state so the Finalize step can combine results. */
+						slot->tts_values[ra] =
+							call_numeric_unary_fmgr(
+								&state->numeric_avg_serialize_fmgr,
+								entry->numeric_state_acc[t],
+								entry->numeric_state_acc[t] == (Datum) 0,
+								(Node *) &state->numeric_fake_aggstate);
+						break;
+					}
+
+					if (tgt->agg_kind == VECGAGG_SUM ||
+						tgt->agg_kind == VECGAGG_SUM_EXPR)
+					{
+						/*
+						 * Serial non-partial: finalize the internal state.
+						 * numeric_state_acc holds the numeric_avg_accum() state;
+						 * numeric_sum(internal) extracts the final numeric sum.
+						 */
+						slot->tts_values[ra] =
+							call_numeric_unary_fmgr(
+								&state->numeric_sum_fmgr,
+								entry->numeric_state_acc[t],
+								entry->numeric_state_acc[t] == (Datum) 0,
+								(Node *) &state->numeric_fake_aggstate);
+						break;
+					}
+
+					if (tgt->agg_kind == VECGAGG_MIN ||
+						tgt->agg_kind == VECGAGG_MAX)
+					{
+						/* MIN/MAX use numeric_acc directly */
+						slot->tts_values[ra] = entry->numeric_acc[t];
+						break;
+					}
+					} /* end if (result_typeoid == NUMERICOID) */
 
 				switch (tgt->col_type)
 				{
@@ -1311,6 +1841,24 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 				}
 				break;
 		}
+
+		/*
+		 * Post-aggregate scalar operator: e.g. 0.5 * sum(col).
+		 * Applied after the switch computes slot->tts_values[ra].
+		 * Only active in AGGSPLIT_SIMPLE mode (has_post_mul=false in partial).
+		 */
+		if (tgt->has_post_mul && !state->is_partial_serial && !slot->tts_isnull[ra])
+		{
+			Datum _pm_arg1 = tgt->post_mul_const_is_lhs
+							 ? tgt->post_mul_const
+							 : slot->tts_values[ra];
+			Datum _pm_arg2 = tgt->post_mul_const_is_lhs
+							 ? slot->tts_values[ra]
+							 : tgt->post_mul_const;
+			slot->tts_values[ra] = FunctionCall2Coll(&tgt->post_mul_fmgr,
+													  InvalidOid,
+													  _pm_arg1, _pm_arg2);
+		}
 	}
 
 	return ExecStoreVirtualTuple(slot);
@@ -1439,8 +1987,9 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 		}
 
 		/* VECGAGG_SUM_EXPR: inline expression tree */
-		state->targets[tno].expr_num_nodes = PRIV_INT(list_nth(priv, target_idx++));
-		state->targets[tno].expr_root_idx  = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].expr_num_nodes  = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].expr_root_idx   = PRIV_INT(list_nth(priv, target_idx++));
+		state->targets[tno].expr_result_scale = PRIV_INT(list_nth(priv, target_idx++));
 		for (int en = 0; en < state->targets[tno].expr_num_nodes; en++)
 		{
 			VecExprNode *n = &state->targets[tno].expr_nodes[en];
@@ -1452,6 +2001,8 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 			n->right     = PRIV_INT(list_nth(priv, target_idx++));
 			n->opfuncid  = (Oid) PRIV_INT(list_nth(priv, target_idx++));
 			n->rettype   = (Oid) PRIV_INT(list_nth(priv, target_idx++));
+			n->fixed_scale = PRIV_INT(list_nth(priv, target_idx++));
+			n->op_type   = PRIV_INT(list_nth(priv, target_idx++));
 
 			/* Load runtime function info for operator nodes */
 			if (!n->is_var && OidIsValid(n->opfuncid))
@@ -1460,6 +2011,62 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 			/* Load type info for the node's return type */
 			if (OidIsValid(n->rettype))
 				get_typlenbyval(n->rettype, &n->rettyplen, &n->retbyval);
+		}
+
+		/* Restore const_val/const_isnull for VECEXPR_CONST_SENTINEL leaf nodes. */
+		for (int en = 0; en < state->targets[tno].expr_num_nodes; en++)
+		{
+			VecExprNode *n = &state->targets[tno].expr_nodes[en];
+
+			if (n->slot_idx == VECEXPR_CONST_SENTINEL)
+			{
+				Const *c = (Const *) list_nth(priv, target_idx++);
+
+				if (c->constisnull)
+				{
+					n->const_isnull = true;
+					n->const_val    = (Datum) 0;
+				}
+				else
+				{
+					n->const_isnull = false;
+					n->const_val    = datumCopy(c->constvalue,
+												n->retbyval,
+												n->rettyplen);
+				}
+			}
+		}
+
+		/* Post-aggregate scalar operator deserialization */
+		{
+			bool has_pm = (bool) PRIV_INT(list_nth(priv, target_idx++));
+			Oid  pm_opfuncid = (Oid) PRIV_INT(list_nth(priv, target_idx++));
+			bool pm_lhs      = (bool) PRIV_INT(list_nth(priv, target_idx++));
+			Const *pm_c      = (Const *) list_nth(priv, target_idx++);
+
+			state->targets[tno].has_post_mul = has_pm;
+			state->targets[tno].post_mul_opfuncid = pm_opfuncid;
+			state->targets[tno].post_mul_const_is_lhs = pm_lhs;
+			state->targets[tno].post_mul_const_plan = NULL; /* plan-time only */
+
+			if (has_pm && OidIsValid(pm_opfuncid) && !pm_c->constisnull)
+			{
+				int16	typlen;
+				bool	typbyval;
+
+				fmgr_info_cxt(pm_opfuncid, &state->targets[tno].post_mul_fmgr,
+							  state->agg_context);
+				get_typlenbyval(pm_c->consttype, &typlen, &typbyval);
+				state->targets[tno].post_mul_const =
+					datumCopy(pm_c->constvalue, typbyval, typlen);
+				state->targets[tno].post_mul_const_isnull = false;
+			}
+			else
+			{
+				state->targets[tno].has_post_mul = false;
+				state->targets[tno].post_mul_const = (Datum) 0;
+				state->targets[tno].post_mul_const_isnull = true;
+			}
 		}
 	}
 
@@ -1552,8 +2159,7 @@ ExecVecGroupAgg(CustomScanState *css)
 
 			Assert(n == state->num_groups);
 
-			/* Sort ascending by key */
-			g_sort_key_type = state->key_col_type[0];
+			/* Sort ascending by all GROUP BY keys */
 			if (n > 1)
 				qsort(state->sorted_arr, n, sizeof(VecGroupEntry *),
 					  vecgroup_entry_cmp);
@@ -1749,9 +2355,10 @@ engine_create_groupagg_node(int num_keys,
 		else
 			priv = lappend(priv, makeNullConst(INT4OID, -1, InvalidOid));
 
-		/* VECGAGG_SUM_EXPR: inline expression tree (2 ints + 7 ints per node) */
+		/* VECGAGG_SUM_EXPR: inline expression tree (3 ints + 9 ints per node) */
 		MKINT(targets[t].expr_num_nodes);
 		MKINT(targets[t].expr_root_idx);
+		MKINT(targets[t].expr_result_scale);
 		for (int en = 0; en < targets[t].expr_num_nodes; en++)
 		{
 			const VecExprNode *n = &targets[t].expr_nodes[en];
@@ -1762,7 +2369,32 @@ engine_create_groupagg_node(int num_keys,
 			MKINT(n->right);
 			MKINT((int) n->opfuncid);
 			MKINT((int) n->rettype);
+			MKINT(n->fixed_scale);
+			MKINT(n->op_type);
 		}
+		/* Serialize Const leaf values so parallel workers can restore const_val. */
+		for (int en = 0; en < targets[t].expr_num_nodes; en++)
+		{
+			const VecExprNode *n = &targets[t].expr_nodes[en];
+			if (n->slot_idx == VECEXPR_CONST_SENTINEL)
+			{
+				int16	typlen;
+				bool	typbyval;
+				get_typlenbyval(n->rettype, &typlen, &typbyval);
+				priv = lappend(priv, makeConst(n->rettype, -1, InvalidOid,
+											   typlen, n->const_val,
+											   n->const_isnull, typbyval));
+			}
+		}
+
+		/* Post-aggregate scalar operator (e.g. 0.5 * sum(col)) */
+		MKINT((int) targets[t].has_post_mul);
+		MKINT((int) targets[t].post_mul_opfuncid);
+		MKINT((int) targets[t].post_mul_const_is_lhs);
+		if (targets[t].has_post_mul && targets[t].post_mul_const_plan != NULL)
+			priv = lappend(priv, copyObject(targets[t].post_mul_const_plan));
+		else
+			priv = lappend(priv, makeNullConst(INT4OID, -1, InvalidOid));
 	}
 
 #undef MKINT

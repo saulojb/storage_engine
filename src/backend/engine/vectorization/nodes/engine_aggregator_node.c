@@ -5616,6 +5616,7 @@ static Node *CreateVectorAggState(CustomScan *custom_plan);
 static void BeginVectorAgg(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *ExecVectorAgg(CustomScanState *node);
 static void EndVectorAgg(CustomScanState *node);
+static void ReScanVectorAgg(CustomScanState *node);
 static void ExplainAggNode(CustomScanState *node, List *ancestors, ExplainState *es);
 
 static CustomScanMethods VectorAggNodeMethods = {
@@ -5629,6 +5630,7 @@ static CustomExecMethods VectorAggNodeExecMethods = {
 	.BeginCustomScan = BeginVectorAgg,
 	.ExecCustomScan = ExecVectorAgg,
 	.EndCustomScan = EndVectorAgg,
+	.ReScanCustomScan = ReScanVectorAgg,
 
 	.ExplainCustomScan = ExplainAggNode,
 
@@ -6438,6 +6440,50 @@ ExecVectorAgg(CustomScanState *node)
 	return ExecAgg((PlanState *)vas);
 }
 
+
+static void
+ReScanVectorAgg(CustomScanState *node)
+{
+	VectorAggState *vas = (VectorAggState *) node;
+
+	if (vas->vecMultiActive)
+	{
+		/* Reset all per-target accumulators */
+		for (int i = 0; i < vas->vecMultiNumTargets; i++)
+		{
+			VecMultiExprTarget *tgt = &vas->vecMultiTargets[i];
+			tgt->sum_float8 = 0.0;
+			tgt->sum_int64 = 0;
+			tgt->sum_numeric = NULL;
+			tgt->count = 0;
+			tgt->has_value = false;
+			tgt->numeric_partial_state = (Datum) 0;
+			tgt->numeric_partial_null = true;
+		}
+		if (vas->aggContext)
+			MemoryContextReset(vas->aggContext);
+		vas->done = false;
+		ExecReScan(outerPlanState(node));
+	}
+	else if (vas->vecExprActive)
+	{
+		/* Reset SumExpr accumulators */
+		vas->sumFloat8 = 0.0;
+		vas->sumNumeric = NULL;
+		vas->sumHasValue = false;
+		vas->numericPartialState = (Datum) 0;
+		vas->numericPartialStateNull = true;
+		if (vas->aggContext)
+			MemoryContextReset(vas->aggContext);
+		vas->done = false;
+		ExecReScan(outerPlanState(node));
+	}
+	else
+	{
+		/* Standard aggregation mode: delegate to AggState rescan */
+		ExecReScan((PlanState *) vas->aggstate);
+	}
+}
 
 static void
 EndVectorAgg(CustomScanState *node)

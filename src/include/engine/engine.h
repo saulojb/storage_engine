@@ -282,6 +282,7 @@ extern bool engine_enable_parallel_execution;
 extern int engine_min_parallel_processes;
 extern bool engine_enable_vectorization;
 extern bool engine_enable_vectorized_groupagg;
+extern int  engine_vecgroupagg_max_groups;
 extern bool engine_enable_automatic_plan;
 extern bool engine_debug_vectorized_groupagg_fallback;
 extern bool engine_enable_dml;
@@ -322,6 +323,8 @@ extern ColumnarReadState * ColumnarBeginRead(Relation relation,
 extern void ColumnarReadFlushPendingWrites(ColumnarReadState *readState);
 extern void ColumnarEndRead(ColumnarReadState *state);
 extern void ColumnarResetRead(ColumnarReadState *readState);
+extern void ColumnarResetChunkGroupRead(ColumnarReadState *readState);
+extern void ColumnarUnmarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId);
 
 /* functions only applicable for sequential access */
 extern bool ColumnarReadNextRow(ColumnarReadState *state, Datum *columnValues,

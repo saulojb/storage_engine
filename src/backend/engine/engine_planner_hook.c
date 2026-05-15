@@ -31,14 +31,17 @@
 #include "optimizer/plancat.h"
 #include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
+#include "nodes/makefuncs.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "parser/analyze.h"
 #include "parser/parser.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_func.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/ruleutils.h"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
 #include "utils/spccache.h"
@@ -70,16 +73,27 @@ static Oid engine_tableam_oid = InvalidOid;
 static bool QueryStringHasPlainExplain(const char *query);
 static bool QueryHasVectorizableAggregate(Query *parse);
 static bool QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse);
+static Oid GetEngineTableAmOid(void);
 static Oid GetRelationTableAmOid(Oid relid);
 static bool PlanHasColumnarCustomScan(Plan *plan);
 static bool PlanHasPathologicalSortedColumnarAgg(Plan *plan);
 static bool PlanHasHashColumnarAgg(Plan *plan);
+#if PG_VERSION_NUM >= PG_VERSION_19
+static bool AppendSortClauseSql(StringInfo buf, Query *query, List *dpcontext);
+static bool AppendLimitClauseSql(StringInfo buf, Query *query, List *dpcontext);
+static Node *DecorrelateNestedScalarAggSubLinksMutator(Node *node, void *context);
+static Query *TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(Query *parse,
+										 const char **planner_query_string);
+static Query *TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
+										 const char **planner_query_string);
+#endif
 static void MutatePlannedStmt(PlannedStmt *stmt);
 static bool TryVectorizeSerialPlan(PlannedStmt *stmt_serial,
 								   MemoryContext saved_context,
 								   Plan **savedPlanTree,
 								   List **savedSubplan);
 static void CollectProjectedAttnos(Plan *scan_plan, AttrNumber *attnos, int *count);
+#endif
 
 typedef struct PlanTreeMutatorContext
 {
@@ -858,6 +872,16 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 			n->right    = -1;
 			n->opfuncid = InvalidOid;
 			n->rettype  = v->vartype;
+			n->op_type  = SE_OPTYPE_NONE;
+			/* Derive fixed_scale from typmod for NUMERIC; 0 for integer types */
+			if (v->vartype == NUMERICOID)
+				n->fixed_scale = (v->vartypmod > VARHDRSZ)
+					? (int32)((v->vartypmod - VARHDRSZ) & 0xffff)
+					: -1;
+			else if (v->vartype == INT4OID || v->vartype == INT8OID)
+				n->fixed_scale = 0;
+			else
+				n->fixed_scale = -1;
 			return idx;
 		}
 	}
@@ -893,6 +917,24 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 		{
 			int			idx = (*num_nodes)++;
 			VecExprNode *n  = &nodes[idx];
+			int			ls  = nodes[left_idx].fixed_scale;
+			int			rs  = nodes[right_idx].fixed_scale;
+			int			ot  = SE_OPTYPE_NONE;
+			const char *fname;
+
+			/* Classify operator for the i128 fast path */
+			fname = get_func_name(op->opfuncid);
+			if (fname)
+			{
+				if (strstr(fname, "_mul") || strstr(fname, "mul"))
+					ot = SE_OPTYPE_MUL;
+				else if (strstr(fname, "_add") || strstr(fname, "pl"))
+					ot = SE_OPTYPE_ADD;
+				else if (strstr(fname, "_sub") || strstr(fname, "mi"))
+					ot = SE_OPTYPE_SUB;
+				else if (strstr(fname, "_div") || strstr(fname, "div"))
+					ot = SE_OPTYPE_DIV;
+			}
 
 			n->is_var   = false;
 			n->slot_idx = -1;
@@ -901,6 +943,16 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 			n->right    = right_idx;
 			n->opfuncid = op->opfuncid;
 			n->rettype  = op->opresulttype;
+			n->op_type  = ot;
+
+			/* Propagate fixed_scale for i128 arithmetic */
+			if (ot == SE_OPTYPE_MUL)
+				n->fixed_scale = (ls >= 0 && rs >= 0) ? ls + rs : -1;
+			else if (ot == SE_OPTYPE_ADD || ot == SE_OPTYPE_SUB)
+				n->fixed_scale = (ls >= 0 && rs >= 0) ? (ls > rs ? ls : rs) : -1;
+			else
+				n->fixed_scale = -1;  /* DIV or unknown → NUMERIC fallback */
+
 			return idx;
 		}
 	}
@@ -921,13 +973,45 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 			int			idx = (*num_nodes)++;
 			VecExprNode *n  = &nodes[idx];
 
-			n->is_var   = true;
-			n->slot_idx = VECEXPR_CONST_SENTINEL;
-			n->col_type = col_type;
-			n->left     = -1;
-			n->right    = -1;
-			n->opfuncid = InvalidOid;
-			n->rettype  = c->consttype;
+			n->is_var       = true;
+			n->slot_idx     = VECEXPR_CONST_SENTINEL;
+			n->col_type     = col_type;
+			n->left         = -1;
+			n->right        = -1;
+			n->opfuncid     = InvalidOid;
+			n->rettype      = c->consttype;
+			n->const_val    = c->constvalue;
+			n->const_isnull = c->constisnull;
+			n->op_type      = SE_OPTYPE_NONE;
+
+			/* Derive fixed_scale for the i128 fast path */
+			if (c->constisnull)
+				n->fixed_scale = -1;
+			else if (c->consttype == INT4OID || c->consttype == INT8OID)
+				n->fixed_scale = 0;
+			else if (c->consttype == NUMERICOID)
+			{
+				/*
+				 * Read the stored decimal scale (dscale) directly from the
+				 * NUMERIC varlena header.  The first two bytes after the
+				 * varlena length are the NumericChoice header word.  Bit 15
+				 * being set means "short" form; bits 12..7 = dscale in that
+				 * form.  Otherwise bit 14..0 of the long-form header = dscale.
+				 * Both forms have been stable since PostgreSQL 9.6.
+				 */
+				Numeric num = DatumGetNumeric(c->constvalue);
+				uint16  hdr = *((const uint16 *) ((const char *) num + VARHDRSZ));
+				bool    is_special = ((hdr & 0xC000) == 0xC000);  /* NaN / Inf */
+				if (is_special)
+					n->fixed_scale = -1;
+				else if (hdr & 0x8000)	/* short form: dscale in bits 12..7 */
+					n->fixed_scale = (int32)((hdr & 0x1F80) >> 7);
+				else					/* long form: dscale in bits 13..0 */
+					n->fixed_scale = (int32)(hdr & 0x3FFF);
+			}
+			else
+				n->fixed_scale = -1;
+
 			return idx;
 		}
 	}
@@ -982,6 +1066,29 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 			/* passthrough for multi-arg typmod casts (opfuncid=InvalidOid) */
 			n->opfuncid = (nargs == 1) ? f->funcid : InvalidOid;
 			n->rettype  = f->funcresulttype;
+			n->op_type  = SE_OPTYPE_CAST;
+
+			/*
+			 * Propagate child's fixed_scale through the cast.
+			 * For multi-arg numeric typmod casts, the second arg encodes the
+			 * typmod; extract the output scale from it when available.
+			 */
+			if (nargs > 1)
+			{
+				Node *typmod_node = (Node *) lsecond(f->args);
+				if (IsA(typmod_node, Const))
+				{
+					int32 tmod = DatumGetInt32(((Const *) typmod_node)->constvalue);
+					n->fixed_scale = (tmod > VARHDRSZ)
+						? (int32)((tmod - VARHDRSZ) & 0xffff)
+						: nodes[child_idx].fixed_scale;
+				}
+				else
+					n->fixed_scale = nodes[child_idx].fixed_scale;
+			}
+			else
+				n->fixed_scale = nodes[child_idx].fixed_scale;
+
 			return idx;
 		}
 	}
@@ -1040,6 +1147,7 @@ ExtractTargetAggref(Node *expr, Aggref **out_aggref)
 		return false;
 	}
 }
+
 
 /*
  * Classify an Aggref into VECGAGG_COUNT_STAR / SUM / MIN / MAX / AVG.
@@ -2100,21 +2208,50 @@ PlanTreeMutator(Plan *node, void *context)
 							(void) FindFirstAggref_walker((Node *) _guard_te->expr,
 														  &_found_agg);
 
-							if (_found_agg != NULL && list_length(_found_agg->args) == 1)
+							if (_found_agg != NULL)
 							{
-								TargetEntry *_agg_arg_te =
-									(TargetEntry *) linitial(_found_agg->args);
-
-								if (_agg_arg_te != NULL && !IsA(_agg_arg_te->expr, Var))
+								/*
+								 * Check 1: aggref's argument is a non-Var expression
+								 * (e.g. sum(price * qty)).  ExpressionMutator would
+								 * try to vectorize the inner operator, which expects
+								 * VectorColumn* arguments → SIGSEGV.
+								 */
+								if (list_length(_found_agg->args) == 1)
 								{
-									_has_expr_agg = true;
-									break;
+									TargetEntry *_agg_arg_te =
+										(TargetEntry *) linitial(_found_agg->args);
+
+									if (_agg_arg_te != NULL &&
+										!IsA(_agg_arg_te->expr, Var))
+									{
+										_has_expr_agg = true;
+										break;
+									}
+								}
+
+								/*
+								 * Check 2: the aggref is wrapped in an outer expression
+								 * (e.g. 0.5 * sum(col), round(avg(col), 4)).
+								 * ExtractTargetAggref only succeeds when the aggref is
+								 * at the top of the expression (possibly through safe
+								 * single-arg wrappers like RelabelType/CoerceViaIO).
+								 * If it fails, the regular VectorAgg path cannot handle
+								 * this TL entry → fall back to PG standard.
+								 */
+								{
+									Aggref *_top_agg = NULL;
+									if (!ExtractTargetAggref(
+											(Node *) _guard_te->expr, &_top_agg))
+									{
+										_has_expr_agg = true;
+										break;
+									}
 								}
 							}
 						}
 
 						if (_has_expr_agg)
-							break;	/* arithmetic expr in agg — fall back to PG standard */
+							break;	/* arithmetic expr in/around agg — fall back to PG standard */
 					}
 
 					vectorizedAggNode = engine_create_aggregator_node();
@@ -2182,7 +2319,8 @@ PlanTreeMutator(Plan *node, void *context)
 			 *   - Aggregates: count(*), count(col), sum, min, max, avg over
 			 *     int4/int8/float4/float8/numeric
 			 *   - Direct ColcompressScan child (no intermediate nodes)
-			 *   - No HAVING clause (plan.qual must be empty)
+			 *   - HAVING is preserved on the replacement scan node so the
+			 *     executor can apply it after group emission
 			 */
 			if (engine_enable_vectorized_groupagg &&
 				(aggNode->aggstrategy == AGG_HASHED ||
@@ -2208,6 +2346,7 @@ PlanTreeMutator(Plan *node, void *context)
 				int				key_result_atts[VECGROUPAGG_MAX_KEYS];
 				VecGroupAggTarget targets[VECGROUPAGG_MAX_TARGETS];
 				int				num_targets = 0;
+				memset(targets, 0, sizeof(targets));
 				bool			supported = true;
 				ListCell	   *lc;
 				int				result_att;
@@ -2256,17 +2395,6 @@ PlanTreeMutator(Plan *node, void *context)
 					 strcmp(childScan->methods->CustomName, "ColcompressScan") != 0))
 				{
 					fallback_reason = "child CustomScan is not ColcompressScan";
-					goto groupagg_fallback;
-				}
-
-				/*
-				 * HAVING guard: plan.qual is the HAVING filter.
-				 * VecGroupAgg does not evaluate quals during emission,
-				 * so fall back to avoid returning wrong results.
-				 */
-				if (aggNode->plan.qual != NIL)
-				{
-					fallback_reason = "HAVING clause not supported by VecGroupAgg";
 					goto groupagg_fallback;
 				}
 
@@ -2402,7 +2530,7 @@ PlanTreeMutator(Plan *node, void *context)
 				 * Bail out early if estimated distinct groups exceed VecGroupAgg
 				 * safety margin. This avoids runtime overflow at MAX_GROUPS.
 				 */
-				if (estimated_groups > (double) (VECGROUPAGG_MAX_GROUPS * 3 / 4))
+if (estimated_groups > (double) (engine_vecgroupagg_max_groups * 3 / 4))
 				{
 					fallback_reason = "estimated groups exceed safety margin";
 					goto groupagg_fallback;
@@ -2502,10 +2630,51 @@ PlanTreeMutator(Plan *node, void *context)
 					}
 					else if (!ExtractTargetAggref((Node *) te->expr, &aggref))
 					{
-						fallback_reason = psprintf("target aggregate shape unsupported (nodeTag=%d)",
-									   (int) nodeTag(te->expr));
-						supported = false;
-						break;
+						/*
+						 * Try to extract OpExpr(Const OP Aggref) or OpExpr(Aggref OP Const).
+						 * e.g. 0.5 * sum(col) or sum(col) * 2.
+						 * Only supported in AGGSPLIT_SIMPLE (non-partial) mode.
+						 */
+						if (IsA(te->expr, OpExpr) &&
+							aggNode->aggsplit == AGGSPLIT_SIMPLE)
+						{
+							OpExpr *_opexpr = (OpExpr *) te->expr;
+							if (list_length(_opexpr->args) == 2 &&
+								OidIsValid(_opexpr->opfuncid))
+							{
+								Node   *_arg1 = (Node *) linitial(_opexpr->args);
+								Node   *_arg2 = (Node *) lsecond(_opexpr->args);
+								Aggref *_maybe_aggref = NULL;
+
+								if (IsA(_arg1, Const) &&
+									ExtractTargetAggref(_arg2, &_maybe_aggref))
+								{
+									/* Pattern: Const OP Aggref */
+									aggref = _maybe_aggref;
+									targets[num_targets].has_post_mul = true;
+									targets[num_targets].post_mul_opfuncid = _opexpr->opfuncid;
+									targets[num_targets].post_mul_const_is_lhs = true;
+									targets[num_targets].post_mul_const_plan = (Const *) _arg1;
+								}
+								else if (IsA(_arg2, Const) &&
+										 ExtractTargetAggref(_arg1, &_maybe_aggref))
+								{
+									/* Pattern: Aggref OP Const */
+									aggref = _maybe_aggref;
+									targets[num_targets].has_post_mul = true;
+									targets[num_targets].post_mul_opfuncid = _opexpr->opfuncid;
+									targets[num_targets].post_mul_const_is_lhs = false;
+									targets[num_targets].post_mul_const_plan = (Const *) _arg2;
+								}
+							}
+						}
+						if (aggref == NULL)
+						{
+							fallback_reason = psprintf("target aggregate shape unsupported (nodeTag=%d)",
+											   (int) nodeTag(te->expr));
+							supported = false;
+							break;
+						}
 					}
 
 					if (num_targets >= VECGROUPAGG_MAX_TARGETS)
@@ -2577,13 +2746,18 @@ PlanTreeMutator(Plan *node, void *context)
 						{
 							memcpy(targets[num_targets].expr_nodes, expr_nodes_tmp,
 								   sizeof(VecExprNode) * expr_num_tmp);
-							targets[num_targets].expr_num_nodes = expr_num_tmp;
-							targets[num_targets].expr_root_idx  = expr_root_tmp;
+							targets[num_targets].expr_num_nodes   = expr_num_tmp;
+							targets[num_targets].expr_root_idx    = expr_root_tmp;
+							targets[num_targets].expr_result_scale =
+								(expr_root_tmp >= 0)
+								? expr_nodes_tmp[expr_root_tmp].fixed_scale
+								: -1;
 						}
 						else
 						{
-							targets[num_targets].expr_num_nodes = 0;
-							targets[num_targets].expr_root_idx  = -1;
+							targets[num_targets].expr_num_nodes   = 0;
+							targets[num_targets].expr_root_idx    = -1;
+							targets[num_targets].expr_result_scale = -1;
 						}
 					}
 
@@ -2732,6 +2906,7 @@ PlanTreeMutator(Plan *node, void *context)
 					vgaNodePlan->total_cost   = aggNode->plan.total_cost;
 					vgaNodePlan->plan_rows    = aggNode->plan.plan_rows;
 					vgaNodePlan->plan_width   = aggNode->plan.plan_width;
+					vgaNodePlan->qual         = aggNode->plan.qual;
 
 					/*
 					 * scan.plan.targetlist must contain only simple Var
@@ -2835,16 +3010,37 @@ groupagg_fallback:
 				CustomScan *vga = (CustomScan *) node->lefttree;
 
 				/*
-				 * Only absorb single-key Sorts.  The GROUP BY key is at
-				 * 1-based position (key_result_att + 1) in VecGroupAgg's
-				 * output; key_result_att is at custom_private[4].
+				 * Absorb the Sort into VecGroupAgg (sort_output=true) when the
+				 * Sort columns exactly match the GROUP BY key output positions.
+				 * Layout of custom_private:
+				 *   [0]                num_keys
+				 *   [1..nk]            key_attnums
+				 *   [nk+1..2nk]       key_typeoids
+				 *   [2nk+1..3nk]      key_is_consts
+				 *   [3nk+1..4nk]      key_result_atts   ← used here
 				 */
-				if (sortNode->numCols == 1)
-				{
-					int key_result_att_vga = DatumGetInt32(
-						((Const *) list_nth(vga->custom_private, 4))->constvalue);
+				int num_keys_vga = DatumGetInt32(
+					((Const *) list_nth(vga->custom_private, 0))->constvalue);
 
-					if (sortNode->sortColIdx[0] == (AttrNumber)(key_result_att_vga + 1))
+				if (sortNode->numCols == num_keys_vga)
+				{
+					bool keys_match = true;
+					int  ki;
+
+					for (ki = 0; ki < num_keys_vga; ki++)
+					{
+						int kra = DatumGetInt32(
+							((Const *) list_nth(vga->custom_private,
+												3 * num_keys_vga + 1 + ki))->constvalue);
+
+						if (sortNode->sortColIdx[ki] != (AttrNumber)(kra + 1))
+						{
+							keys_match = false;
+							break;
+						}
+					}
+
+					if (keys_match)
 					{
 						engine_groupagg_enable_sort_output(vga);
 						return node->lefttree;  /* Drop the Sort */
@@ -2893,6 +3089,7 @@ MutatePlannedStmt(PlannedStmt *stmt)
 	stmt->subplans = subplans;
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_14
 /*
  * TryVectorizeSerialPlan
  *
@@ -2950,6 +3147,9 @@ ColumnarPlannerHook(Query *parse,
 					)
 {
 	PlannedStmt	*stmt;
+#if PG_VERSION_NUM >= PG_VERSION_13
+	const char *planner_query_string = query_string;
+#endif
 #if PG_VERSION_NUM >= PG_VERSION_14
 	bool pass1Vectorized = false;
 	bool pass2Vectorized = false;
@@ -2969,6 +3169,21 @@ ColumnarPlannerHook(Query *parse,
 #if PG_VERSION_NUM < PG_VERSION_13
 	/* query_string not passed by PG12 planner hook — not available */
 	const char *query_string = NULL;
+	const char *planner_query_string = NULL;
+#endif
+
+#if PG_VERSION_NUM >= PG_VERSION_19
+	{
+		Query *decorrelated_parse =
+			TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(parse,
+										   &planner_query_string);
+
+		if (decorrelated_parse != NULL)
+		{
+			parse = decorrelated_parse;
+			lowCardinalityGroupBy = QueryHasSingleLowCardinalityColumnarGroupBy(parse);
+		}
+	}
 #endif
 
 	/*
@@ -2990,17 +3205,17 @@ ColumnarPlannerHook(Query *parse,
 #endif
 	if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
-			stmt = PreviousPlannerHook(parse, query_string, cursorOptions, boundParams, es);
+			stmt = PreviousPlannerHook(parse, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-			stmt = PreviousPlannerHook(parse, query_string, cursorOptions, boundParams);
+			stmt = PreviousPlannerHook(parse, planner_query_string, cursorOptions, boundParams);
 #else
 			stmt = PreviousPlannerHook(parse, cursorOptions, boundParams);
 #endif
 		else
 #if PG_VERSION_NUM >= PG_VERSION_19
-			stmt = standard_planner(parse, query_string, cursorOptions, boundParams, es);
+			stmt = standard_planner(parse, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-			stmt = standard_planner(parse, query_string, cursorOptions, boundParams);
+			stmt = standard_planner(parse, planner_query_string, cursorOptions, boundParams);
 #else
 			stmt = standard_planner(parse, cursorOptions, boundParams);
 #endif
@@ -3042,8 +3257,7 @@ ColumnarPlannerHook(Query *parse,
 		|| stmt->commandType != CMD_SELECT)		/* only SELECTS are supported  */
 		return stmt;
 
-	if (engine_tableam_oid == InvalidOid)
-		engine_tableam_oid = get_table_am_oid("columnar", true);
+	(void) GetEngineTableAmOid();
 
 #if PG_VERSION_NUM >= PG_VERSION_14
 	if (parse_for_sortavoid != NULL &&
@@ -3056,17 +3270,17 @@ ColumnarPlannerHook(Query *parse,
 		{
 			if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
-				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, query_string, cursorOptions, boundParams, es);
+				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, query_string, cursorOptions, boundParams);
+				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, planner_query_string, cursorOptions, boundParams);
 #else
 				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, cursorOptions, boundParams);
 #endif
 			else
 #if PG_VERSION_NUM >= PG_VERSION_19
-				stmt_hash = standard_planner(parse_for_sortavoid, query_string, cursorOptions, boundParams, es);
+				stmt_hash = standard_planner(parse_for_sortavoid, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-				stmt_hash = standard_planner(parse_for_sortavoid, query_string, cursorOptions, boundParams);
+				stmt_hash = standard_planner(parse_for_sortavoid, planner_query_string, cursorOptions, boundParams);
 #else
 				stmt_hash = standard_planner(parse_for_sortavoid, cursorOptions, boundParams);
 #endif
@@ -3146,6 +3360,7 @@ ColumnarPlannerHook(Query *parse,
 				stmt->subplans = savedParallelSubplan;
 			}
 			PG_END_TRY();
+
 		}
 
 		max_parallel_workers_per_gather = 0;
@@ -3157,17 +3372,17 @@ ColumnarPlannerHook(Query *parse,
 
 			if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
-				stmt_serial = PreviousPlannerHook(parse_for_pass2, query_string, cursorOptions, boundParams, es);
+				stmt_serial = PreviousPlannerHook(parse_for_pass2, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-				stmt_serial = PreviousPlannerHook(parse_for_pass2, query_string, cursorOptions, boundParams);
+				stmt_serial = PreviousPlannerHook(parse_for_pass2, planner_query_string, cursorOptions, boundParams);
 #else
 				stmt_serial = PreviousPlannerHook(parse_for_pass2, cursorOptions, boundParams);
 #endif
 			else
 #if PG_VERSION_NUM >= PG_VERSION_19
-				stmt_serial = standard_planner(parse_for_pass2, query_string, cursorOptions, boundParams, es);
+				stmt_serial = standard_planner(parse_for_pass2, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-				stmt_serial = standard_planner(parse_for_pass2, query_string, cursorOptions, boundParams);
+				stmt_serial = standard_planner(parse_for_pass2, planner_query_string, cursorOptions, boundParams);
 #else
 				stmt_serial = standard_planner(parse_for_pass2, cursorOptions, boundParams);
 #endif
@@ -3352,8 +3567,7 @@ QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse)
 	if (rte == NULL || rte->rtekind != RTE_RELATION)
 		return false;
 
-	if (engine_tableam_oid == InvalidOid)
-		engine_tableam_oid = get_table_am_oid("columnar", true);
+	(void) GetEngineTableAmOid();
 
 	if (!OidIsValid(engine_tableam_oid) || GetRelationTableAmOid(rte->relid) != engine_tableam_oid)
 		return false;
@@ -3399,6 +3613,19 @@ QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse)
 }
 
 static Oid
+GetEngineTableAmOid(void)
+{
+	if (OidIsValid(engine_tableam_oid))
+		return engine_tableam_oid;
+
+	engine_tableam_oid = get_table_am_oid("colcompress", true);
+	if (!OidIsValid(engine_tableam_oid))
+		engine_tableam_oid = get_table_am_oid("columnar", true);
+
+	return engine_tableam_oid;
+}
+
+static Oid
 GetRelationTableAmOid(Oid relid)
 {
 	HeapTuple classTuple;
@@ -3415,6 +3642,769 @@ GetRelationTableAmOid(Oid relid)
 
 	return relam;
 }
+
+#if PG_VERSION_NUM >= PG_VERSION_19
+typedef struct ScalarAggSubLinkInfo
+{
+	OpExpr *compareQual;
+	Query *innerQuery;
+	Node *outerExpr;
+	Node *innerTargetExpr;
+	List *innerKeyVars;
+	List *outerKeyVars;
+	Node *outerRemainingQuals;
+	Node *innerLocalQuals;
+	bool sublinkOnLeft;
+} ScalarAggSubLinkInfo;
+
+static void
+CollectAndClauses(Node *node, List **clauses)
+{
+	if (node == NULL)
+		return;
+
+	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == AND_EXPR)
+	{
+		ListCell *lc;
+
+		foreach(lc, ((BoolExpr *) node)->args)
+			CollectAndClauses((Node *) lfirst(lc), clauses);
+		return;
+	}
+
+	*clauses = lappend(*clauses, node);
+}
+
+static Node *
+BuildAndClause(List *clauses)
+{
+	if (clauses == NIL)
+		return NULL;
+	if (list_length(clauses) == 1)
+		return (Node *) linitial(clauses);
+	return (Node *) makeBoolExpr(AND_EXPR, clauses, -1);
+}
+
+static Node *
+StripRelabels(Node *node)
+{
+	for (;;)
+	{
+		if (node == NULL)
+			return NULL;
+		if (IsA(node, RelabelType))
+			node = (Node *) ((RelabelType *) node)->arg;
+		else
+			return node;
+	}
+}
+
+static bool
+QueryUsesColumnarRelation(Query *parse)
+{
+	ListCell *lc;
+
+	if (parse == NULL || parse->rtable == NIL)
+		return false;
+
+	(void) GetEngineTableAmOid();
+
+	if (!OidIsValid(engine_tableam_oid))
+		return false;
+
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+
+		if (GetRelationTableAmOid(rte->relid) == engine_tableam_oid)
+			return true;
+	}
+
+	return false;
+}
+
+static bool
+ExtractCorrelationEquality(Node *quals,
+						   List **innerKeyVars,
+						   List **outerKeyVars,
+						   Node **innerLocalQuals)
+{
+	List *clauses = NIL;
+	List *localClauses = NIL;
+	ListCell *lc;
+	bool foundCorrelation = false;
+
+	CollectAndClauses(quals, &clauses);
+
+	foreach(lc, clauses)
+	{
+		Node *qual = (Node *) lfirst(lc);
+		Node *left;
+		Node *right;
+		OpExpr *op;
+		const char *opname;
+
+		if (!IsA(qual, OpExpr))
+		{
+			localClauses = lappend(localClauses, qual);
+			continue;
+		}
+
+		op = (OpExpr *) qual;
+		if (list_length(op->args) != 2)
+		{
+			localClauses = lappend(localClauses, qual);
+			continue;
+		}
+
+		opname = get_opname(op->opno);
+		if (opname == NULL || strcmp(opname, "=") != 0)
+		{
+			localClauses = lappend(localClauses, qual);
+			continue;
+		}
+
+		left = StripRelabels((Node *) linitial(op->args));
+		right = StripRelabels((Node *) lsecond(op->args));
+
+		if (!IsA(left, Var) || !IsA(right, Var))
+		{
+			localClauses = lappend(localClauses, qual);
+			continue;
+		}
+
+		if (((Var *) left)->varlevelsup == 0 && ((Var *) right)->varlevelsup == 1)
+		{
+			Var *flattenedOuterKey;
+
+			flattenedOuterKey = copyObject((Var *) right);
+			flattenedOuterKey->varlevelsup = 0;
+			*innerKeyVars = lappend(*innerKeyVars, left);
+			*outerKeyVars = lappend(*outerKeyVars, flattenedOuterKey);
+			foundCorrelation = true;
+			continue;
+		}
+
+		if (((Var *) left)->varlevelsup == 1 && ((Var *) right)->varlevelsup == 0)
+		{
+			Var *flattenedOuterKey;
+
+			flattenedOuterKey = copyObject((Var *) left);
+			flattenedOuterKey->varlevelsup = 0;
+			*innerKeyVars = lappend(*innerKeyVars, right);
+			*outerKeyVars = lappend(*outerKeyVars, flattenedOuterKey);
+			foundCorrelation = true;
+			continue;
+		}
+
+		localClauses = lappend(localClauses, qual);
+	}
+
+	if (!foundCorrelation)
+		return false;
+
+	*innerLocalQuals = BuildAndClause(localClauses);
+	return true;
+}
+
+static bool
+ExtractScalarAggSubLinkInfo(Query *parse, ScalarAggSubLinkInfo *info)
+{
+	List *outerClauses = NIL;
+	ListCell *lc;
+
+	if (parse == NULL || parse->jointree == NULL || parse->jointree->quals == NULL)
+		return false;
+
+	memset(info, 0, sizeof(*info));
+	CollectAndClauses(parse->jointree->quals, &outerClauses);
+
+	foreach(lc, outerClauses)
+	{
+		Node *qual = (Node *) lfirst(lc);
+		OpExpr *op;
+		Node *left;
+		Node *right;
+		SubLink *subLink;
+		Query *innerQuery;
+		TargetEntry *innerTarget = NULL;
+		ListCell *tlc;
+		List *remainingClauses = NIL;
+		ListCell *lc2;
+
+		if (!IsA(qual, OpExpr))
+			continue;
+
+		op = (OpExpr *) qual;
+		if (list_length(op->args) != 2)
+			continue;
+
+		left = StripRelabels((Node *) linitial(op->args));
+		right = StripRelabels((Node *) lsecond(op->args));
+
+		if (IsA(left, SubLink) == IsA(right, SubLink))
+			continue;
+
+		subLink = IsA(left, SubLink) ? (SubLink *) left : (SubLink *) right;
+		if (subLink->subLinkType != EXPR_SUBLINK || !IsA(subLink->subselect, Query))
+			continue;
+
+		innerQuery = (Query *) subLink->subselect;
+		if (innerQuery->commandType != CMD_SELECT ||
+			!innerQuery->hasAggs ||
+			innerQuery->setOperations != NULL ||
+			innerQuery->groupClause != NIL ||
+			innerQuery->havingQual != NULL ||
+			innerQuery->distinctClause != NIL ||
+			innerQuery->sortClause != NIL ||
+			innerQuery->limitOffset != NULL ||
+			innerQuery->limitCount != NULL ||
+			innerQuery->windowClause != NIL ||
+			innerQuery->jointree == NULL)
+			continue;
+
+		foreach(tlc, innerQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, tlc);
+
+			if (te->resjunk)
+				continue;
+
+			if (innerTarget != NULL)
+			{
+				innerTarget = NULL;
+				break;
+			}
+
+			innerTarget = te;
+		}
+
+		if (innerTarget == NULL || contain_vars_of_level((Node *) innerTarget->expr, 1))
+			continue;
+
+		if (!ExtractCorrelationEquality(innerQuery->jointree->quals,
+								   &info->innerKeyVars,
+								   &info->outerKeyVars,
+								   &info->innerLocalQuals))
+			continue;
+
+		foreach(lc2, outerClauses)
+		{
+			if (lfirst(lc2) != qual)
+				remainingClauses = lappend(remainingClauses, lfirst(lc2));
+		}
+
+		info->compareQual = op;
+		info->innerQuery = innerQuery;
+		info->outerExpr = IsA(left, SubLink) ? (Node *) lsecond(op->args)
+										 : (Node *) linitial(op->args);
+		info->innerTargetExpr = (Node *) innerTarget->expr;
+		info->outerRemainingQuals = BuildAndClause(remainingClauses);
+		info->sublinkOnLeft = IsA(left, SubLink);
+		return true;
+	}
+
+	return false;
+}
+
+static List *
+BuildRelationDeparseContext(Query *query)
+{
+	PlannedStmt pstmt;
+	List *rtableNames;
+
+	if (query == NULL || query->rtable == NIL)
+		return NIL;
+
+	memset(&pstmt, 0, sizeof(pstmt));
+	pstmt.rtable = query->rtable;
+	rtableNames = select_rtable_names_for_explain(query->rtable, NULL);
+
+	return deparse_context_for_plan_tree(&pstmt, rtableNames);
+}
+
+static bool
+AppendSimpleFromClause(StringInfo buf, Query *query, List *fromlist)
+{
+	ListCell *lc;
+	bool first = true;
+
+	foreach(lc, fromlist)
+	{
+		RangeTblRef *rtr;
+		RangeTblEntry *rte;
+		char *relname;
+
+		if (!IsA(lfirst(lc), RangeTblRef))
+			return false;
+
+		rtr = lfirst_node(RangeTblRef, lc);
+		rte = rt_fetch(rtr->rtindex, query->rtable);
+		if (rte == NULL || rte->rtekind != RTE_RELATION)
+			return false;
+
+		relname = get_rel_name(rte->relid);
+		if (relname == NULL)
+			return false;
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		appendStringInfoString(buf, quote_identifier(relname));
+		if (rte->alias != NULL && rte->alias->aliasname != NULL &&
+			strcmp(rte->alias->aliasname, relname) != 0)
+			appendStringInfo(buf, " %s", quote_identifier(rte->alias->aliasname));
+	}
+
+	return !first;
+}
+
+static bool
+AppendTargetListSql(StringInfo buf, List *targetList, List *dpcontext)
+{
+	ListCell *lc;
+	bool first = true;
+
+	foreach(lc, targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		char *exprSql;
+
+		if (te->resjunk)
+			continue;
+
+		exprSql = deparse_expression((Node *) te->expr, dpcontext, true, false);
+		if (exprSql == NULL)
+			return false;
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		appendStringInfoString(buf, exprSql);
+		if (te->resname != NULL && te->resname[0] != '\0')
+			appendStringInfo(buf, " AS %s", quote_identifier(te->resname));
+	}
+
+	return !first;
+}
+
+static bool
+AppendSortClauseSql(StringInfo buf, Query *query, List *dpcontext)
+{
+	ListCell *lc;
+	bool first = true;
+
+	if (query == NULL || query->sortClause == NIL)
+		return true;
+
+	appendStringInfoString(buf, " order by ");
+
+	foreach(lc, query->sortClause)
+	{
+		SortGroupClause *sortClause = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle;
+		char *exprSql;
+
+		tle = get_sortgroupclause_tle(sortClause, query->targetList);
+		if (tle == NULL)
+			return false;
+
+		exprSql = deparse_expression((Node *) tle->expr, dpcontext, true, false);
+		if (exprSql == NULL)
+			return false;
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		appendStringInfoString(buf, exprSql);
+		appendStringInfoString(buf, sortClause->reverse_sort ? " desc" : " asc");
+	}
+
+	return true;
+}
+
+static bool
+AppendLimitClauseSql(StringInfo buf, Query *query, List *dpcontext)
+{
+	char *limitOffsetSql = NULL;
+	char *limitCountSql = NULL;
+
+	if (query == NULL)
+		return false;
+
+	if (query->limitOffset != NULL)
+	{
+		limitOffsetSql = deparse_expression(query->limitOffset, dpcontext, true, false);
+		if (limitOffsetSql == NULL)
+			return false;
+	}
+
+	if (query->limitCount != NULL)
+	{
+		limitCountSql = deparse_expression(query->limitCount, dpcontext, true, false);
+		if (limitCountSql == NULL)
+			return false;
+	}
+
+	if (limitCountSql != NULL)
+		appendStringInfo(buf, " limit %s", limitCountSql);
+
+	if (limitOffsetSql != NULL)
+		appendStringInfo(buf, " offset %s", limitOffsetSql);
+
+	return true;
+}
+
+static Node *
+DecorrelateNestedScalarAggSubLinksMutator(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, SubLink))
+	{
+		SubLink *oldSubLink = (SubLink *) node;
+		SubLink *newSubLink = copyObject(oldSubLink);
+		const char *ignoredPlannerQueryString = NULL;
+
+		if (newSubLink->testexpr != NULL)
+			newSubLink->testexpr = expression_tree_mutator(newSubLink->testexpr,
+									   DecorrelateNestedScalarAggSubLinksMutator,
+									   context);
+
+		if (IsA(newSubLink->subselect, Query))
+		{
+			newSubLink->subselect = (Node *)
+				TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(
+					(Query *) newSubLink->subselect,
+					&ignoredPlannerQueryString);
+		}
+
+		return (Node *) newSubLink;
+	}
+
+	return expression_tree_mutator(node,
+							   DecorrelateNestedScalarAggSubLinksMutator,
+							   context);
+}
+
+static Query *
+TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(Query *parse,
+										const char **planner_query_string)
+{
+	ListCell *lc;
+	Query *rewrittenParse;
+
+	if (parse == NULL)
+		return NULL;
+
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		const char *ignoredPlannerQueryString = NULL;
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
+		{
+			rte->subquery = TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(
+				rte->subquery,
+				&ignoredPlannerQueryString);
+		}
+	}
+
+	foreach(lc, parse->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+		const char *ignoredPlannerQueryString = NULL;
+
+		if (cte->ctequery != NULL && IsA(cte->ctequery, Query))
+		{
+			cte->ctequery = (Node *)
+				TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(
+					(Query *) cte->ctequery,
+					&ignoredPlannerQueryString);
+		}
+	}
+
+	foreach(lc, parse->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		te->expr = (Expr *) expression_tree_mutator((Node *) te->expr,
+									 DecorrelateNestedScalarAggSubLinksMutator,
+									 NULL);
+	}
+
+	if (parse->jointree != NULL && parse->jointree->quals != NULL)
+	{
+		parse->jointree->quals = expression_tree_mutator(parse->jointree->quals,
+										DecorrelateNestedScalarAggSubLinksMutator,
+										NULL);
+	}
+
+	if (parse->havingQual != NULL)
+	{
+		parse->havingQual = expression_tree_mutator(parse->havingQual,
+									 DecorrelateNestedScalarAggSubLinksMutator,
+									 NULL);
+	}
+
+	if (parse->limitOffset != NULL)
+	{
+		parse->limitOffset = expression_tree_mutator(parse->limitOffset,
+									   DecorrelateNestedScalarAggSubLinksMutator,
+									   NULL);
+	}
+
+	if (parse->limitCount != NULL)
+	{
+		parse->limitCount = expression_tree_mutator(parse->limitCount,
+									  DecorrelateNestedScalarAggSubLinksMutator,
+									  NULL);
+	}
+
+	rewrittenParse = TryDecorrelateScalarAggSubqueryForPg19(parse,
+									   planner_query_string);
+	if (rewrittenParse != NULL)
+		return rewrittenParse;
+
+	return parse;
+}
+
+static Query *
+TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
+							   const char **planner_query_string)
+{
+	ScalarAggSubLinkInfo info;
+	List *outerDpcontext;
+	List *innerDpcontext;
+	StringInfoData targetSql;
+	StringInfoData rewrittenSql;
+	StringInfoData outerFrom;
+	StringInfoData innerFrom;
+	char *outerExprSql;
+	char *innerTargetSql;
+	char *outerQualSql = NULL;
+	char *innerQualSql = NULL;
+	const char *opname;
+	bool useOuterKeyPruning;
+	List *outerKeySqlList = NIL;
+	List *innerKeySqlList = NIL;
+	ListCell *outerLc;
+	ListCell *innerLc;
+	List *rawParsetrees;
+	RawStmt *rawStmt;
+	Query *rewrittenParse = NULL;
+
+	if (parse == NULL || planner_query_string == NULL)
+		return NULL;
+
+	if (!QueryUsesColumnarRelation(parse))
+		return NULL;
+
+	if (!ExtractScalarAggSubLinkInfo(parse, &info))
+		return NULL;
+
+	outerDpcontext = BuildRelationDeparseContext(parse);
+	innerDpcontext = BuildRelationDeparseContext(info.innerQuery);
+	if (outerDpcontext == NIL || innerDpcontext == NIL)
+		return NULL;
+
+	initStringInfo(&targetSql);
+	initStringInfo(&rewrittenSql);
+	initStringInfo(&outerFrom);
+	initStringInfo(&innerFrom);
+
+	if (!AppendTargetListSql(&targetSql, parse->targetList, outerDpcontext))
+		return NULL;
+
+	if (!AppendSimpleFromClause(&outerFrom, parse, parse->jointree->fromlist) ||
+		!AppendSimpleFromClause(&innerFrom, info.innerQuery, info.innerQuery->jointree->fromlist))
+		return NULL;
+
+	outerExprSql = deparse_expression(info.outerExpr, outerDpcontext, true, false);
+	innerTargetSql = deparse_expression(info.innerTargetExpr, innerDpcontext, true, false);
+	if (outerExprSql == NULL || innerTargetSql == NULL)
+		return NULL;
+
+	forboth(outerLc, info.outerKeyVars, innerLc, info.innerKeyVars)
+	{
+		char *outerKeySql = deparse_expression((Node *) lfirst(outerLc),
+										  outerDpcontext,
+										  true,
+										  false);
+		char *innerKeySql = deparse_expression((Node *) lfirst(innerLc),
+										  innerDpcontext,
+										  true,
+										  false);
+
+		if (outerKeySql == NULL || innerKeySql == NULL)
+			return NULL;
+
+		outerKeySqlList = lappend(outerKeySqlList, outerKeySql);
+		innerKeySqlList = lappend(innerKeySqlList, innerKeySql);
+	}
+
+	if (outerKeySqlList == NIL || list_length(outerKeySqlList) != list_length(innerKeySqlList))
+		return NULL;
+
+	if (info.outerRemainingQuals != NULL)
+		outerQualSql = deparse_expression(info.outerRemainingQuals, outerDpcontext, true, false);
+	if (info.innerLocalQuals != NULL)
+		innerQualSql = deparse_expression(info.innerLocalQuals, innerDpcontext, true, false);
+
+	opname = get_opname(info.compareQual->opno);
+	if (opname == NULL)
+		return NULL;
+
+	useOuterKeyPruning = (info.innerQuery->jointree != NULL &&
+						 list_length(info.innerQuery->jointree->fromlist) == 1);
+
+	appendStringInfo(&rewrittenSql, "select %s from %s, (select ",
+					 targetSql.data,
+					 outerFrom.data);
+
+	{
+		int keyIndex = 1;
+
+		foreach(innerLc, innerKeySqlList)
+		{
+			if (keyIndex > 1)
+				appendStringInfoString(&rewrittenSql, ", ");
+			appendStringInfo(&rewrittenSql,
+				"%s AS se_corr_key_%d",
+				(char *) lfirst(innerLc),
+				keyIndex);
+			keyIndex++;
+		}
+
+		appendStringInfo(&rewrittenSql,
+			", %s AS se_scalar_val from %s",
+			innerTargetSql,
+			innerFrom.data);
+	}
+
+	if (useOuterKeyPruning)
+	{
+		int keyIndex = 1;
+
+		appendStringInfo(&rewrittenSql,
+				 ", (select distinct ");
+
+		foreach(outerLc, outerKeySqlList)
+		{
+			if (keyIndex > 1)
+				appendStringInfoString(&rewrittenSql, ", ");
+			appendStringInfo(&rewrittenSql,
+				"%s AS se_corr_key_%d",
+				(char *) lfirst(outerLc),
+				keyIndex);
+			keyIndex++;
+		}
+
+		appendStringInfo(&rewrittenSql, " from %s", outerFrom.data);
+
+		if (outerQualSql != NULL && outerQualSql[0] != '\0')
+			appendStringInfo(&rewrittenSql, " where %s", outerQualSql);
+
+		appendStringInfo(&rewrittenSql, ") se_outer_keys");
+
+		appendStringInfoString(&rewrittenSql, " where ");
+		if (innerQualSql != NULL && innerQualSql[0] != '\0')
+			appendStringInfo(&rewrittenSql, "%s and ", innerQualSql);
+
+		{
+			int keyIndex = 1;
+			bool firstKey = true;
+
+			foreach(innerLc, innerKeySqlList)
+			{
+				if (!firstKey)
+					appendStringInfoString(&rewrittenSql, " and ");
+				firstKey = false;
+				appendStringInfo(&rewrittenSql,
+					"se_outer_keys.se_corr_key_%d = %s",
+					keyIndex,
+					(char *) lfirst(innerLc));
+				keyIndex++;
+			}
+		}
+	}
+	else if (innerQualSql != NULL && innerQualSql[0] != '\0')
+		appendStringInfo(&rewrittenSql, " where %s", innerQualSql);
+
+	appendStringInfoString(&rewrittenSql, " group by ");
+	{
+		bool firstKey = true;
+
+		foreach(innerLc, innerKeySqlList)
+		{
+			if (!firstKey)
+				appendStringInfoString(&rewrittenSql, ", ");
+			firstKey = false;
+			appendStringInfoString(&rewrittenSql, (char *) lfirst(innerLc));
+		}
+	}
+	appendStringInfoString(&rewrittenSql, ") se_decor_subq where ");
+
+	if (outerQualSql != NULL && outerQualSql[0] != '\0')
+		appendStringInfo(&rewrittenSql, "%s and ", outerQualSql);
+
+	{
+		int keyIndex = 1;
+
+		forboth(outerLc, outerKeySqlList, innerLc, innerKeySqlList)
+		{
+			appendStringInfo(&rewrittenSql,
+				"se_decor_subq.se_corr_key_%d = %s and ",
+				keyIndex,
+				(char *) lfirst(outerLc));
+			keyIndex++;
+		}
+	}
+
+	if (info.sublinkOnLeft)
+		appendStringInfo(&rewrittenSql, "se_decor_subq.se_scalar_val %s %s", opname, outerExprSql);
+	else
+		appendStringInfo(&rewrittenSql, "%s %s se_decor_subq.se_scalar_val", outerExprSql, opname);
+
+	if (!AppendSortClauseSql(&rewrittenSql, parse, outerDpcontext) ||
+		!AppendLimitClauseSql(&rewrittenSql, parse, outerDpcontext))
+		return NULL;
+
+	PG_TRY();
+	{
+		rawParsetrees = pg_parse_query(rewrittenSql.data);
+		if (list_length(rawParsetrees) == 1)
+		{
+			rawStmt = linitial_node(RawStmt, rawParsetrees);
+			rewrittenParse = parse_analyze_fixedparams(rawStmt,
+									  rewrittenSql.data,
+									  NULL,
+									  0,
+									  NULL);
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(CurrentMemoryContext);
+		FlushErrorState();
+		rewrittenParse = NULL;
+	}
+	PG_END_TRY();
+
+	if (rewrittenParse == NULL || rewrittenParse->commandType != CMD_SELECT)
+		return NULL;
+
+	*planner_query_string = rewrittenSql.data;
+	return rewrittenParse;
+}
+#endif
 
 static bool
 PlanHasColumnarCustomScan(Plan *plan)

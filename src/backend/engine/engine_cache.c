@@ -264,37 +264,52 @@ EvictCache(uint64 size)
 void
 ColumnarMarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId)
 {
-	bool found = false;
-	ListCell *lc;
-
 	MemoryContext ctx = MemoryContextSwitchTo(ColumnarCacheMemoryContext());
 
-	foreach(lc, ChunkGroupsInUse)
-	{
-		ColumarCacheChunkGroupInUse *chunkGroupInUse =
-			(ColumarCacheChunkGroupInUse *) lfirst(lc);
-
-		if (chunkGroupInUse->relId == relId)
-		{
-			chunkGroupInUse->stripeId = stripeId;
-			chunkGroupInUse->chunkId = chunkId;
-			found = true;
-		}
-	}
-
-	if (!found)
-	{
-		ColumarCacheChunkGroupInUse *newChunkGroupInUse =
-			palloc0(sizeof(ColumarCacheChunkGroupInUse));
-
-		newChunkGroupInUse->relId = relId;
-		newChunkGroupInUse->stripeId = stripeId;
-		newChunkGroupInUse->chunkId = chunkId;
-
-		ChunkGroupsInUse = lappend(ChunkGroupsInUse, newChunkGroupInUse);
-	}
+	/*
+	 * Append a new entry for this (relId, stripeId, chunkId) tuple.
+	 * Multiple concurrent scans on the same relation each protect their own
+	 * chunk group independently.  ColumnarUnmarkChunkGroupInUse removes
+	 * exactly one matching entry when the chunk group is released.
+	 */
+	ColumarCacheChunkGroupInUse *newEntry =
+		palloc0(sizeof(ColumarCacheChunkGroupInUse));
+	newEntry->relId  = relId;
+	newEntry->stripeId = stripeId;
+	newEntry->chunkId  = chunkId;
+	ChunkGroupsInUse = lappend(ChunkGroupsInUse, newEntry);
 
 	MemoryContextSwitchTo(ctx);
+}
+
+/*
+ * ColumnarUnmarkChunkGroupInUse
+ *
+ * Remove exactly one in-use entry matching (relId, stripeId, chunkId).
+ * Called from EndChunkGroupRead so that EvictCache can reclaim the buffer
+ * once no scan is actively reading it.
+ */
+void
+ColumnarUnmarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId)
+{
+	if (ChunkGroupsInUse == NIL)
+		return;
+
+	ListCell *lc;
+	foreach(lc, ChunkGroupsInUse)
+	{
+		ColumarCacheChunkGroupInUse *entry =
+			(ColumarCacheChunkGroupInUse *) lfirst(lc);
+
+		if (entry->relId   == relId &&
+			entry->stripeId == stripeId &&
+			entry->chunkId  == chunkId)
+		{
+			ChunkGroupsInUse = list_delete_cell(ChunkGroupsInUse, lc);
+			pfree(entry);
+			return;		/* remove exactly one entry */
+		}
+	}
 }
 
 /*
@@ -316,6 +331,7 @@ ColumnarAddCacheEntry(uint64 relId, uint64 stripeId, uint64 chunkId,
 	if (head == NULL)
 	{
 		head = palloc0(sizeof(dlist_head));
+		dlist_init(head);
 	}
 
 	ColumnarCacheEntry *entry = ColumnarFindInCache(relId, stripeId, chunkId, columnId);

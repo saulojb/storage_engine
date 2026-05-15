@@ -14,6 +14,7 @@ Covers:
   - NULL handling (empty table, all-NULL column, mixed NULLs)
   - EXPLAIN plan verification (StorageEngineVectorAgg node)
   - EXPLAIN ANALYZE correctness (not blocked by IsExplainQuery)
+    - PG19 correlated scalar aggregate decorrelation (single-relation + multi-relation)
   - Parallel safety (AGGSPLIT_SIMPLE guard)
   - Multi-column aggregate query
   - Upgrade path chain traversability
@@ -841,6 +842,176 @@ class TestRunner:
         )
         self.check("mixed numeric+money: VEC ON query runs without crash",
                    rc == 0, err[:200] if err else out[:200])
+
+    def test_pg19_correlated_scalar_decorrelation(self) -> None:
+        self.section("PG19 Correlated Scalar Aggregate Decorrelation")
+
+        server_version_num = self.q1("SHOW server_version_num")
+        if not server_version_num or int(server_version_num) < 190000:
+            self.check("PG19+ only: correlated decorrelation test skipped", True)
+            return
+
+        rc, err = self.exec("""
+            DROP TABLE IF EXISTS _corr_dim;
+            DROP TABLE IF EXISTS _corr_supp;
+            DROP TABLE IF EXISTS _corr_fact_heap;
+            DROP TABLE IF EXISTS _corr_fact_col;
+            DROP TABLE IF EXISTS _corr_part_heap;
+            DROP TABLE IF EXISTS _corr_part_col;
+            DROP TABLE IF EXISTS _corr_ps_heap;
+            DROP TABLE IF EXISTS _corr_ps_col;
+
+            CREATE TABLE _corr_dim (
+                partkey integer,
+                tag text
+            ) USING heap;
+
+            CREATE TABLE _corr_supp (
+                suppkey integer,
+                region text
+            ) USING heap;
+
+            CREATE TABLE _corr_fact_heap (
+                partkey integer,
+                qty integer
+            ) USING heap;
+
+            CREATE TABLE _corr_fact_col (
+                partkey integer,
+                qty integer
+            ) USING colcompress;
+
+            CREATE TABLE _corr_part_heap (
+                partkey integer,
+                kind text
+            ) USING heap;
+
+            CREATE TABLE _corr_part_col (
+                partkey integer,
+                kind text
+            ) USING colcompress;
+
+            CREATE TABLE _corr_ps_heap (
+                partkey integer,
+                suppkey integer,
+                cost integer
+            ) USING heap;
+
+            CREATE TABLE _corr_ps_col (
+                partkey integer,
+                suppkey integer,
+                cost integer
+            ) USING colcompress;
+
+            INSERT INTO _corr_dim VALUES
+                (1, 'keep'),
+                (2, 'keep'),
+                (3, 'skip');
+
+            INSERT INTO _corr_supp VALUES
+                (1, 'EU'),
+                (2, 'EU'),
+                (3, 'US');
+
+            INSERT INTO _corr_fact_heap VALUES
+                (1, 10), (1, 20), (1, 30),
+                (2, 5), (2, 15), (2, 40),
+                (3, 100);
+
+            INSERT INTO _corr_fact_col SELECT * FROM _corr_fact_heap;
+
+            INSERT INTO _corr_part_heap VALUES
+                (1, 'keep'),
+                (2, 'keep'),
+                (3, 'skip');
+
+            INSERT INTO _corr_part_col SELECT * FROM _corr_part_heap;
+
+            INSERT INTO _corr_ps_heap VALUES
+                (1, 1, 10), (1, 2, 12), (1, 3, 1),
+                (2, 1, 7), (2, 2, 7), (2, 3, 2),
+                (3, 1, 50);
+
+            INSERT INTO _corr_ps_col SELECT * FROM _corr_ps_heap;
+        """)
+        self.check("setup correlated decorrelation fixtures", rc == 0, err[:200] if err else "")
+
+        single_heap_sql = (
+            "SELECT c.partkey, c.qty "
+            "FROM _corr_fact_heap c, _corr_dim d "
+            "WHERE d.partkey = c.partkey "
+            "AND d.tag = 'keep' "
+            "AND c.qty < ("
+            "  SELECT avg(c2.qty) "
+            "  FROM _corr_fact_heap c2 "
+            "  WHERE c2.partkey = d.partkey"
+            ") "
+            "ORDER BY 1, 2"
+        )
+        single_col_sql = single_heap_sql.replace("_corr_fact_heap", "_corr_fact_col")
+
+        single_heap = self.q(single_heap_sql)
+        single_col = self.q(single_col_sql)
+        self.check(
+            "single-relation correlated aggregate: col result matches heap",
+            single_col == single_heap,
+            f"heap={single_heap!r} col={single_col!r}",
+        )
+
+        single_plan = self.q(f"EXPLAIN (COSTS OFF) {single_col_sql}")
+        self.check(
+            "single-relation correlated aggregate: plan has no SubPlan",
+            "SubPlan" not in single_plan,
+            single_plan[:700],
+        )
+
+        multi_heap_sql = (
+            "SELECT p.partkey, ps.suppkey, ps.cost "
+            "FROM _corr_part_heap p, _corr_ps_heap ps, _corr_supp s "
+            "WHERE p.partkey = ps.partkey "
+            "AND s.suppkey = ps.suppkey "
+            "AND p.kind = 'keep' "
+            "AND s.region = 'EU' "
+            "AND ps.cost = ("
+            "  SELECT min(ps2.cost) "
+            "  FROM _corr_ps_heap ps2, _corr_supp s2 "
+            "  WHERE ps2.partkey = p.partkey "
+            "  AND s2.suppkey = ps2.suppkey "
+            "  AND s2.region = 'EU'"
+            ") "
+            "ORDER BY 1, 2, 3"
+        )
+        multi_col_sql = (
+            "SELECT p.partkey, ps.suppkey, ps.cost "
+            "FROM _corr_part_col p, _corr_ps_col ps, _corr_supp s "
+            "WHERE p.partkey = ps.partkey "
+            "AND s.suppkey = ps.suppkey "
+            "AND p.kind = 'keep' "
+            "AND s.region = 'EU' "
+            "AND ps.cost = ("
+            "  SELECT min(ps2.cost) "
+            "  FROM _corr_ps_col ps2, _corr_supp s2 "
+            "  WHERE ps2.partkey = p.partkey "
+            "  AND s2.suppkey = ps2.suppkey "
+            "  AND s2.region = 'EU'"
+            ") "
+            "ORDER BY 1, 2, 3"
+        )
+
+        multi_heap = self.q(multi_heap_sql)
+        multi_col = self.q(multi_col_sql)
+        self.check(
+            "multi-relation correlated aggregate: col result matches heap",
+            multi_col == multi_heap,
+            f"heap={multi_heap!r} col={multi_col!r}",
+        )
+
+        multi_plan = self.q(f"EXPLAIN (COSTS OFF) {multi_col_sql}")
+        self.check(
+            "multi-relation correlated aggregate: plan has no SubPlan",
+            "SubPlan" not in multi_plan,
+            multi_plan[:700],
+        )
 
     # ------------------------------------------------------------------ parallel safety
 
@@ -2017,6 +2188,7 @@ class TestRunner:
         self.test_multi_column_aggregates()
         self.test_null_handling()
         self.test_explain_plan()
+        self.test_pg19_correlated_scalar_decorrelation()
         self.test_parallel_safety()
         self.test_vecgroupagg()
         self.test_maintenance_api()

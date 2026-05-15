@@ -58,6 +58,10 @@ typedef struct ChunkGroupReadState
 	bool rowMaskCached; /* If rowMask metadata is cached and borrowed */
 	uint32 chunkStripeRowOffset; 
 	uint32 chunkGroupDeletedRows;
+	/* Cache in-use tracking: set by BeginChunkGroupRead, used by EndChunkGroupRead */
+	Oid    relId;
+	uint64 stripeId;
+	int    chunkGroupIndex;
 } ChunkGroupReadState;
 
 typedef struct StripeReadState
@@ -170,7 +174,7 @@ static bool ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnVal
 							  uint64 stripeFirstRowNumber,
 							  Snapshot snapshot, uint64 stripeId);
 static ChunkGroupReadState * BeginChunkGroupRead(StripeBuffers *stripeBuffers, int
-												 chunkIndex,
+												 chunkIndex, int absChunkIndex,
 												 TupleDesc tupleDesc,
 												 List *projectedColumnList,
 												 MemoryContext cxt, StripeReadState *state, uint64 stripeId);
@@ -220,6 +224,7 @@ static void DeserializeDatumArray(StringInfo datumBuffer, bool *existsArray,
 								  int datumTypeLength, char datumTypeAlign,
 								  Datum *datumArray);
 static ChunkData * DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
+										uint64 absChunkIndex,
 										uint32 rowCount, TupleDesc tupleDescriptor,
 										List *projectedColumnList, StripeReadState *state, uint64 stripeId);
 static Datum ColumnDefaultValue(TupleConstr *tupleConstraints,
@@ -414,14 +419,22 @@ ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 		}
 
 		/*
-		 * Stripe-level pruning (serial scan only): pre-filter the stripe
-		 * list using per-column min/max statistics from engine.chunk.  This
-		 * avoids reading data pages for stripes that provably cannot satisfy
-		 * the WHERE clauses.  The parallel path filters stripes in
-		 * Columnar_InitializeDSMCustomScan before writing them to the DSM.
+		 * Pre-load the stripe list for all serial scans (not just those with
+		 * a pushdown WHERE clause).  This serves two purposes:
+		 *
+		 *  1. Stripe-level pruning: when a WHERE clause is present, we filter
+		 *     out stripes whose min/max statistics cannot satisfy it.
+		 *
+		 *  2. Rescan performance: for correlated subqueries the scan is
+		 *     rescanned once per outer row.  With a pre-built stripe list,
+		 *     ColumnarRescan only needs to reset the cursor pointer (O(1))
+		 *     instead of calling FindNextStripeByRowNumber (catalog index
+		 *     scan) on every rescan iteration.
+		 *
+		 * The parallel path builds its own stripe list in
+		 * Columnar_InitializeDSMCustomScan before writing to the DSM.
 		 */
-		if (readState->parallelColumnarScan == NULL &&
-			whereClauseList != NIL && readState->whereClauseVars != NIL)
+		if (readState->parallelColumnarScan == NULL)
 		{
 			MemoryContext oldCtx = MemoryContextSwitchTo(readState->scanContext);
 #if PG_VERSION_NUM >= PG_VERSION_16
@@ -429,12 +442,21 @@ ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 #else
 			List *allStripes = StripesForRelfilenode(relation->rd_node,
 #endif
-													 ForwardScanDirection);
-			readState->filteredStripeList =
-				FilterStripeList(relation, allStripes, tupleDescriptor,
-								 whereClauseList, readState->whereClauseVars,
-								 readState->snapshot, &readState->stripesSkipped);
-			readState->currentStripeCursor = list_head(readState->filteredStripeList);
+												 ForwardScanDirection);
+			if (whereClauseList != NIL && readState->whereClauseVars != NIL)
+			{
+				readState->filteredStripeList =
+					FilterStripeList(relation, allStripes, tupleDescriptor,
+									 whereClauseList, readState->whereClauseVars,
+									 readState->snapshot, &readState->stripesSkipped);
+			}
+			else
+			{
+				/* No pruning: use full stripe list as-is. */
+				readState->filteredStripeList = allStripes;
+			}
+			readState->currentStripeCursor =
+				list_head(readState->filteredStripeList);
 			MemoryContextSwitchTo(oldCtx);
 		}
 
@@ -646,46 +668,23 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 													 0 /* no ANALYZE sampling */,
 													 targetChunkGroupIndex);
 
-		readState->currentStripeMetadata = stripeMetadata;
-	}
-	else if (readState->indexScanEnabled &&
-			 readState->stripeReadState != NULL &&
-			 readState->stripeReadState->targetChunkGroupIndex >= 0)
-	{
 		/*
-		 * Single-chunk optimization is active (index scan point-lookup mode).
-		 * If the next row is in a DIFFERENT chunk group of the same stripe
-		 * (e.g. a GIN index returning many rows spread across chunk groups),
-		 * fall back to loading the entire stripe so that all subsequent rows
-		 * in this stripe can be served without repeated reloads.
-		 *
-		 * For true point lookups (unique index, 1 TID returned per fetch),
-		 * the stripe will have changed before reaching this branch, so the
-		 * fallback never fires and we keep the 1-chunk-group benefit.
+		 * Copy stripeMetadata into scanContext so it outlives any short-lived
+		 * CurrentMemoryContext (e.g. ecxt_per_tuple_memory during SubPlan eval).
+		 * This matches the pattern used by AdvanceStripeRead and ensures that
+		 * ColumnarResetRead's pfree(currentStripeMetadata) is always safe.
 		 */
-		StripeMetadata *sm = readState->currentStripeMetadata;
-		uint64 stripeRowOffset = rowNumber - sm->firstRowNumber;
-		int neededCG = (sm->chunkGroupRowCount > 0)
-			? (int)(stripeRowOffset / sm->chunkGroupRowCount)
-			: 0;
-
-		if (neededCG != readState->stripeReadState->targetChunkGroupIndex)
 		{
-			/* Reload the stripe loading ALL chunk groups (targetChunkGroupIndex=-1) */
-			readState->stripeReadState = NULL;
-			MemoryContextReset(readState->stripeReadContext);
-
-			readState->stripeReadState = BeginStripeRead(sm,
-														 readState->relation,
-														 RelationGetDescr(readState->relation),
-														 readState->projectedColumnList,
-														 NIL, NIL,
-														 readState->stripeReadContext,
-														 readState->snapshot,
-														 0 /* no ANALYZE sampling */,
-														 -1 /* load all chunk groups */);
+			MemoryContext old = MemoryContextSwitchTo(readState->scanContext);
+			StripeMetadata *persistentMeta = palloc(sizeof(StripeMetadata));
+			*persistentMeta = *stripeMetadata;
+			MemoryContextSwitchTo(old);
+			readState->currentStripeMetadata = persistentMeta;
 		}
 	}
+	/* else if (same stripe, single-CG mode): ColumnarReadIsCurrentStripe
+	 * already ensures rowNumber is in targetChunkGroupIndex.  No reload needed.
+	 */
 
 	return ReadStripeRowByRowNumber(readState, rowNumber, columnValues, columnNulls);
 }
@@ -740,7 +739,14 @@ ColumnarSetStripeReadState(ColumnarReadState *readState,
 													 0 /* no ANALYZE sampling */,
 													 -1 /* load all chunks */);
 
-		readState->currentStripeMetadata = stripeMetadata;
+		/* Copy into scanContext — same lifetime guarantee as ColumnarReadRowByRowNumber */
+		{
+			MemoryContext old = MemoryContextSwitchTo(readState->scanContext);
+			StripeMetadata *persistentMeta = palloc(sizeof(StripeMetadata));
+			*persistentMeta = *stripeMetadata;
+			MemoryContextSwitchTo(old);
+			readState->currentStripeMetadata = persistentMeta;
+		}
 	}
 
 	return true;
@@ -748,7 +754,14 @@ ColumnarSetStripeReadState(ColumnarReadState *readState,
 
 /*
  * ColumnarReadIsCurrentStripe returns true if stripe being read contains
- * row with given rowNumber.
+ * row with given rowNumber AND the row is in the currently-loaded chunk group
+ * (when single-CG mode is active for index scan point-lookups).
+ *
+ * In single-CG mode (targetChunkGroupIndex >= 0), if rowNumber falls in a
+ * different chunk group of the same stripe, we return false so the caller's
+ * 'if' branch handles the reload via FindStripeByRowNumber + BeginStripeRead.
+ * This routes all CG transitions through the well-tested 'if' branch rather
+ * than a separate reload path.
  */
 static bool
 ColumnarReadIsCurrentStripe(ColumnarReadState *readState, uint64 rowNumber)
@@ -762,6 +775,20 @@ ColumnarReadIsCurrentStripe(ColumnarReadState *readState, uint64 rowNumber)
 	if (rowNumber >= currentStripeMetadata->firstRowNumber &&
 		rowNumber <= StripeGetHighestRowNumber(currentStripeMetadata))
 	{
+		/*
+		 * In single-CG mode, also verify the row is in the SAME chunk group
+		 * as the one currently loaded.  If not, return false so the 'if'
+		 * branch reloads only the needed CG — no separate reload path needed.
+		 */
+		if (readState->stripeReadState != NULL &&
+			readState->stripeReadState->targetChunkGroupIndex >= 0 &&
+			currentStripeMetadata->chunkGroupRowCount > 0)
+		{
+			uint64 stripeRowOffset = rowNumber - currentStripeMetadata->firstRowNumber;
+			int neededCG = (int)(stripeRowOffset / currentStripeMetadata->chunkGroupRowCount);
+			if (neededCG != readState->stripeReadState->targetChunkGroupIndex)
+				return false;
+		}
 		return true;
 	}
 
@@ -820,6 +847,7 @@ ReadStripeRowByRowNumber(ColumnarReadState *readState,
 		stripeReadState->chunkGroupReadState = BeginChunkGroupRead(
 			stripeReadState->stripeBuffers,
 			bufferChunkIndex,
+			chunkGroupIndex, /* absChunkIndex: absolute CG index for cache keying */
 			stripeReadState->tupleDescriptor,
 			stripeReadState->projectedColumnList,
 			stripeReadState->stripeReadContext,
@@ -938,8 +966,21 @@ HasUnreadStripe(ColumnarReadState *readState)
 
 
 /*
- * ColumnarRescan clears the position where we were scanning so that the next read starts at
- * the beginning again
+ * ColumnarRescan clears the position where we were scanning so that the next
+ * read starts at the beginning again.
+ *
+ * For unparameterized scans (no correlated WHERE clauses, e.g. the supplier
+ * table inside Q2's subplan), we simply reset the cursor to the start of the
+ * already-built filteredStripeList — zero catalog calls per rescan iteration.
+ *
+ * For parameterized scans (correlated subquery with a new parameter value),
+ * we rebuild filteredStripeList with the new evaluated scanQual so that
+ * stripe pruning stays accurate for the new parameter value.  Without the
+ * rebuild:
+ *   1. The old list was built for a different parameter and may exclude
+ *      stripes that match the new value.
+ *   2. The cursor is exhausted (NULL) after the previous scan, causing
+ *      AdvanceStripeRead to return immediately with no rows.
  */
 void
 ColumnarRescan(ColumnarReadState *readState, List *scanQual)
@@ -947,6 +988,44 @@ ColumnarRescan(ColumnarReadState *readState, List *scanQual)
 	MemoryContext oldContext = MemoryContextSwitchTo(readState->scanContext);
 
 	ColumnarResetRead(readState);
+
+	if (readState->parallelColumnarScan == NULL)
+	{
+		if (scanQual != NIL && readState->whereClauseVars != NIL)
+		{
+			/*
+			 * Parameterized rescan: rebuild filteredStripeList with the new
+			 * (already evaluated) scanQual so pruning uses the current
+			 * parameter values.
+			 */
+			readState->filteredStripeList = NIL;
+			readState->currentStripeCursor = NULL;
+			readState->stripesSkipped = 0;
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+			List *allStripes = StripesForRelfilenode(readState->relation->rd_locator,
+#else
+			List *allStripes = StripesForRelfilenode(readState->relation->rd_node,
+#endif
+													 ForwardScanDirection);
+			readState->filteredStripeList =
+				FilterStripeList(readState->relation, allStripes,
+								 readState->tupleDescriptor,
+								 scanQual, readState->whereClauseVars,
+								 readState->snapshot, &readState->stripesSkipped);
+			readState->currentStripeCursor = list_head(readState->filteredStripeList);
+		}
+		else
+		{
+			/*
+			 * Unparameterized rescan (no correlated qual): the stripe list is
+			 * constant across all iterations, so just rewind the cursor.
+			 * This avoids a catalog scan on every rescan call — critical for
+			 * correlated subqueries with many outer rows.
+			 */
+			readState->currentStripeCursor = list_head(readState->filteredStripeList);
+		}
+	}
 
 	/* set currentStripeMetadata for the first stripe to read */
 	AdvanceStripeRead(readState);
@@ -994,11 +1073,57 @@ ColumnarResetRead(ColumnarReadState *readState)
 {
 	if (StripeReadInProgress(readState))
 	{
+		/*
+		 * Only update cache bookkeeping (remove in-use entry) before the
+		 * memory context reset.  Do NOT call EndChunkGroupRead here:
+		 * EndChunkGroupRead does explicit pfrees of memory that lives in
+		 * stripeReadContext, and the subsequent MemoryContextReset would
+		 * then process those already-freed blocks, corrupting palloc state.
+		 * MemoryContextReset frees the stripeReadContext in one shot, which
+		 * correctly handles all allocations including chunkGroupReadState.
+		 */
+		if (engine_enable_page_cache &&
+			readState->stripeReadState != NULL &&
+			readState->stripeReadState->chunkGroupReadState != NULL)
+		{
+			ChunkGroupReadState *cg = readState->stripeReadState->chunkGroupReadState;
+			ColumnarUnmarkChunkGroupInUse((uint64) cg->relId,
+										  cg->stripeId,
+										  (uint32) cg->chunkGroupIndex);
+		}
+
 		pfree(readState->currentStripeMetadata);
 		readState->currentStripeMetadata = NULL;
 
 		readState->stripeReadState = NULL;
 		MemoryContextReset(readState->stripeReadContext);
+	}
+}
+
+
+/*
+ * ColumnarResetChunkGroupRead — reset only the per-chunk-group read state
+ * between SubPlan re-evaluations, without discarding the stripe buffers.
+ *
+ * Cheaper than ColumnarResetRead: stripeReadState and currentStripeMetadata
+ * remain intact, so ColumnarReadIsCurrentStripe() can still return true for
+ * the same-stripe case — avoiding a FindStripeByRowNumber catalog lookup.
+ *
+ * After this call, StripeReadIsCurrentChunkGroup() returns false
+ * (chunkGroupReadState == NULL), forcing BeginChunkGroupRead() on the next
+ * access.  The raw stripe buffers are still in stripeReadContext, so the
+ * re-decompress is in-memory only (no I/O).
+ */
+void
+ColumnarResetChunkGroupRead(ColumnarReadState *readState)
+{
+	if (readState->stripeReadState == NULL)
+		return;
+
+	if (readState->stripeReadState->chunkGroupReadState != NULL)
+	{
+		EndChunkGroupRead(readState->stripeReadState->chunkGroupReadState);
+		readState->stripeReadState->chunkGroupReadState = NULL;
 	}
 }
 
@@ -1066,15 +1191,22 @@ AdvanceStripeRead(ColumnarReadState *readState)
 		if (readState->filteredStripeList != NIL)
 		{
 			/*
-			 * Stripe-level pruning is active: iterate the pre-filtered list
-			 * directly instead of doing a catalog lookup per stripe.
-			 * currentStripeCursor was initialised to list_head() in
-			 * ColumnarBeginRead before the first AdvanceStripeRead call.
+			 * Pre-built stripe list is active: iterate it directly without
+			 * a catalog lookup per stripe.  currentStripeCursor was set to
+			 * list_head() in ColumnarBeginRead (and reset there on rescan).
+			 *
+			 * We COPY the StripeMetadata struct rather than pointing directly
+			 * into the list cell.  ColumnarResetRead pfrees currentStripeMetadata
+			 * after each stripe; if we pointed into the list, that pfree would
+			 * corrupt the list entries and break the cursor-rewind in rescan.
 			 */
 			if (readState->currentStripeCursor != NULL)
 			{
-				readState->currentStripeMetadata =
+				StripeMetadata *listed =
 					(StripeMetadata *) lfirst(readState->currentStripeCursor);
+				readState->currentStripeMetadata =
+					(StripeMetadata *) palloc(sizeof(StripeMetadata));
+				*readState->currentStripeMetadata = *listed;
 				readState->currentStripeCursor =
 					lnext_compat(readState->filteredStripeList,
 								 readState->currentStripeCursor);
@@ -1231,14 +1363,11 @@ ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnValues,
 		{
 			stripeReadState->chunkGroupReadState = BeginChunkGroupRead(
 				stripeReadState->stripeBuffers,
-				stripeReadState->
-				chunkGroupIndex,
-				stripeReadState->
-				tupleDescriptor,
-				stripeReadState->
-				projectedColumnList,
-				stripeReadState->
-				stripeReadContext,
+				stripeReadState->chunkGroupIndex, /* chunkIndex (buf==abs in seq scan) */
+				stripeReadState->chunkGroupIndex, /* absChunkIndex */
+				stripeReadState->tupleDescriptor,
+				stripeReadState->projectedColumnList,
+				stripeReadState->stripeReadContext,
 				stripeReadState,
 				stripeId
 				);
@@ -1306,7 +1435,8 @@ ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnValues,
  * BeginChunkGroupRead allocates state for reading a chunk.
  */
 static ChunkGroupReadState *
-BeginChunkGroupRead(StripeBuffers *stripeBuffers, int chunkIndex, TupleDesc tupleDesc,
+BeginChunkGroupRead(StripeBuffers *stripeBuffers, int chunkIndex, int absChunkIndex,
+					TupleDesc tupleDesc,
 					List *projectedColumnList, MemoryContext cxt, StripeReadState *state, uint64 stripeId)
 {
 	uint32 chunkGroupRowCount =
@@ -1326,7 +1456,23 @@ BeginChunkGroupRead(StripeBuffers *stripeBuffers, int chunkIndex, TupleDesc tupl
 	chunkGroupReadState->columnCount = tupleDesc->natts;
 	chunkGroupReadState->projectedColumnList = projectedColumnList;
 
+	/* Store identifiers for cache in-use tracking in EndChunkGroupRead */
+	chunkGroupReadState->relId          = state->relation->rd_id;
+	chunkGroupReadState->stripeId       = stripeId;
+	chunkGroupReadState->chunkGroupIndex = absChunkIndex;
+
+	/*
+	 * Mark this chunk group as in-use BEFORE decompressing so that
+	 * EvictCache cannot free its buffer while we are building the datum
+	 * arrays.  One mark per BeginChunkGroupRead; EndChunkGroupRead removes
+	 * exactly one matching entry.
+	 */
+	if (engine_enable_page_cache)
+		ColumnarMarkChunkGroupInUse((uint64) state->relation->rd_id,
+									stripeId, (uint32) absChunkIndex);
+
 	chunkGroupReadState->chunkGroupData = DeserializeChunkData(stripeBuffers, chunkIndex,
+															   absChunkIndex,
 															   chunkGroupRowCount,
 															   tupleDesc,
 															   projectedColumnList, state, stripeId);
@@ -1342,6 +1488,16 @@ BeginChunkGroupRead(StripeBuffers *stripeBuffers, int chunkIndex, TupleDesc tupl
 static void
 EndChunkGroupRead(ChunkGroupReadState *chunkGroupReadState)
 {
+	/*
+	 * Remove the in-use protection added by BeginChunkGroupRead so that
+	 * EvictCache can reclaim this chunk group's cached buffer once it is
+	 * no longer being read.
+	 */
+	if (engine_enable_page_cache)
+		ColumnarUnmarkChunkGroupInUse((uint64) chunkGroupReadState->relId,
+									  chunkGroupReadState->stripeId,
+									  (uint32) chunkGroupReadState->chunkGroupIndex);
+
 	FreeChunkBufferValueArray(chunkGroupReadState->chunkGroupData);
 	FreeChunkData(chunkGroupReadState->chunkGroupData);
 	if (chunkGroupReadState->rowMask != NULL && !chunkGroupReadState->rowMaskCached)
@@ -1542,30 +1698,19 @@ FreeChunkData(ChunkData *chunkData)
 }
 
 #if PG_VERSION_NUM >= PG_VERSION_16
-/* Copied from postgres 15 source, since it was removed from 16. */
+/*
+ * PG16+ removed MemoryContextContains. Use GetMemoryChunkContext() which is
+ * the official API for determining which context owns a palloc'd chunk.
+ * All callers of this function pass valid palloc'd pointers, so the
+ * assertions inside GetMemoryChunkContext() are safe to trigger.
+ */
 static bool
 MemoryContextContains(MemoryContext context, void *pointer)
 {
-        MemoryContext ptr_context;
-
-        /*
-         * NB: Can't use GetMemoryChunkContext() here - that performs assertions
-         * that aren't acceptable here since we might be passed memory not
-         * allocated by any memory context.
-         *
-         * Try to detect bogus pointers handed to us, poorly though we can.
-         * Presumably, a pointer that isn't MAXALIGNED isn't pointing at an
-         * allocated chunk.
-         */
         if (pointer == NULL || pointer != (void *) MAXALIGN(pointer))
                 return false;
 
-        /*
-         * OK, it's probably safe to look at the context.
-         */
-        ptr_context = *(MemoryContext *) (((char *) pointer) - sizeof(void *));
-
-        return ptr_context == context;
+        return GetMemoryChunkContext(pointer) == context;
 }
 #endif
 
@@ -2257,6 +2402,7 @@ DeserializeDatumArray(StringInfo datumBuffer, bool *existsArray, uint32 datumCou
  */
 static ChunkData *
 DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
+					 uint64 absChunkIndex,
 					 uint32 rowCount, TupleDesc tupleDescriptor,
 					 List *projectedColumnList, StripeReadState *state, uint64 stripeId)
 {
@@ -2285,17 +2431,12 @@ DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
 				columnBuffers->chunkBuffersArray[chunkIndex];
 			bool shouldCache = engine_enable_page_cache == true && chunkBuffers->valueCompressionType != COMPRESSION_NONE;
 
-			if (shouldCache)
-			{
-				ColumnarMarkChunkGroupInUse(state->relation->rd_id, stripeId, chunkIndex);
-			}
-
 			/* decompress and deserialize current chunk's data */
 			StringInfo valueBuffer = NULL;
 			
 			if (shouldCache)
 			{
-				valueBuffer = ColumnarRetrieveCache(state->relation->rd_id, stripeId, chunkIndex, columnIndex);
+				valueBuffer = ColumnarRetrieveCache(state->relation->rd_id, stripeId, absChunkIndex, columnIndex);
 			}
 
 			if (valueBuffer == NULL)
@@ -2312,7 +2453,7 @@ DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
 
 				if (shouldCache)
 				{
-					ColumnarAddCacheEntry(state->relation->rd_id, stripeId, chunkIndex, columnIndex, valueBuffer);
+					ColumnarAddCacheEntry(state->relation->rd_id, stripeId, absChunkIndex, columnIndex, valueBuffer);
 					MemoryContextSwitchTo(oldMemoryContext);
 				}
 			}
@@ -2473,14 +2614,11 @@ ReadStripeNextVector(StripeReadState *stripeReadState, Datum *columnValues,
 		{
 			stripeReadState->chunkGroupReadState = BeginChunkGroupRead(
 				stripeReadState->stripeBuffers,
-				stripeReadState->
-				chunkGroupIndex,
-				stripeReadState->
-				tupleDescriptor,
-				stripeReadState->
-				projectedColumnList,
-				stripeReadState->
-				stripeReadContext,
+				stripeReadState->chunkGroupIndex, /* chunkIndex (buf==abs in seq scan) */
+				stripeReadState->chunkGroupIndex, /* absChunkIndex */
+				stripeReadState->tupleDescriptor,
+				stripeReadState->projectedColumnList,
+				stripeReadState->stripeReadContext,
 				stripeReadState,
 				stripeId);
 
