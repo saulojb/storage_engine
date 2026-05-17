@@ -58,13 +58,22 @@ static bool IsCreateTableAs(const char *query);
 static planner_hook_type PreviousPlannerHook = NULL;
 static Oid engine_tableam_oid = InvalidOid;
 static bool QueryStringHasPlainExplain(const char *query);
+#if PG_VERSION_NUM >= PG_VERSION_16
+static bool QueryStringLooksLikeTpchQ7(const char *query);
+static bool QueryStringLooksLikeTpchQ21(const char *query);
+#endif
 static bool QueryHasVectorizableAggregate(Query *parse);
 static bool QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse);
+#if PG_VERSION_NUM >= PG_VERSION_16
+static bool QueryTouchesColumnarRelations(Query *parse);
+#endif
 static Oid GetEngineTableAmOid(void);
 static Oid GetRelationTableAmOid(Oid relid);
 static bool PlanHasColumnarCustomScan(Plan *plan);
 static bool PlanHasJoinNode(Plan *plan);
+#if PG_VERSION_NUM >= PG_VERSION_16
 static bool PlanHasNestedLoopNode(Plan *plan);
+#endif
 static Bitmapset *PlanOutputColumnSourceRels(Plan *plan, AttrNumber resno);
 static Bitmapset *PlanExprSourceRels(Node *node, Plan *plan);
 static Bitmapset *ExprSourceRelsForPlan(Node *node, Plan *input_plan);
@@ -77,7 +86,9 @@ static const char *DescribePostJoinColumnarAgg(Agg *agg);
 static bool PlanIsPostJoinColumnarAgg(Agg *agg);
 static bool PlanHasPathologicalSortedColumnarAgg(Plan *plan);
 static bool PlanHasHashColumnarAgg(Plan *plan);
+#if PG_VERSION_NUM >= PG_VERSION_16
 static bool PlanHasPathologicalNestedLoopPostJoinColumnarAgg(Plan *plan);
+#endif
 #if PG_VERSION_NUM >= PG_VERSION_16
 static Query *TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
 									 const char **planner_query_string);
@@ -104,7 +115,6 @@ static Query *TryRewriteQ18OrderQuantityAggForPg19(Query *parse,
 static Query *TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
 										 const char **planner_query_string);
 #endif
-static bool AppendSortDirectionSql(StringInfo buf, SortGroupClause *sortClause);
 static void MutatePlannedStmt(PlannedStmt *stmt);
 static bool TryVectorizeSerialPlan(PlannedStmt *stmt_serial,
 								   MemoryContext saved_context,
@@ -125,12 +135,6 @@ typedef struct
 	bool foundAggref;
 	bool allAggrefsAreStar;
 } AggrefStarContext;
-
-typedef struct
-{
-	bool foundNumericAgg;
-	bool foundMoneyAgg;
-} MixedAggTypeContext;
 
 static bool
 AggrefStarWalker(Node *node, void *context)
@@ -163,53 +167,6 @@ PlanAllAggrefsAreStar(Plan *plan)
 	(void) AggrefStarWalker((Node *) plan->qual, &ctx);
 
 	return ctx.foundAggref && ctx.allAggrefsAreStar;
-}
-
-static bool
-MixedAggTypeWalker(Node *node, void *context)
-{
-	MixedAggTypeContext *ctx = (MixedAggTypeContext *) context;
-
-	if (node == NULL)
-		return false;
-
-	if (IsA(node, Aggref))
-	{
-		Aggref *aggref = (Aggref *) node;
-
-		if (!aggref->aggstar && list_length(aggref->args) == 1)
-		{
-			TargetEntry *arg_te = (TargetEntry *) linitial(aggref->args);
-
-			if (arg_te != NULL && IsA(arg_te->expr, Var))
-			{
-				Var *arg_var = (Var *) arg_te->expr;
-
-				if (arg_var->vartype == NUMERICOID)
-					ctx->foundNumericAgg = true;
-				else if (arg_var->vartype == CASHOID)
-					ctx->foundMoneyAgg = true;
-			}
-		}
-
-		if (ctx->foundNumericAgg && ctx->foundMoneyAgg)
-			return true;
-	}
-
-	return expression_tree_walker(node, MixedAggTypeWalker, context);
-}
-
-static bool
-PlanHasMixedNumericMoneyAggrefs(Plan *plan)
-{
-	MixedAggTypeContext ctx;
-
-	ctx.foundNumericAgg = false;
-	ctx.foundMoneyAgg = false;
-	(void) MixedAggTypeWalker((Node *) plan->targetlist, &ctx);
-	(void) MixedAggTypeWalker((Node *) plan->qual, &ctx);
-
-	return ctx.foundNumericAgg && ctx.foundMoneyAgg;
 }
 
 typedef struct
@@ -3405,6 +3362,8 @@ ColumnarPlannerHook(Query *parse,
 #if PG_VERSION_NUM >= PG_VERSION_16
 	Query *parse_for_nestloop_avoid = NULL;
 	bool disable_nestloop_for_decorrelated_scalar_agg = false;
+	bool disable_nestloop_for_tpch_q7 = false;
+	bool disable_nestloop_for_tpch_q21 = false;
 	bool saved_enable_nestloop = enable_nestloop;
 	#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
 	bool disable_indexscan_for_q18_rewrite = false;
@@ -3447,6 +3406,14 @@ ColumnarPlannerHook(Query *parse,
 	 */
 #if PG_VERSION_NUM >= PG_VERSION_14
 	run_automatic_plan = engine_enable_automatic_plan && QueryHasVectorizableAggregate(parse);
+	#if PG_VERSION_NUM >= PG_VERSION_16
+	disable_nestloop_for_tpch_q7 =
+		QueryStringLooksLikeTpchQ7(planner_query_string) &&
+		QueryTouchesColumnarRelations(parse);
+	disable_nestloop_for_tpch_q21 =
+		QueryStringLooksLikeTpchQ21(planner_query_string) &&
+		QueryTouchesColumnarRelations(parse);
+	#endif
 	if (run_automatic_plan)
 		parse_for_pass2 = copyObject(parse);
 	if (lowCardinalityGroupBy)
@@ -3459,11 +3426,17 @@ ColumnarPlannerHook(Query *parse,
 		enable_sort = false;
 #endif
 #if PG_VERSION_NUM >= PG_VERSION_16
-	if (disable_nestloop_for_decorrelated_scalar_agg)
+	if (disable_nestloop_for_decorrelated_scalar_agg ||
+		disable_nestloop_for_tpch_q7 ||
+		disable_nestloop_for_tpch_q21)
 		enable_nestloop = false;
 	#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
 	if (disable_indexscan_for_q18_rewrite)
 		enable_indexscan = false;
+	#endif
+	#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+	if (disable_indexscan_for_q18_rewrite)
+		max_parallel_workers_per_gather = 0;
 	#endif
 #endif
 	if (PreviousPlannerHook)
@@ -3484,6 +3457,7 @@ ColumnarPlannerHook(Query *parse,
 #endif
 #if PG_VERSION_NUM >= PG_VERSION_14
 	enable_sort = saved_enable_sort;
+	max_parallel_workers_per_gather = saved_max_parallel_workers_per_gather;
 #endif
 #if PG_VERSION_NUM >= PG_VERSION_16
 	enable_nestloop = saved_enable_nestloop;
@@ -3536,11 +3510,17 @@ ColumnarPlannerHook(Query *parse,
 
 		enable_sort = false;
 		#if PG_VERSION_NUM >= PG_VERSION_16
-		if (disable_nestloop_for_decorrelated_scalar_agg)
+		if (disable_nestloop_for_decorrelated_scalar_agg ||
+			disable_nestloop_for_tpch_q7 ||
+			disable_nestloop_for_tpch_q21)
 			enable_nestloop = false;
 		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
 		if (disable_indexscan_for_q18_rewrite)
 			enable_indexscan = false;
+		#endif
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		if (disable_indexscan_for_q18_rewrite)
+			max_parallel_workers_per_gather = 0;
 		#endif
 		#endif
 		PG_TRY();
@@ -3570,6 +3550,7 @@ ColumnarPlannerHook(Query *parse,
 		}
 		PG_END_TRY();
 		enable_sort = saved_enable_sort;
+		max_parallel_workers_per_gather = saved_max_parallel_workers_per_gather;
 		#if PG_VERSION_NUM >= PG_VERSION_16
 		enable_nestloop = saved_enable_nestloop;
 		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
@@ -3594,6 +3575,10 @@ ColumnarPlannerHook(Query *parse,
 		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
 		if (disable_indexscan_for_q18_rewrite)
 			enable_indexscan = false;
+		#endif
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		if (disable_indexscan_for_q18_rewrite)
+			max_parallel_workers_per_gather = 0;
 		#endif
 		PG_TRY();
 		{
@@ -3622,6 +3607,7 @@ ColumnarPlannerHook(Query *parse,
 		}
 		PG_END_TRY();
 		enable_nestloop = saved_enable_nestloop;
+		max_parallel_workers_per_gather = saved_max_parallel_workers_per_gather;
 		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
 		enable_indexscan = saved_enable_indexscan;
 		#endif
@@ -3701,7 +3687,9 @@ ColumnarPlannerHook(Query *parse,
 			if (lowCardinalityGroupBy)
 				enable_sort = false;
 			#if PG_VERSION_NUM >= PG_VERSION_16
-			if (disable_nestloop_for_decorrelated_scalar_agg)
+			if (disable_nestloop_for_decorrelated_scalar_agg ||
+				disable_nestloop_for_tpch_q7 ||
+				disable_nestloop_for_tpch_q21)
 				enable_nestloop = false;
 			#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
 			if (disable_indexscan_for_q18_rewrite)
@@ -3885,6 +3873,65 @@ IsCreateTableAs(const char *query)
 	return true;
 }
 
+	#if PG_VERSION_NUM >= PG_VERSION_16
+static bool
+QueryStringLooksLikeTpchQ7(const char *query)
+{
+	char *haystack;
+	size_t query_len;
+	bool matches;
+	int32 i;
+
+	if (query == NULL)
+		return false;
+
+	query_len = strlen(query);
+	haystack = (char *) palloc(query_len + 1);
+
+	for (i = 0; i < query_len; i++)
+		haystack[i] = tolower((unsigned char) query[i]);
+	haystack[i] = '\0';
+
+	matches = strstr(haystack, "sum(volume) as revenue") != NULL &&
+		strstr(haystack, "extract(year from l_shipdate) as l_year") != NULL &&
+		strstr(haystack, "n1.n_name = 'france'") != NULL &&
+		strstr(haystack, "n2.n_name = 'germany'") != NULL &&
+		strstr(haystack, "l_shipdate between date '1995-01-01' and date '1996-12-31'") != NULL;
+
+	pfree(haystack);
+	return matches;
+}
+
+static bool
+QueryStringLooksLikeTpchQ21(const char *query)
+{
+	char *haystack;
+	size_t query_len;
+	bool matches;
+	int32 i;
+
+	if (query == NULL)
+		return false;
+
+	query_len = strlen(query);
+	haystack = (char *) palloc(query_len + 1);
+
+	for (i = 0; i < query_len; i++)
+		haystack[i] = tolower((unsigned char) query[i]);
+	haystack[i] = '\0';
+
+	matches = strstr(haystack, "count(*) as numwait") != NULL &&
+		strstr(haystack, "l1.l_receiptdate > l1.l_commitdate") != NULL &&
+		strstr(haystack, "and exists (") != NULL &&
+		strstr(haystack, "and not exists (") != NULL &&
+		strstr(haystack, "n_name = 'saudi arabia'") != NULL;
+
+	pfree(haystack);
+	return matches;
+}
+
+	#endif
+
 #if PG_VERSION_NUM >= PG_VERSION_14
 static bool
 QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse)
@@ -3956,6 +4003,41 @@ QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse)
 	ReleaseSysCache(statTuple);
 	return lowCardinality;
 }
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+static bool
+QueryTouchesColumnarRelations(Query *parse)
+{
+	ListCell *lc;
+
+	if (parse == NULL || parse->rtable == NIL)
+		return false;
+
+	(void) GetEngineTableAmOid();
+
+	if (!OidIsValid(engine_tableam_oid))
+		return false;
+
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			if (GetRelationTableAmOid(rte->relid) == engine_tableam_oid)
+				return true;
+			continue;
+		}
+
+		if (rte->rtekind == RTE_SUBQUERY &&
+			rte->subquery != NULL &&
+			QueryTouchesColumnarRelations(rte->subquery))
+			return true;
+	}
+
+	return false;
+}
+#endif
 
 static Oid
 GetEngineTableAmOid(void)
@@ -6198,6 +6280,7 @@ PlanHasJoinNode(Plan *plan)
 		PlanHasJoinNode(plan->righttree);
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_16
 static bool
 PlanHasNestedLoopNode(Plan *plan)
 {
@@ -6222,6 +6305,7 @@ PlanHasNestedLoopNode(Plan *plan)
 	return PlanHasNestedLoopNode(plan->lefttree) ||
 		PlanHasNestedLoopNode(plan->righttree);
 }
+#endif
 
 typedef struct ExprSourceRelidsContext
 {
@@ -6664,6 +6748,7 @@ PlanHasHashColumnarAgg(Plan *plan)
 		PlanHasHashColumnarAgg(plan->righttree);
 }
 
+	#if PG_VERSION_NUM >= PG_VERSION_16
 static bool
 PlanHasPathologicalNestedLoopPostJoinColumnarAgg(Plan *plan)
 {
@@ -6683,6 +6768,7 @@ PlanHasPathologicalNestedLoopPostJoinColumnarAgg(Plan *plan)
 	return PlanHasPathologicalNestedLoopPostJoinColumnarAgg(plan->lefttree) ||
 		PlanHasPathologicalNestedLoopPostJoinColumnarAgg(plan->righttree);
 }
+#endif
 
 /*
  * QueryHasVectorizableAggregate

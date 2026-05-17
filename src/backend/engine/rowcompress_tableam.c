@@ -43,6 +43,7 @@
 #if PG_VERSION_NUM >= PG_VERSION_19
 #include "utils/tuplesort.h"
 #endif
+#include "lib/ilist.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/tidbitmap.h"
@@ -216,6 +217,7 @@ typedef RowCompressParallelScanDescData *RowCompressParallelScanDesc;
  * when all slots are occupied the least-recently-used one is evicted.
  */
 #define RC_DECOMP_CACHE_MAX  32
+#define RC_GLOBAL_DECOMP_CACHE_MAX 128
 
 /* One slot in the decompressed-batch LRU cache */
 typedef struct RCDecompCacheEntry
@@ -226,7 +228,28 @@ typedef struct RCDecompCacheEntry
 	uint32   batchRowCount;       /* number of rows in this batch */
 	uint64   batchFirstRowNumber; /* first logical row number */
 	int      lastUsed;            /* LRU clock value; higher = more recent */
+	bool     borrowedFromGlobal;  /* borrowed from backend-local cache */
 } RCDecompCacheEntry;
+
+typedef struct RCGlobalBatchCacheEntry
+{
+	dlist_node listNode;
+	Oid        relid;
+	uint64     batchNum;
+	char      *batchData;
+	uint32     batchDataSize;
+	uint32    *rowOffsets;
+	uint32     rowOffsetsBytes;
+	uint32     batchRowCount;
+	uint64     batchFirstRowNumber;
+} RCGlobalBatchCacheEntry;
+
+typedef struct RCGlobalMetaCacheEntry
+{
+	Oid                       relid;
+	RowCompressBatchMetadata *batchMetaArray;
+	int                       batchMetaCount;
+} RCGlobalMetaCacheEntry;
 
 /* Index fetch state (for index scans) */
 typedef struct IndexFetchRowCompressData
@@ -242,6 +265,7 @@ typedef struct IndexFetchRowCompressData
 	 */
 	RowCompressBatchMetadata *batchMetaArray; /* sorted by firstRowNumber */
 	int                       batchMetaCount;
+	bool                      batchMetaBorrowedFromGlobal;
 
 	/*
 	 * LRU cache of decompressed batches.  Keeps the last
@@ -251,6 +275,12 @@ typedef struct IndexFetchRowCompressData
 	 */
 	RCDecompCacheEntry  decompCache[RC_DECOMP_CACHE_MAX];
 	int                 lruClock;   /* incremented on every cache hit/fill */
+	uint64              metaCacheHits;
+	uint64              metaCacheMisses;
+	uint64              batchCacheHits;
+	uint64              batchCacheMisses;
+	uint64              batchCacheEvictions;
+	uint64              batchDecompresses;
 
 	MemoryContext       scanContext;
 } IndexFetchRowCompressData;
@@ -297,6 +327,11 @@ typedef struct IndexFetchRowCompressData
 
 static List          *RCWriteStateList    = NIL;
 static MemoryContext  RCWriteStateContext = NULL;
+static MemoryContext  RCIndexCacheContext = NULL;
+static List          *RCGlobalMetaCacheList = NIL;
+static dlist_head     RCGlobalBatchCacheList;
+static int            RCGlobalBatchCacheEntries = 0;
+static bool           RCGlobalBatchCacheInitialized = false;
 
 /* Object access hook for DROP TABLE cleanup */
 static object_access_hook_type PrevRCObjectAccessHook = NULL;
@@ -314,12 +349,36 @@ typedef struct RCScanStatsEntry
 	int64 totalScans;
 	int64 batchesTotal;    /* sum of list_length(batchList) across all scans */
 	int64 batchesPruned;   /* sum of batchesPruned across all scans */
+	int64 metaCacheHits;
+	int64 metaCacheMisses;
+	int64 batchCacheHits;
+	int64 batchCacheMisses;
+	int64 batchCacheEvictions;
+	int64 batchDecompresses;
 } RCScanStatsEntry;
 
 static HTAB         *RCScanStatsHash = NULL;
 static MemoryContext RCScanStatsCtx  = NULL;
 
+static RCScanStatsEntry *RCGetScanStatsEntry(Oid relid, bool *found);
 static void RCAccumulateScanStats(Oid relid, int batchesTotal, int64 batchesPruned);
+static void RCAccumulateIndexFetchStats(Oid relid, IndexFetchRowCompressData *fetch);
+static void RCFlushIndexFetchStats(IndexFetchRowCompressData *fetch);
+static MemoryContext RCGetIndexCacheContext(void);
+static void RCFreeBatchMetadataArray(RowCompressBatchMetadata *batchMetaArray,
+									 int batchMetaCount);
+static RCGlobalMetaCacheEntry *RCFindGlobalMetaCacheEntry(Oid relid);
+static RCGlobalBatchCacheEntry *RCFindGlobalBatchCacheEntry(Oid relid, uint64 batchNum);
+static RCGlobalBatchCacheEntry *RCStoreGlobalBatchCacheEntry(Oid relid,
+									  uint64 batchNum,
+									  char *batchData,
+									  uint32 batchDataSize,
+									  uint32 *rowOffsets,
+									  uint32 rowOffsetsBytes,
+									  uint32 batchRowCount,
+									  uint64 batchFirstRowNumber);
+static void RCInvalidateGlobalIndexCacheForRel(Oid relid);
+static void RCMoveGlobalBatchCacheEntryToHead(RCGlobalBatchCacheEntry *entry);
 
 
 /* ================================================================
@@ -546,6 +605,159 @@ static bool rowcompress_scan_bitmap_next_tuple(TableScanDesc sscan,
  * CATALOG HELPER: OID lookups
  * ================================================================ */
 
+static MemoryContext
+RCGetIndexCacheContext(void)
+{
+	if (RCIndexCacheContext == NULL)
+	{
+		RCIndexCacheContext = AllocSetContextCreate(TopMemoryContext,
+									  "RowCompress Index Cache",
+									  ALLOCSET_DEFAULT_SIZES);
+	}
+
+	if (!RCGlobalBatchCacheInitialized)
+	{
+		dlist_init(&RCGlobalBatchCacheList);
+		RCGlobalBatchCacheInitialized = true;
+	}
+
+	return RCIndexCacheContext;
+}
+
+static void
+RCFreeBatchMetadataArray(RowCompressBatchMetadata *batchMetaArray, int batchMetaCount)
+{
+	if (batchMetaArray == NULL)
+		return;
+
+	for (int i = 0; i < batchMetaCount; i++)
+	{
+		pfree(batchMetaArray[i].deletedMask);
+		pfree(batchMetaArray[i].rawMinValue);
+		pfree(batchMetaArray[i].rawMaxValue);
+	}
+
+	pfree(batchMetaArray);
+}
+
+static RCGlobalMetaCacheEntry *
+RCFindGlobalMetaCacheEntry(Oid relid)
+{
+	ListCell *lc;
+
+	foreach(lc, RCGlobalMetaCacheList)
+	{
+		RCGlobalMetaCacheEntry *entry = lfirst(lc);
+		if (entry->relid == relid)
+			return entry;
+	}
+
+	return NULL;
+}
+
+static void
+RCMoveGlobalBatchCacheEntryToHead(RCGlobalBatchCacheEntry *entry)
+{
+	dlist_delete(&entry->listNode);
+	dlist_push_head(&RCGlobalBatchCacheList, &entry->listNode);
+}
+
+static RCGlobalBatchCacheEntry *
+RCFindGlobalBatchCacheEntry(Oid relid, uint64 batchNum)
+{
+	dlist_iter iter;
+
+	if (!RCGlobalBatchCacheInitialized)
+		return NULL;
+
+	dlist_foreach(iter, &RCGlobalBatchCacheList)
+	{
+		RCGlobalBatchCacheEntry *entry =
+			dlist_container(RCGlobalBatchCacheEntry, listNode, iter.cur);
+
+		if (entry->relid == relid && entry->batchNum == batchNum)
+		{
+			RCMoveGlobalBatchCacheEntryToHead(entry);
+			return entry;
+		}
+	}
+
+	return NULL;
+}
+
+static RCGlobalBatchCacheEntry *
+RCStoreGlobalBatchCacheEntry(Oid relid, uint64 batchNum, char *batchData,
+							 uint32 batchDataSize, uint32 *rowOffsets,
+							 uint32 rowOffsetsBytes, uint32 batchRowCount,
+							 uint64 batchFirstRowNumber)
+{
+	MemoryContext oldctx = MemoryContextSwitchTo(RCGetIndexCacheContext());
+	RCGlobalBatchCacheEntry *entry = palloc0(sizeof(RCGlobalBatchCacheEntry));
+
+	entry->relid = relid;
+	entry->batchNum = batchNum;
+	entry->batchData = batchData;
+	entry->batchDataSize = batchDataSize;
+	entry->rowOffsets = rowOffsets;
+	entry->rowOffsetsBytes = rowOffsetsBytes;
+	entry->batchRowCount = batchRowCount;
+	entry->batchFirstRowNumber = batchFirstRowNumber;
+
+	dlist_push_head(&RCGlobalBatchCacheList, &entry->listNode);
+	RCGlobalBatchCacheEntries++;
+
+	while (RCGlobalBatchCacheEntries > RC_GLOBAL_DECOMP_CACHE_MAX)
+	{
+		RCGlobalBatchCacheEntry *tail =
+			dlist_tail_element(RCGlobalBatchCacheEntry, listNode,
+						   &RCGlobalBatchCacheList);
+		dlist_delete(&tail->listNode);
+		pfree(tail->batchData);
+		pfree(tail->rowOffsets);
+		pfree(tail);
+		RCGlobalBatchCacheEntries--;
+	}
+
+	MemoryContextSwitchTo(oldctx);
+	return entry;
+}
+
+static void
+RCInvalidateGlobalIndexCacheForRel(Oid relid)
+{
+	ListCell *lc;
+
+	foreach(lc, RCGlobalMetaCacheList)
+	{
+		RCGlobalMetaCacheEntry *entry = lfirst(lc);
+		if (entry->relid == relid)
+		{
+			RCGlobalMetaCacheList = list_delete_ptr(RCGlobalMetaCacheList, entry);
+			RCFreeBatchMetadataArray(entry->batchMetaArray, entry->batchMetaCount);
+			pfree(entry);
+			break;
+		}
+	}
+
+	if (!RCGlobalBatchCacheInitialized)
+		return;
+
+	dlist_mutable_iter miter;
+	dlist_foreach_modify(miter, &RCGlobalBatchCacheList)
+	{
+		RCGlobalBatchCacheEntry *entry =
+			dlist_container(RCGlobalBatchCacheEntry, listNode, miter.cur);
+		if (entry->relid != relid)
+			continue;
+
+		dlist_delete(miter.cur);
+		pfree(entry->batchData);
+		pfree(entry->rowOffsets);
+		pfree(entry);
+		RCGlobalBatchCacheEntries--;
+	}
+}
+
 static Oid
 RCNamespaceId(void)
 {
@@ -728,7 +940,23 @@ static void
 RCEnsureBatchMetaCache(IndexFetchRowCompressData *fetch, Relation rel)
 {
 	if (fetch->batchMetaArray != NULL)
+	{
+		fetch->metaCacheHits++;
 		return;   /* already loaded */
+	}
+
+	RCGlobalMetaCacheEntry *globalEntry =
+		RCFindGlobalMetaCacheEntry(RelationGetRelid(rel));
+	if (globalEntry != NULL)
+	{
+		fetch->batchMetaArray = globalEntry->batchMetaArray;
+		fetch->batchMetaCount = globalEntry->batchMetaCount;
+		fetch->batchMetaBorrowedFromGlobal = true;
+		fetch->metaCacheHits++;
+		return;
+	}
+
+	fetch->metaCacheMisses++;
 
 	uint64 storageId = RCStorageId(rel);
 	List  *batches   = RCGetBatches(storageId);
@@ -737,13 +965,26 @@ RCEnsureBatchMetaCache(IndexFetchRowCompressData *fetch, Relation rel)
 	if (n == 0)
 	{
 		/* Empty table: allocate a dummy array so the pointer is non-NULL */
+		MemoryContext oldctx = MemoryContextSwitchTo(RCGetIndexCacheContext());
 		fetch->batchMetaArray = palloc0(sizeof(RowCompressBatchMetadata));
+		MemoryContextSwitchTo(oldctx);
 		fetch->batchMetaCount = 0;
 		list_free_deep(batches);
+
+		oldctx = MemoryContextSwitchTo(RCGetIndexCacheContext());
+		RCGlobalMetaCacheEntry *emptyEntry = palloc0(sizeof(RCGlobalMetaCacheEntry));
+		emptyEntry->relid = RelationGetRelid(rel);
+		emptyEntry->batchMetaArray = fetch->batchMetaArray;
+		emptyEntry->batchMetaCount = 0;
+		RCGlobalMetaCacheList = lappend(RCGlobalMetaCacheList, emptyEntry);
+		MemoryContextSwitchTo(oldctx);
+		fetch->batchMetaBorrowedFromGlobal = true;
 		return;
 	}
 
+	MemoryContext oldctx = MemoryContextSwitchTo(RCGetIndexCacheContext());
 	fetch->batchMetaArray = palloc(n * sizeof(RowCompressBatchMetadata));
+	MemoryContextSwitchTo(oldctx);
 	fetch->batchMetaCount = n;
 
 	int       i  = 0;
@@ -755,13 +996,40 @@ RCEnsureBatchMetaCache(IndexFetchRowCompressData *fetch, Relation rel)
 		/* Deep-copy deletedMask so it survives after list_free_deep */
 		if (m->deletedMask != NULL && m->deletedMaskLen > 0)
 		{
+			oldctx = MemoryContextSwitchTo(RCGetIndexCacheContext());
 			fetch->batchMetaArray[i].deletedMask = palloc(m->deletedMaskLen);
+			MemoryContextSwitchTo(oldctx);
 			memcpy(fetch->batchMetaArray[i].deletedMask,
 				   m->deletedMask, m->deletedMaskLen);
+		}
+		if (m->rawMinValue != NULL)
+		{
+			oldctx = MemoryContextSwitchTo(RCGetIndexCacheContext());
+			fetch->batchMetaArray[i].rawMinValue = palloc(VARSIZE_ANY(m->rawMinValue));
+			MemoryContextSwitchTo(oldctx);
+			memcpy(fetch->batchMetaArray[i].rawMinValue,
+				   m->rawMinValue, VARSIZE_ANY(m->rawMinValue));
+		}
+		if (m->rawMaxValue != NULL)
+		{
+			oldctx = MemoryContextSwitchTo(RCGetIndexCacheContext());
+			fetch->batchMetaArray[i].rawMaxValue = palloc(VARSIZE_ANY(m->rawMaxValue));
+			MemoryContextSwitchTo(oldctx);
+			memcpy(fetch->batchMetaArray[i].rawMaxValue,
+				   m->rawMaxValue, VARSIZE_ANY(m->rawMaxValue));
 		}
 		i++;
 	}
 	list_free_deep(batches);
+
+	oldctx = MemoryContextSwitchTo(RCGetIndexCacheContext());
+	RCGlobalMetaCacheEntry *newEntry = palloc0(sizeof(RCGlobalMetaCacheEntry));
+	newEntry->relid = RelationGetRelid(rel);
+	newEntry->batchMetaArray = fetch->batchMetaArray;
+	newEntry->batchMetaCount = fetch->batchMetaCount;
+	RCGlobalMetaCacheList = lappend(RCGlobalMetaCacheList, newEntry);
+	MemoryContextSwitchTo(oldctx);
+	fetch->batchMetaBorrowedFromGlobal = true;
 }
 
 /*
@@ -810,10 +1078,49 @@ RCGetOrLoadBatch(IndexFetchRowCompressData *fetch, Relation rel,
 	{
 		if (fetch->decompCache[i].batchNum == meta->batchNum)
 		{
+			fetch->batchCacheHits++;
 			fetch->decompCache[i].lastUsed = ++fetch->lruClock;
 			return &fetch->decompCache[i];
 		}
 	}
+
+	RCGlobalBatchCacheEntry *globalEntry =
+		RCFindGlobalBatchCacheEntry(RelationGetRelid(rel), meta->batchNum);
+	if (globalEntry != NULL)
+	{
+		int localSlot = 0;
+		for (i = 1; i < RC_DECOMP_CACHE_MAX; i++)
+		{
+			RCDecompCacheEntry *candidate = &fetch->decompCache[i];
+			if (candidate->batchNum == UINT64_MAX)
+			{
+				localSlot = i;
+				break;
+			}
+			if (candidate->lastUsed < fetch->decompCache[localSlot].lastUsed)
+				localSlot = i;
+		}
+
+		RCDecompCacheEntry *entry = &fetch->decompCache[localSlot];
+		if (!entry->borrowedFromGlobal && entry->batchData)
+			pfree(entry->batchData);
+		if (!entry->borrowedFromGlobal && entry->rowOffsets)
+			pfree(entry->rowOffsets);
+
+		entry->batchData = palloc(globalEntry->batchDataSize > 0 ? globalEntry->batchDataSize : 1);
+		memcpy(entry->batchData, globalEntry->batchData, globalEntry->batchDataSize);
+		entry->rowOffsets = palloc(globalEntry->rowOffsetsBytes > 0 ? globalEntry->rowOffsetsBytes : 1);
+		entry->batchNum = globalEntry->batchNum;
+		memcpy(entry->rowOffsets, globalEntry->rowOffsets, globalEntry->rowOffsetsBytes);
+		entry->batchRowCount = globalEntry->batchRowCount;
+		entry->batchFirstRowNumber = globalEntry->batchFirstRowNumber;
+		entry->borrowedFromGlobal = false;
+		entry->lastUsed = ++fetch->lruClock;
+		fetch->batchCacheHits++;
+		return entry;
+	}
+
+	fetch->batchCacheMisses++;
 
 	/* Find the LRU (or first empty) slot */
 	int evict = 0;
@@ -830,10 +1137,17 @@ RCGetOrLoadBatch(IndexFetchRowCompressData *fetch, Relation rel,
 	}
 
 	RCDecompCacheEntry *entry = &fetch->decompCache[evict];
+	if (entry->batchNum != UINT64_MAX)
+		fetch->batchCacheEvictions++;
 
 	/* Free old data */
-	if (entry->batchData)  { pfree(entry->batchData);  entry->batchData  = NULL; }
-	if (entry->rowOffsets) { pfree(entry->rowOffsets); entry->rowOffsets = NULL; }
+	if (!entry->borrowedFromGlobal && entry->batchData)
+		pfree(entry->batchData);
+	if (!entry->borrowedFromGlobal && entry->rowOffsets)
+		pfree(entry->rowOffsets);
+	entry->batchData = NULL;
+	entry->rowOffsets = NULL;
+	entry->borrowedFromGlobal = false;
 
 	/* Read compressed batch from disk */
 	char *rawData = palloc(meta->dataLength);
@@ -853,13 +1167,17 @@ RCGetOrLoadBatch(IndexFetchRowCompressData *fetch, Relation rel,
 	uint32 uncompressedDataSize = hdr->uncompressedDataSize;
 
 	/* Decompress */
+	fetch->batchDecompresses++;
+	MemoryContext oldctx = MemoryContextSwitchTo(RCGetIndexCacheContext());
 	char *batchData;
+	uint32 batchDataLength;
 	if (compressionType != COMPRESSION_NONE)
 	{
 		StringInfoData compBuf = {storedData, storedDataSize, storedDataSize, 0};
 		StringInfo decompBuf = DecompressBuffer(&compBuf,
 												(CompressionType) compressionType,
 												uncompressedDataSize);
+		batchDataLength = decompBuf->len;
 		batchData = palloc(decompBuf->len);
 		memcpy(batchData, decompBuf->data, decompBuf->len);
 		pfree(decompBuf->data);
@@ -867,21 +1185,32 @@ RCGetOrLoadBatch(IndexFetchRowCompressData *fetch, Relation rel,
 	}
 	else
 	{
+		batchDataLength = storedDataSize;
 		batchData = palloc(storedDataSize > 0 ? storedDataSize : 1);
 		memcpy(batchData, storedData, storedDataSize);
 	}
 
 	uint32 *offsets = palloc(offsetsBytes > 0 ? offsetsBytes : 1);
 	memcpy(offsets, storedOffsets, offsetsBytes);
+	MemoryContextSwitchTo(oldctx);
 
 	pfree(rawData);
 
 	/* Populate cache entry */
-	entry->batchNum            = meta->batchNum;
-	entry->batchData           = batchData;
-	entry->rowOffsets          = offsets;
-	entry->batchRowCount       = rowCount;
-	entry->batchFirstRowNumber = meta->firstRowNumber;
+	RCGlobalBatchCacheEntry *storedEntry =
+		RCStoreGlobalBatchCacheEntry(RelationGetRelid(rel), meta->batchNum,
+								 batchData, batchDataLength,
+								 offsets, offsetsBytes, rowCount,
+								 meta->firstRowNumber);
+
+	entry->batchNum            = storedEntry->batchNum;
+	entry->batchData           = palloc(storedEntry->batchDataSize > 0 ? storedEntry->batchDataSize : 1);
+	memcpy(entry->batchData, storedEntry->batchData, storedEntry->batchDataSize);
+	entry->rowOffsets          = palloc(storedEntry->rowOffsetsBytes > 0 ? storedEntry->rowOffsetsBytes : 1);
+	memcpy(entry->rowOffsets, storedEntry->rowOffsets, storedEntry->rowOffsetsBytes);
+	entry->batchRowCount       = storedEntry->batchRowCount;
+	entry->batchFirstRowNumber = storedEntry->batchFirstRowNumber;
+	entry->borrowedFromGlobal  = false;
 	entry->lastUsed            = ++fetch->lruClock;
 
 	return entry;
@@ -1276,6 +1605,8 @@ RCFlushWriteStateForRelation(Relation rel)
 	if (ws == NULL || ws->rowCount == 0)
 		return;
 
+	RCInvalidateGlobalIndexCacheForRel(RelationGetRelid(rel));
+
 	RCFlushBatch(ws, rel);
 	CommandCounterIncrement();
 }
@@ -1582,14 +1913,13 @@ RCFlushBatch(RowCompressWriteState *ws, Relation rel)
 	uint64 batchId    = ColumnarStorageReserveStripeId(rel);
 	uint64 fileOffset = ColumnarStorageReserveData(rel, totalSize);
 
-
-/* Write header, row offsets, then data */
-ColumnarStorageWrite(rel, fileOffset,
- (char *) &header, sizeof(header));
-ColumnarStorageWrite(rel, fileOffset + sizeof(header),
- (char *) rowOffsets, offsetsBytes);
-ColumnarStorageWrite(rel, fileOffset + sizeof(header) + offsetsBytes,
- dataToStore->data, dataToStore->len);
+	/* Write header, row offsets, then data */
+	ColumnarStorageWrite(rel, fileOffset,
+						 (char *) &header, sizeof(header));
+	ColumnarStorageWrite(rel, fileOffset + sizeof(header),
+						 (char *) rowOffsets, offsetsBytes);
+	ColumnarStorageWrite(rel, fileOffset + sizeof(header) + offsetsBytes,
+						 dataToStore->data, dataToStore->len);
 
 /* Insert metadata row (transactional; rolled back if transaction aborts) */
 	bytea *minBytea = NULL;
@@ -2127,7 +2457,14 @@ rowcompress_index_fetch_begin(Relation rel
 	fetch->storageId      = RCStorageId(rel);
 	fetch->batchMetaArray = NULL;
 	fetch->batchMetaCount = 0;
+	fetch->batchMetaBorrowedFromGlobal = false;
 	fetch->lruClock       = 0;
+	fetch->metaCacheHits = 0;
+	fetch->metaCacheMisses = 0;
+	fetch->batchCacheHits = 0;
+	fetch->batchCacheMisses = 0;
+	fetch->batchCacheEvictions = 0;
+	fetch->batchDecompresses = 0;
 
 	/* Mark all cache slots as empty */
 	for (int i = 0; i < RC_DECOMP_CACHE_MAX; i++)
@@ -2141,6 +2478,7 @@ static void
 rowcompress_index_fetch_reset(IndexFetchTableData *scan)
 {
 	IndexFetchRowCompressData *fetch = (IndexFetchRowCompressData *) scan;
+	RCFlushIndexFetchStats(fetch);
 
 	/*
 	 * Free decompressed batch data but keep the metadata cache: the batch
@@ -2149,17 +2487,18 @@ rowcompress_index_fetch_reset(IndexFetchTableData *scan)
 	 */
 	for (int i = 0; i < RC_DECOMP_CACHE_MAX; i++)
 	{
-		if (fetch->decompCache[i].batchData)
+		if (!fetch->decompCache[i].borrowedFromGlobal && fetch->decompCache[i].batchData)
 		{
 			pfree(fetch->decompCache[i].batchData);
 			fetch->decompCache[i].batchData = NULL;
 		}
-		if (fetch->decompCache[i].rowOffsets)
+		if (!fetch->decompCache[i].borrowedFromGlobal && fetch->decompCache[i].rowOffsets)
 		{
 			pfree(fetch->decompCache[i].rowOffsets);
 			fetch->decompCache[i].rowOffsets = NULL;
 		}
 		fetch->decompCache[i].batchNum = UINT64_MAX;
+		fetch->decompCache[i].borrowedFromGlobal = false;
 	}
 }
 
@@ -2168,8 +2507,8 @@ rowcompress_index_fetch_end(IndexFetchTableData *scan)
 {
 	IndexFetchRowCompressData *fetch = (IndexFetchRowCompressData *) scan;
 	rowcompress_index_fetch_reset(scan);
-	if (fetch->batchMetaArray)
-		pfree(fetch->batchMetaArray);
+	if (fetch->batchMetaArray && !fetch->batchMetaBorrowedFromGlobal)
+		RCFreeBatchMetadataArray(fetch->batchMetaArray, fetch->batchMetaCount);
 	pfree(fetch);
 }
 
@@ -2258,10 +2597,13 @@ rowcompress_fetch_row_version(Relation relation,
 	/* Free any data allocated during the single-TID fetch */
 	for (int i = 0; i < RC_DECOMP_CACHE_MAX; i++)
 	{
-		if (fetch.decompCache[i].batchData)  pfree(fetch.decompCache[i].batchData);
-		if (fetch.decompCache[i].rowOffsets) pfree(fetch.decompCache[i].rowOffsets);
+		if (!fetch.decompCache[i].borrowedFromGlobal && fetch.decompCache[i].batchData)
+			pfree(fetch.decompCache[i].batchData);
+		if (!fetch.decompCache[i].borrowedFromGlobal && fetch.decompCache[i].rowOffsets)
+			pfree(fetch.decompCache[i].rowOffsets);
 	}
-	if (fetch.batchMetaArray) pfree(fetch.batchMetaArray);
+	if (fetch.batchMetaArray && !fetch.batchMetaBorrowedFromGlobal)
+		RCFreeBatchMetadataArray(fetch.batchMetaArray, fetch.batchMetaCount);
 
 	return found;
 }
@@ -2689,6 +3031,8 @@ SMgrRelation srel = RelationCreateStorage(*newrnode, persistence);
 
 ColumnarStorageInit(srel, ColumnarMetadataNewStorageId());
 
+RCInvalidateGlobalIndexCacheForRel(RelationGetRelid(rel));
+
 /* Delete old options row if it exists (TRUNCATE reuses the same rel OID) */
 RCDeleteOptions(rel->rd_id, true /* missingOk */);
 RCInitOptions(rel->rd_id);
@@ -2702,6 +3046,7 @@ rowcompress_relation_nontransactional_truncate(Relation rel)
 {
 uint64 storageId = ColumnarStorageGetStorageId(rel, false);
 RCDeleteBatches(storageId);
+RCInvalidateGlobalIndexCacheForRel(RelationGetRelid(rel));
 RelationTruncate(rel, 0);
 
 uint64 newStorageId = ColumnarMetadataNewStorageId();
@@ -3972,35 +4317,79 @@ rowcompress_repack(PG_FUNCTION_ARGS)
  * Called from rowcompress_endscan before the scan context is freed.
  */
 static void
-RCAccumulateScanStats(Oid relid, int batchesTotal, int64 batchesPruned)
+RCAccumulateIndexFetchStats(Oid relid, IndexFetchRowCompressData *fetch)
 {
-	bool found;
+	RCScanStatsEntry *entry = RCGetScanStatsEntry(relid, NULL);
 
-	/* Lazy-init the hash and its memory context */
+	entry->metaCacheHits += fetch->metaCacheHits;
+	entry->metaCacheMisses += fetch->metaCacheMisses;
+	entry->batchCacheHits += fetch->batchCacheHits;
+	entry->batchCacheMisses += fetch->batchCacheMisses;
+	entry->batchCacheEvictions += fetch->batchCacheEvictions;
+	entry->batchDecompresses += fetch->batchDecompresses;
+}
+
+static void
+RCFlushIndexFetchStats(IndexFetchRowCompressData *fetch)
+{
+	if (fetch->metaCacheHits == 0 &&
+		fetch->metaCacheMisses == 0 &&
+		fetch->batchCacheHits == 0 &&
+		fetch->batchCacheMisses == 0 &&
+		fetch->batchCacheEvictions == 0 &&
+		fetch->batchDecompresses == 0)
+		return;
+
+	RCAccumulateIndexFetchStats(RelationGetRelid(fetch->rc_base.rel), fetch);
+
+	fetch->metaCacheHits = 0;
+	fetch->metaCacheMisses = 0;
+	fetch->batchCacheHits = 0;
+	fetch->batchCacheMisses = 0;
+	fetch->batchCacheEvictions = 0;
+	fetch->batchDecompresses = 0;
+}
+
+static RCScanStatsEntry *
+RCGetScanStatsEntry(Oid relid, bool *found)
+{
+	bool localFound;
+
 	if (RCScanStatsHash == NULL)
 	{
 		HASHCTL hctl;
 
 		RCScanStatsCtx = AllocSetContextCreate(TopMemoryContext,
-											   "RowCompress ScanStats",
-											   ALLOCSET_SMALL_SIZES);
+									   "RowCompress ScanStats",
+									   ALLOCSET_SMALL_SIZES);
 		memset(&hctl, 0, sizeof(hctl));
 		hctl.keysize   = sizeof(Oid);
 		hctl.entrysize = sizeof(RCScanStatsEntry);
 		hctl.hcxt      = RCScanStatsCtx;
 		RCScanStatsHash = hash_create("RowCompress scan stats",
-									  64, &hctl,
-									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+								  64, &hctl,
+								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 
 	RCScanStatsEntry *entry =
-		(RCScanStatsEntry *) hash_search(RCScanStatsHash, &relid, HASH_ENTER, &found);
-	if (!found)
+		(RCScanStatsEntry *) hash_search(RCScanStatsHash, &relid, HASH_ENTER, &localFound);
+	if (!localFound)
 	{
-		entry->totalScans    = 0;
-		entry->batchesTotal  = 0;
-		entry->batchesPruned = 0;
+		memset(entry, 0, sizeof(RCScanStatsEntry));
+		entry->relid = relid;
 	}
+
+	if (found != NULL)
+		*found = localFound;
+
+	return entry;
+}
+
+static void
+RCAccumulateScanStats(Oid relid, int batchesTotal, int64 batchesPruned)
+{
+	RCScanStatsEntry *entry = RCGetScanStatsEntry(relid, NULL);
+
 	entry->totalScans    += 1;
 	entry->batchesTotal  += batchesTotal;
 	entry->batchesPruned += batchesPruned;
@@ -4010,7 +4399,10 @@ RCAccumulateScanStats(Oid relid, int batchesTotal, int64 batchesPruned)
  * rowcompress_scan_stats — SRF returning session-local scan statistics.
  *
  * Columns: table_name text, total_scans bigint, batches_total bigint,
- *          batches_scanned bigint, batches_pruned bigint, pruning_ratio float4
+ *          batches_scanned bigint, batches_pruned bigint, pruning_ratio float4,
+ *          meta_cache_hits bigint, meta_cache_misses bigint,
+ *          batch_cache_hits bigint, batch_cache_misses bigint,
+ *          batch_cache_evictions bigint, batch_decompresses bigint
  *
  * Usage: SELECT * FROM engine.rowcompress_scan_stats();
  */
@@ -4057,8 +4449,9 @@ rowcompress_scan_stats(PG_FUNCTION_ARGS)
 				? (float4) entry->batchesPruned / (float4) entry->batchesTotal
 				: 0.0f;
 
-			Datum  values[6];
-			bool   nulls[6] = {false, false, false, false, false, false};
+			Datum  values[12];
+			bool   nulls[12] = {false, false, false, false, false, false,
+								 false, false, false, false, false, false};
 
 			values[0] = CStringGetTextDatum(relname);
 			values[1] = Int64GetDatum(entry->totalScans);
@@ -4066,6 +4459,12 @@ rowcompress_scan_stats(PG_FUNCTION_ARGS)
 			values[3] = Int64GetDatum(batchesScanned);
 			values[4] = Int64GetDatum(entry->batchesPruned);
 			values[5] = Float4GetDatum(pruningRatio);
+			values[6] = Int64GetDatum(entry->metaCacheHits);
+			values[7] = Int64GetDatum(entry->metaCacheMisses);
+			values[8] = Int64GetDatum(entry->batchCacheHits);
+			values[9] = Int64GetDatum(entry->batchCacheMisses);
+			values[10] = Int64GetDatum(entry->batchCacheEvictions);
+			values[11] = Int64GetDatum(entry->batchDecompresses);
 
 			HeapTuple tup = heap_form_tuple(tupdesc, values, nulls);
 			tuplestore_puttuple(tupstore, tup);
@@ -4192,6 +4591,7 @@ RCObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 
 	/* Delete all batch rows for this storage and the options row */
 	RCDeleteBatches(storageId);
+	RCInvalidateGlobalIndexCacheForRel(objectId);
 	RCDeleteOptions(objectId, true);
 }
 

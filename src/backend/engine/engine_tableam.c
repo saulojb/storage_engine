@@ -109,6 +109,7 @@ typedef struct ColumnarScanDescData
 	MemoryContext scanContext;
 	Bitmapset *attr_needed;
 	List *scanQual;
+	uint64 cacheScanGeneration;
 
 	/* Parallel Scan Data */
 	ParallelColumnarScan parallelColumnarScan;
@@ -245,9 +246,8 @@ static bool previousCacheEnabledState = false;
 
 /*
  * Reference count for active sequential/custom scans using the column cache.
- * ColumnarResetCache() is only called when the last active scan ends, so that
- * nested scans (e.g. correlated subqueries) do not destroy the shared cache
- * context while an outer scan still holds pointers into it.
+ * We keep the cache alive across scans in the same backend, but still track
+ * active users so we never let the count drift negative on mixed scan paths.
  */
 static int se_cache_refcount = 0;
 
@@ -328,6 +328,7 @@ engine_beginscan_extended(Relation relation, Snapshot snapshot,
 	scan->attr_needed = bms_copy(attr_needed);
 	scan->scanQual = copyObject(scanQual);
 	scan->scanContext = scanContext;
+	scan->cacheScanGeneration = ColumnarCacheRegisterScan();
 
 	/* Parallel execution scan data */;
 	scan->parallelColumnarScan = parallelColumnarScan;
@@ -365,6 +366,7 @@ CreateColumnarScanMemoryContext(void)
 static ColumnarReadState *
 init_engine_read_state(Relation relation, TupleDesc tupdesc, Bitmapset *attr_needed,
 						 List *scanQual, MemoryContext scanContext, Snapshot snapshot,
+						 uint64 cacheScanGeneration,
 						 bool randomAccess,
 						 ParallelColumnarScan parallelColumnarScan)
 {
@@ -372,7 +374,8 @@ init_engine_read_state(Relation relation, TupleDesc tupdesc, Bitmapset *attr_nee
 
 	List *neededColumnList = NeededColumnsList(tupdesc, attr_needed);
 	ColumnarReadState *readState = ColumnarBeginRead(relation, tupdesc, neededColumnList,
-													 scanQual, scanContext, snapshot,
+									 scanQual, scanContext, snapshot,
+									 cacheScanGeneration,
 													 randomAccess,
 													 parallelColumnarScan);
 
@@ -400,11 +403,8 @@ engine_endscan(TableScanDesc sscan)
 	/* clean up any caches. */
 	if (engine_enable_page_cache == true)
 	{
-		if (--se_cache_refcount <= 0)
-		{
+		if (--se_cache_refcount < 0)
 			se_cache_refcount = 0;
-			ColumnarResetCache();
-		}
 	}
 
 	MemoryContextDelete(scan->scanContext);
@@ -446,6 +446,7 @@ engine_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot 
 			init_engine_read_state(scan->cs_base.rs_rd, readTupleDesc,
 									 scan->attr_needed, scan->scanQual,
 									 scan->scanContext, scan->cs_base.rs_snapshot,
+									 scan->cacheScanGeneration,
 									 randomAccess,
 									 scan->parallelColumnarScan);
 		/* Propagate ANALYZE sampling stride (0 = normal scan) */
@@ -757,11 +758,8 @@ engine_index_fetch_end(IndexFetchTableData *sscan)
 	/* clean up any caches. */
 	if (engine_enable_page_cache == true)
 	{
-		if (--se_cache_refcount <= 0)
-		{
+		if (--se_cache_refcount < 0)
 			se_cache_refcount = 0;
-			ColumnarResetCache();
-		}
 	}
 
 	MemoryContextDelete(scan->scanContext);
@@ -858,7 +856,8 @@ engine_index_fetch_tuple(struct IndexFetchTableData *sscan,
 													  slot->tts_tupleDescriptor,
 													  scan->attr_needed, scanQual,
 													  scan->scanContext,
-													  snapshot, randomAccess,
+									  snapshot, ColumnarCacheRegisterScan(),
+									  randomAccess,
 													  NULL);
 
 		/*
@@ -1094,7 +1093,8 @@ engine_fetch_row_version(Relation relation,
 											  slot->tts_tupleDescriptor,
 											  attr_needed, scanQual,
 											  GetColumnarReadStateCache(),
-											  snapshot, randomAccess,
+									  snapshot, ColumnarCacheRegisterScan(),
+									  randomAccess,
 											  NULL);
 	}
 
@@ -1500,7 +1500,8 @@ engine_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 										slot->tts_tupleDescriptor,
 										attr_needed, scanQual,
 										CurrentMemoryContext, // to be checked
-										GetTransactionSnapshot(), randomAccess,
+									GetTransactionSnapshot(), ColumnarCacheRegisterScan(),
+									randomAccess,
 										NULL);
 
 	ColumnarReadRowByRowNumber(readState, rowNumber,
@@ -1554,6 +1555,7 @@ engine_relation_set_new_filenode(Relation rel,
 #if PG_VERSION_NUM >= PG_VERSION_16
 	if (rel->rd_locator.relNumber != newrnode->relNumber)
 	{
+		ColumnarInvalidateRelationCache(rel->rd_id);
 		MarkRelfilenodeDropped(rel->rd_locator.relNumber, GetCurrentSubTransactionId());
 
 		DeleteMetadataRows(rel->rd_locator);
@@ -1561,6 +1563,7 @@ engine_relation_set_new_filenode(Relation rel,
 #else
 	if (rel->rd_node.relNode != newrnode->relNode)
 	{
+		ColumnarInvalidateRelationCache(rel->rd_id);
 		MarkRelfilenodeDropped(rel->rd_node.relNode, GetCurrentSubTransactionId());
 
 		DeleteMetadataRows(rel->rd_node);
@@ -1596,6 +1599,7 @@ engine_relation_nontransactional_truncate(Relation rel)
 	NonTransactionDropWriteState(relfilelocator.relNode);
 #endif
 	/* Delete old relfilelocator metadata */
+	ColumnarInvalidateRelationCache(rel->rd_id);
 	DeleteMetadataRows(relfilelocator);
 
 	/*
@@ -1689,6 +1693,7 @@ engine_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	ColumnarReadState *readState = init_engine_read_state(OldHeap, sourceDesc,
 															attr_needed, scanQual,
 															scanContext, snapshot,
+									ColumnarCacheRegisterScan(),
 															randomAccess,
 															NULL);
 
@@ -1870,6 +1875,7 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 
 	/* We need to re-assing RecentXmin here */
 	PushActiveSnapshot(GetTransactionSnapshot());
+	ColumnarInvalidateRelationCache(rel->rd_id);
 #if PG_VERSION_NUM >= PG_VERSION_16
 	ColumnarWriteState *writeState = ColumnarBeginWrite(rel->rd_locator,
 														columnarOptions,
@@ -1892,6 +1898,7 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 	ColumnarReadState *readState = init_engine_read_state(rel, tupleDesc,
 															attr_needed, scanQual,
 															scanContext, SnapshotAny,
+									ColumnarCacheRegisterScan(),
 															randomAccess,
 															NULL);
 
@@ -3041,7 +3048,8 @@ engine_scan_bitmap_next_tuple(TableScanDesc sscan,
 		scan->cs_readState = init_engine_read_state(
 			scan->cs_base.rs_rd, slot->tts_tupleDescriptor,
 			scan->attr_needed, scan->scanQual, scan->scanContext,
-			scan->cs_base.rs_snapshot, true /* randomAccess */, NULL);
+			scan->cs_base.rs_snapshot, scan->cacheScanGeneration,
+			true /* randomAccess */, NULL);
 	}
 
 	while (true)
@@ -3101,7 +3109,8 @@ engine_scan_bitmap_next_tuple(TableScanDesc sscan,
 		scan->cs_readState = init_engine_read_state(
 			scan->cs_base.rs_rd, slot->tts_tupleDescriptor,
 			scan->attr_needed, scan->scanQual, scan->scanContext,
-			scan->cs_base.rs_snapshot, true /* randomAccess */, NULL);
+			scan->cs_base.rs_snapshot, scan->cacheScanGeneration,
+			true /* randomAccess */, NULL);
 	}
 
 	/* Allocate the exact-offset buffer once inside the scan memory context */
@@ -3378,6 +3387,7 @@ ColumnarTableDropHook(Oid relid)
 #else
 		RelFileLocator relfilelocator = rel->rd_node;
 #endif
+		ColumnarInvalidateRelationCache(relid);
 		DeleteMetadataRows(relfilelocator);
 		DeleteColumnarTableOptions(rel->rd_id, true);
 #if PG_VERSION_NUM >= PG_VERSION_16
@@ -4469,6 +4479,7 @@ se_vacuum_engine_table(PG_FUNCTION_ARGS)
 		ColumnarReadState *readState = init_engine_read_state(rel, tupleDesc,
 															attr_needed, scanQual,
 															scanContext, snapshot,
+									ColumnarCacheRegisterScan(),
 															randomAccess,
 															NULL);
 
@@ -4486,6 +4497,8 @@ se_vacuum_engine_table(PG_FUNCTION_ARGS)
 			ColumnarWriteRow(writeState, values, nulls);
 			rowCount++;
 		}
+
+		ColumnarInvalidateRelationCache(rel->rd_id);
 
 #if PG_VERSION_NUM >= PG_VERSION_16
 		DeleteMetadataRowsForStripeId(rel->rd_locator, vacuumCandidate->stripeMetadata->id);

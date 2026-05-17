@@ -12,15 +12,19 @@ export LC_ALL=C
 PORT=5433
 WITH_CH=1
 DBUSER="${PGUSER:-postgres}"
+CACHE_OPTS=""
 
 for arg in "$@"; do
     case "$arg" in
         --no-ch)
             WITH_CH=0
             ;;
+        --cache-on)
+            CACHE_OPTS="-c storage_engine.enable_page_cache=on"
+            ;;
         ''|*[!0-9]*)
-            if [[ "$arg" != "--no-ch" ]]; then
-                echo "Uso: bash bench-matrix.sh [port] [--no-ch]" >&2
+            if [[ "$arg" != "--no-ch" && "$arg" != "--cache-on" ]]; then
+                echo "Uso: bash bench-matrix.sh [port] [--no-ch] [--cache-on]" >&2
                 exit 1
             fi
             ;;
@@ -146,7 +150,8 @@ any_timeout=0
 # ---------------------------------------------------------------------------
 # Loop principal Q1..Q22
 # ---------------------------------------------------------------------------
-VEC="-c storage_engine.enable_vectorization=on"
+VEC="-c storage_engine.enable_vectorization=on ${CACHE_OPTS}"
+BASE_PG_OPTS="${CACHE_OPTS}"
 
 for i in $(seq 1 22); do
 
@@ -154,10 +159,10 @@ for i in $(seq 1 22); do
 
     # ---- PostgreSQL heap ----
     printf " pg" >&2
-    run_pg "pg" "pg" "" "$i" 1
+    run_pg "pg" "pg" "$BASE_PG_OPTS" "$i" 1
     ms_pf=$(ms_pg "$DIR/result/pg${i}.1")
     for j in 2 3 4; do
-        run_pg "pg" "pg" "" "$i" $j
+        run_pg "pg" "pg" "$BASE_PG_OPTS" "$i" $j
         printf "." >&2
     done
     ms_pw=$(avg3 "$(ms_pg "$DIR/result/pg${i}.2")" \

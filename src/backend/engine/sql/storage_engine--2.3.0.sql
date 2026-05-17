@@ -3249,13 +3249,19 @@ CREATE OR REPLACE FUNCTION engine.rowcompress_scan_stats(
     OUT batches_total   bigint,
     OUT batches_scanned bigint,
     OUT batches_pruned  bigint,
-    OUT pruning_ratio   float4)
+    OUT pruning_ratio   float4,
+    OUT meta_cache_hits bigint,
+    OUT meta_cache_misses bigint,
+    OUT batch_cache_hits bigint,
+    OUT batch_cache_misses bigint,
+    OUT batch_cache_evictions bigint,
+    OUT batch_decompresses bigint)
 RETURNS SETOF record
 LANGUAGE C
 AS 'MODULE_PATHNAME', 'rowcompress_scan_stats';
 
 COMMENT ON FUNCTION engine.rowcompress_scan_stats()
-IS 'Session-local scan statistics for rowcompress tables: total scans, batches examined, batches pruned by min/max, and pruning effectiveness ratio. Accumulated since session start (or last reset). Reset on session end.';
+IS 'Session-local scan statistics for rowcompress tables: total scans, batches examined, batches pruned by min/max, pruning effectiveness ratio, metadata-cache reuse, and decompressed-batch LRU reuse. Accumulated since session start (or last reset). Reset on session end.';
 
 GRANT EXECUTE ON FUNCTION engine.rowcompress_scan_stats() TO PUBLIC;
 

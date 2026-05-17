@@ -264,10 +264,17 @@ typedef struct RowMaskWriteStateEntry RowMaskWriteStateEntry;
 /* Cache statistics for when caching is enabled and used. */
 typedef struct ColumnarCacheStatistics
 {
+	uint64 lookups;
 	uint64 hits;
+	uint64 sameScanHits;
+	uint64 reusedScanHits;
 	uint64 misses;
 	uint64 evictions;
+	uint64 evictedBytes;
 	uint64 writes;
+	uint64 overwrites;
+	uint64 bytesWritten;
+	uint64 bytesReused;
 	uint64 maximumCacheSize;
 	uint64 endingCacheSize;
 	uint64 entries;
@@ -319,6 +326,7 @@ extern ColumnarReadState * ColumnarBeginRead(Relation relation,
 											 List *qualConditions,
 											 MemoryContext scanContext,
 											 Snapshot snaphot,
+									 uint64 scanGeneration,
 											 bool randomAccess,
 											 ParallelColumnarScan parallaleColumnarScan);
 extern void ColumnarReadFlushPendingWrites(ColumnarReadState *readState);
@@ -483,9 +491,11 @@ extern MemoryContext GetColumnarReadStateCache(void);
 
 /* engine_cache.c */
 extern void ColumnarMarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId);
-extern void ColumnarAddCacheEntry(uint64, uint64, uint64, uint32, void *);
-extern void *ColumnarRetrieveCache(uint64, uint64, uint64, uint32);
+extern uint64 ColumnarCacheRegisterScan(void);
+extern void ColumnarAddCacheEntry(uint64, uint64, uint64, uint32, void *, uint64);
+extern void *ColumnarRetrieveCache(uint64, uint64, uint64, uint32, uint64);
 extern void ColumnarResetCache(void);
+extern void ColumnarInvalidateRelationCache(uint64 relId);
 extern ColumnarCacheStatistics *ColumnarGetCacheStatistics(void);
 extern MemoryContext ColumnarCacheMemoryContext(void);
 

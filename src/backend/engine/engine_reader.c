@@ -69,6 +69,7 @@ typedef struct StripeReadState
 	int columnCount;
 	int64 rowCount;
 	int64 currentRow;
+	uint64 scanGeneration;
 	TupleDesc tupleDescriptor;
 	Relation relation;
 	int chunkGroupIndex;
@@ -114,6 +115,7 @@ struct ColumnarReadState
 
 	Snapshot snapshot;
 	bool snapshotRegisteredByUs;
+	uint64 scanGeneration;
 
 	/* Parallel exeuction */
 	ParallelColumnarScan parallelColumnarScan;
@@ -165,6 +167,7 @@ static StripeReadState * BeginStripeRead(StripeMetadata *stripeMetadata, Relatio
 										 List *whereClauseList, List *whereClauseVars,
 										 MemoryContext stripeReadContext,
 										 Snapshot snapshot,
+									 uint64 scanGeneration,
 										 int analyze_cg_stride,
 										 int targetChunkGroupIndex);
 static void AdvanceStripeRead(ColumnarReadState *readState);
@@ -346,6 +349,7 @@ ColumnarReadState *
 ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 				  List *projectedColumnList, List *whereClauseList,
 				  MemoryContext scanContext, Snapshot snapshot,
+				  uint64 scanGeneration,
 				  bool randomAccess,
 				  ParallelColumnarScan parallelColumnarScan)
 {
@@ -369,6 +373,7 @@ ColumnarBeginRead(Relation relation, TupleDesc tupleDescriptor,
 	readState->stripeReadContext = stripeReadContext;
 	readState->stripeReadState = NULL;
 	readState->scanContext = scanContext;
+	readState->scanGeneration = scanGeneration;
 
 	/*
 	 * Note that ColumnarReadFlushPendingWrites might update those two by
@@ -548,6 +553,7 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *columnValues, bool *col
 														 readState->whereClauseVars,
 														 readState->stripeReadContext,
 														 readState->snapshot,
+														 readState->scanGeneration,
 														 readState->analyze_cg_stride,
 														 -1 /* load all chunks */);
 		}
@@ -665,6 +671,7 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 													 whereClauseVars,
 													 stripeReadContext,
 													 snapshot,
+													 readState->scanGeneration,
 													 0 /* no ANALYZE sampling */,
 													 targetChunkGroupIndex);
 
@@ -736,6 +743,7 @@ ColumnarSetStripeReadState(ColumnarReadState *readState,
 													 whereClauseVars,
 													 stripeReadContext,
 													 snapshot,
+													 readState->scanGeneration,
 													 0 /* no ANALYZE sampling */,
 													 -1 /* load all chunks */);
 
@@ -1135,6 +1143,7 @@ static StripeReadState *
 BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDesc,
 				List *projectedColumnList, List *whereClauseList, List *whereClauseVars,
 				MemoryContext stripeReadContext, Snapshot snapshot,
+				uint64 scanGeneration,
 				int analyze_cg_stride, int targetChunkGroupIndex)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(stripeReadContext);
@@ -1144,6 +1153,7 @@ BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDes
 	stripeReadState->relation = rel;
 	stripeReadState->tupleDescriptor = tupleDesc;
 	stripeReadState->columnCount = tupleDesc->natts;
+	stripeReadState->scanGeneration = scanGeneration;
 	stripeReadState->chunkGroupReadState = NULL;
 	stripeReadState->projectedColumnList = projectedColumnList;
 	stripeReadState->stripeReadContext = stripeReadContext;
@@ -2436,7 +2446,9 @@ DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
 			
 			if (shouldCache)
 			{
-				valueBuffer = ColumnarRetrieveCache(state->relation->rd_id, stripeId, absChunkIndex, columnIndex);
+				valueBuffer = ColumnarRetrieveCache(state->relation->rd_id, stripeId,
+											 absChunkIndex, columnIndex,
+											 state->scanGeneration);
 			}
 
 			if (valueBuffer == NULL)
@@ -2453,7 +2465,10 @@ DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
 
 				if (shouldCache)
 				{
-					ColumnarAddCacheEntry(state->relation->rd_id, stripeId, absChunkIndex, columnIndex, valueBuffer);
+					ColumnarAddCacheEntry(state->relation->rd_id, stripeId,
+										  absChunkIndex, columnIndex,
+										  valueBuffer,
+										  state->scanGeneration);
 					MemoryContextSwitchTo(oldMemoryContext);
 				}
 			}
@@ -2563,6 +2578,7 @@ ColumnarReadNextVector(ColumnarReadState *readState,  Datum *columnValues,
 														 readState->whereClauseVars,
 														 readState->stripeReadContext,
 														 readState->snapshot,
+														 readState->scanGeneration,
 														 readState->analyze_cg_stride,
 														 -1 /* load all chunks */);
 		}

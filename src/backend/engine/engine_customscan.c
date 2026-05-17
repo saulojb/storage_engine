@@ -3309,9 +3309,27 @@ ColumnarScan_ExplainCustomScan(CustomScanState *node, List *ancestors,
 		ColumnarCacheStatistics *statistics = ColumnarGetCacheStatistics();
 
 		ExplainPropertyUInteger(
+			"Cache Lookups",
+			NULL,
+			statistics->lookups,
+			es);
+
+		ExplainPropertyUInteger(
 			"Cache Hits",
 			NULL,
 			statistics->hits,
+			es);
+
+		ExplainPropertyUInteger(
+			"Cache Same-Scan Hits",
+			NULL,
+			statistics->sameScanHits,
+			es);
+
+		ExplainPropertyUInteger(
+			"Cache Reused Hits",
+			NULL,
+			statistics->reusedScanHits,
 			es);
 
 		ExplainPropertyUInteger(
@@ -3327,9 +3345,33 @@ ColumnarScan_ExplainCustomScan(CustomScanState *node, List *ancestors,
 			es);
 
 		ExplainPropertyUInteger(
+			"Cache Evicted Bytes",
+			NULL,
+			statistics->evictedBytes,
+			es);
+
+		ExplainPropertyUInteger(
 			"Cache Writes",
 			NULL,
 			statistics->writes,
+			es);
+
+		ExplainPropertyUInteger(
+			"Cache Overwrites",
+			NULL,
+			statistics->overwrites,
+			es);
+
+		ExplainPropertyUInteger(
+			"Cache Bytes Written",
+			NULL,
+			statistics->bytesWritten,
+			es);
+
+		ExplainPropertyUInteger(
+			"Cache Bytes Reused",
+			NULL,
+			statistics->bytesReused,
 			es);
 
 		ExplainPropertyUInteger(
