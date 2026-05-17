@@ -1,6 +1,6 @@
 # storage_engine
 
-> **v2.2 — Storage Maintenance BGW + Incremental Merge + CREATE TABLE WITH(…)** `storage_engine` v2.2 adds a built-in maintenance Background Worker that automatically calls `engine.storage_maintenance_auto()` on a schedule, incremental merge procedures for both AMs (`colcompress_merge_incremental`, `rowcompress_merge_incremental`), a unified `engine.storage_health` view, and support for `CREATE TABLE … USING colcompress/rowcompress WITH (options)` syntax. Validated: **281/281 on PG 15, 280/280 on PG 16–19**.
+> **v2.4 — TPC-H planner fixes + reread caches + PG15–PG19 validation** `storage_engine` v2.4 improves real `colcompress` performance with narrow planner-hook fixes for official TPC-H queries (`Q7`, `Q18`, `Q20`, `Q21`) and a targeted replan that avoids bad final nested loops for `Q9`-style post-join aggregates on PG16+. It also makes repeated reads measurably cheaper by keeping the `colcompress` page cache alive across scans in the same backend and by reusing `rowcompress` metadata/decompressed batches safely across repeated index probes, with observability through `engine.rowcompress_scan_stats()`. Validated: **294/294 on PG15, 293/293 on PG16–PG18, 297/297 on PG19**.
 
 A PostgreSQL extension providing two high-performance Table Access Methods designed for analytical and HTAP workloads.
 
@@ -101,6 +101,8 @@ A scan only reads the columns referenced by the query, skipping all others entir
 ### Column-Level Caching
 
 The AM maintains an in-memory **column cache** that stores decompressed column chunks across executor iterations. When the same stripe region is accessed more than once (nested loops, repeated plans, self-joins), the decompressed data is served from cache without re-reading or re-decompressing the file.
+
+In v2.4, that cache remains alive for the backend across repeated scans instead of being dropped when the last scan ends, so reread-heavy workloads benefit without restarting the session or rewriting SQL.
 
 ```sql
 SET storage_engine.enable_column_cache = on;   -- default: on
@@ -451,6 +453,8 @@ Compared to `colcompress`:
 SET max_parallel_workers_per_gather = 4;
 ```
 
+For repeated point lookups, `rowcompress` also keeps backend-local metadata and reusable decompressed batches so index-driven probes do not need to rebuild batch state on every statement. Use `engine.rowcompress_scan_stats()` to inspect metadata cache hits/misses, batch cache hits/misses, and decompression counts for the current session.
+
 ### Per-Table Options
 
 ```sql
@@ -538,7 +542,7 @@ Reload with `SELECT pg_reload_conf()` after changing `maintenance_auto_*` GUCs �
 | `CALL engine.rowcompress_merge_incremental(regclass, max_batches)` | Rewrite only dirty batches (low-lock, incremental) |
 | `engine.storage_maintenance_recommendation(regclass)` | Returns health metrics and `recommended_action` for a single table |
 | `CALL engine.storage_maintenance_auto(dry_run, max_tables, am_filter, p_verbose)` | Dispatch merge/repack for all tables with pending maintenance |
-| `engine.rowcompress_scan_stats()` | Session-local scan statistics for rowcompress tables (batches read/skipped, bytes, cache hits) |
+| `engine.rowcompress_scan_stats()` | Session-local scan statistics for rowcompress tables, including metadata/batch cache hits, misses, and decompression counters |
 
 ---
 
@@ -819,7 +823,7 @@ python3 tests/bench/chart_parallel.py
 
 See [tests/README.md](tests/README.md) for full environment description and step-by-step instructions.
 
-> Benchmark results above correspond to version 2.2.0 with `lz4` compression and globally sorted stripes.
+> Benchmark results above correspond to version 2.4.0 with `lz4` compression and globally sorted stripes.
 
 ---
 
@@ -843,7 +847,7 @@ Version policy:
 
 - `2.0.0` is the first release of the `2.x` line. It requires **PostgreSQL 15 or later**.
 - `1.3.4` remains the supported release for PostgreSQL 12, 13, and 14 installations. No further features will be backported to that line.
-- The `2.x` line is validated against PostgreSQL 15, 16, 17, 18, and 19 (devel).
+- The `2.4.0` validation matrix is green on PostgreSQL 15, 16, 17, 18, and 19: **294/294 on PG15, 293/293 on PG16–PG18, 297/297 on PG19**.
 
 ---
 

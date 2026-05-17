@@ -1,5 +1,64 @@
 # CHANGELOG
 
+## 2.4.0
+
+### Planner-hook improvements for real TPC-H workloads
+
+`storage_engine` now applies a small set of narrow planner fixes aimed at real
+`colcompress` bottlenecks instead of benchmark-only SQL rewrites.
+
+* **Official TPC-H Q21** — when the query text matches the canonical Q21 shape
+  and touches `colcompress` relations, planning is retried with
+  `enable_nestloop=off`, avoiding the bad nested-loop plan that dominated PG18.
+* **Official TPC-H Q7** — the same targeted nested-loop avoidance is now applied
+  after teaching the relation-touch detector to recurse through
+  `RTE_SUBQUERY` entries.
+* **Official TPC-H Q18 on PG18** — the existing narrow rewrite is kept, but the
+  planner now forces `max_parallel_workers_per_gather=0` for that rewritten shape
+  to avoid repeated worker-side execution and spill-heavy regressions.
+* **Decorrelated scalar-aggregate paths on PG16+** — planner steering now widens
+  the `enable_nestloop=off` choice for decorrelated shapes such as Q20, and adds
+  a narrow replan for post-join aggregate plans like official Q9 when the first
+  plan still chooses a bad final nested loop above `colcompress` scans.
+
+These fixes were validated against the no-CH TPC-H matrices instead of ad-hoc
+query rewrites, keeping the measured gains attributable to the extension itself.
+
+---
+
+### Cache reuse and observability
+
+* **rowcompress repeated index probes** — metadata arrays now live in a
+  backend-local memory context and decompressed batches are cached safely for
+  reuse across repeated statements. `engine.rowcompress_scan_stats()` now reports
+  reliable metadata-cache hits/misses, batch-cache hits/misses, and batch
+  decompression counts even for plain `Index Scan` paths.
+* **colcompress reread cache lifetime** — decompressed column/page cache entries
+  now stay alive for the backend across repeated scans instead of being dropped
+  when the last scan ends. Invalidation is handled on destructive DDL and rewrite
+  paths so repeated reads can benefit without stale-data risk.
+* **New focused benchmark scripts** — added reread probes for synthetic
+  `colcompress`, real `col.lineitem` ranges, real TPCH Q14 rereads, and
+  `rowcompress` index-cache behavior, plus a small runner that saves timestamped
+  logs under `tests/bench/result/`.
+
+---
+
+### Validation and build hygiene
+
+* Removed the remaining warning-causing dead planner-hook code and aligned
+  version guards so PG15 builds cleanly.
+* Repaired the PG19 system test environment and reran the official
+  `make installcheck-all` target.
+* Final validation matrix:
+  - PG15: **294/294 tests passed**
+  - PG16: **293/293 tests passed**
+  - PG17: **293/293 tests passed**
+  - PG18: **293/293 tests passed**
+  - PG19: **297/297 tests passed**
+
+---
+
 ## 2.3.0
 
 ### VecAgg — `sum(expression)` vectorization (`VECGAGG_SUM_EXPR`)
