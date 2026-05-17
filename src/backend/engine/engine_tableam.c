@@ -2333,16 +2333,7 @@ TruncateColumnar(Relation rel, int elevel)
 										ColumnarFirstLogicalOffset);
 #endif
 		if (unlikely(rel->rd_smgr == NULL))
-		{
-#if PG_VERSION_NUM >= PG_VERSION_17
-			rel->rd_smgr = smgropen(rel->rd_locator, rel->rd_backend);
-			smgrpin(rel->rd_smgr);
-#elif PG_VERSION_NUM >= PG_VERSION_16
-			smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-			smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-		}
+			EnsureRelationSmgrOpen(rel);
 
 		BlockNumber old_rel_pages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
 

@@ -33,6 +33,7 @@
 #define VMSEXPR_COUNT_STAR          1   /* count(*) */
 #define VMSEXPR_SUM_EXPR            2   /* sum(arithmetic expression) */
 #define VMSEXPR_SUM_COL             3   /* sum(plain_var) — direct column read */
+#define VMSEXPR_AVG_COL             4   /* avg(plain_var) — direct column read */
 
 /* Maximum aggregate targets in multi-target mode */
 #define VECGAGG_MULTI_MAX_TARGETS   8
@@ -44,8 +45,9 @@
  */
 typedef struct VecMultiExprTarget
 {
-	int			kind;				/* VMSEXPR_COUNT_STAR / VMSEXPR_SUM_EXPR / VMSEXPR_SUM_COL */
+	int			kind;				/* VMSEXPR_COUNT_STAR / VMSEXPR_SUM_EXPR / VMSEXPR_SUM_COL / VMSEXPR_AVG_COL */
 	int			col_type;			/* VECGAGG_TYPE_* for SUM targets */
+	Oid			result_typeoid;	/* SQL result type OID for this target */
 	int			aggsplit;			/* AggSplit for this target */
 
 	/* Inline expression tree (SUM_EXPR only) */

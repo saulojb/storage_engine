@@ -1,6 +1,12 @@
 SET client_min_messages = notice;
 BEGIN;
 
+\if :{?with_ch}
+\else
+\set with_ch 1
+\endif
+
+\if :with_ch
 \set ch_user default
 \getenv ch_user CLICKHOUSE_USER
 \set ch_pass
@@ -15,6 +21,7 @@ CREATE USER MAPPING FOR CURRENT_USER SERVER ch_tpch_svr OPTIONS (user :'ch_user'
 
 CREATE SCHEMA ch;
 IMPORT FOREIGN SCHEMA tpch FROM SERVER ch_tpch_svr INTO ch;
+\endif
 
 CREATE SCHEMA pg;
 SET search_path = pg;

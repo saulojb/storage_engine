@@ -829,10 +829,10 @@ class TestRunner:
             "SET max_parallel_workers_per_gather=0; "
             "EXPLAIN SELECT sum(i4), round(avg(num), 6), sum(m) FROM _texpl_mixed"
         )
-        self.check("mixed numeric+money: EXPLAIN falls back to regular Agg",
-                   "StorageEngineVectorAgg" not in plan_mixed, plan_mixed[:400])
+        self.check("mixed numeric+money: EXPLAIN shows StorageEngineVectorAgg",
+                   "StorageEngineVectorAgg" in plan_mixed, plan_mixed[:400])
 
-        self.agg_ok("mixed numeric+money: VEC ON falls back without changing result",
+        self.agg_ok("mixed numeric+money: VEC ON matches regular result",
                     "SELECT sum(i4), round(avg(num), 6), sum(m) FROM _texpl_mixed")
 
         out, rc, err = self._run(

@@ -5726,6 +5726,11 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 
 					READ_INT(tgt->kind);
 					READ_INT(tgt->col_type);
+					{
+						int tmp;
+						READ_INT(tmp);
+						tgt->result_typeoid = (Oid) tmp;
+					}
 					READ_INT(tgt->sum_col_slot_idx);
 					READ_INT(tgt->expr_num_nodes);
 					READ_INT(tgt->expr_root_idx);
@@ -6123,6 +6128,60 @@ ExecVecMultiSumExpr(VectorAggState *vas)
 					continue;
 				}
 
+				if (tgt->kind == VMSEXPR_AVG_COL)
+				{
+					/* Direct VectorColumn read — accumulate sum + non-null count */
+					VectorColumn *col = (VectorColumn *)
+						outerslot->tts_values[tgt->sum_col_slot_idx];
+					if (col == NULL || col->isnull[row_i])
+						continue;
+					int8 *rawptr = (int8 *) col->value +
+								   (int) col->columnTypeLen * row_i;
+					Datum val = fetch_att(rawptr,
+								  col->columnIsVal,
+								  col->columnTypeLen);
+
+					if (tgt->col_type == VECGAGG_TYPE_NUMERIC)
+					{
+						MemoryContext oldctx =
+							MemoryContextSwitchTo(vas->aggContext);
+						Datum val_copy = datumCopy(val, false, -1);
+						if (tgt->sum_numeric == NULL)
+							tgt->sum_numeric = DatumGetNumeric(val_copy);
+						else
+							tgt->sum_numeric = DatumGetNumeric(
+								DirectFunctionCall2(numeric_add,
+									NumericGetDatum(tgt->sum_numeric),
+									val_copy));
+						MemoryContextSwitchTo(oldctx);
+					}
+					else if (tgt->col_type == VECGAGG_TYPE_FLOAT8 ||
+							 tgt->col_type == VECGAGG_TYPE_FLOAT4)
+					{
+						float8 fval;
+						if (col->columnTypeLen == 4)
+							fval = (float8) DatumGetFloat4(val);
+						else
+							fval = DatumGetFloat8(val);
+						tgt->sum_float8 += fval;
+					}
+					else
+					{
+						int64 ival;
+						switch (col->columnTypeLen)
+						{
+							case 2:  ival = (int64) DatumGetInt16(val); break;
+							case 4:  ival = (int64) DatumGetInt32(val); break;
+							default: ival = DatumGetInt64(val); break;
+						}
+						tgt->sum_int64 += ival;
+					}
+
+					tgt->count++;
+					tgt->has_value = true;
+					continue;
+				}
+
 				/* VMSEXPR_SUM_EXPR: evaluate expression tree */
 				bool  isnull;
 				Datum val;
@@ -6203,6 +6262,38 @@ ExecVecMultiSumExpr(VectorAggState *vas)
 			slot_vals [ti] = Int64GetDatum(tgt->count);
 			slot_nulls[ti] = false;
 		}
+		else if (tgt->kind == VMSEXPR_AVG_COL)
+		{
+			if (!tgt->has_value || tgt->count == 0)
+			{
+				slot_vals[ti] = (Datum) 0;
+				slot_nulls[ti] = true;
+			}
+			else if (tgt->result_typeoid == NUMERICOID)
+			{
+				Datum count_numeric =
+					DirectFunctionCall1(int8_numeric,
+						Int64GetDatum(tgt->count));
+				Datum sum_numeric;
+
+				if (tgt->col_type == VECGAGG_TYPE_NUMERIC)
+					sum_numeric = NumericGetDatum(tgt->sum_numeric);
+				else
+					sum_numeric = DirectFunctionCall1(int8_numeric,
+						Int64GetDatum(tgt->sum_int64));
+
+				slot_vals[ti] = DirectFunctionCall2(numeric_div,
+					sum_numeric,
+					count_numeric);
+				slot_nulls[ti] = false;
+			}
+			else
+			{
+				slot_vals[ti] = Float8GetDatum(
+					tgt->sum_float8 / (float8) tgt->count);
+				slot_nulls[ti] = false;
+			}
+		}
 		else if (!tgt->has_value)
 		{
 			slot_vals [ti] = (Datum) 0;
@@ -6228,7 +6319,12 @@ ExecVecMultiSumExpr(VectorAggState *vas)
 		else if (tgt->col_type == VECGAGG_TYPE_INT4 ||
 				 tgt->col_type == VECGAGG_TYPE_INT8)
 		{
-			slot_vals [ti] = Int64GetDatum(tgt->sum_int64);
+			if (tgt->result_typeoid == NUMERICOID)
+				slot_vals[ti] = DirectFunctionCall1(int8_numeric,
+					Int64GetDatum(tgt->sum_int64));
+			else
+				/* money and bigint sums share the int64 Datum representation */
+				slot_vals[ti] = Int64GetDatum(tgt->sum_int64);
 			slot_nulls[ti] = false;
 		}
 		else

@@ -12,62 +12,50 @@
 
 #include "postgres.h"
 
-#include "miscadmin.h"
+#include "access/stratnum.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_operator.h"
-#include "catalog/pg_proc.h"
 #include "catalog/pg_statistic.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
+#include "lib/stringinfo.h"
+#include "miscadmin.h"
+#include "nodes/extensible.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pg_list.h"
+#include "nodes/plannodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
-#include "optimizer/pathnode.h"
-#include "optimizer/paths.h"
-#include "optimizer/plancat.h"
 #include "optimizer/planner.h"
-#include "optimizer/restrictinfo.h"
-#include "nodes/makefuncs.h"
-#include "tcop/tcopprot.h"
-#include "tcop/utility.h"
+#include "optimizer/plancat.h"
 #include "parser/analyze.h"
 #include "parser/parser.h"
-#include "parser/parse_oper.h"
-#include "parser/parse_func.h"
 #include "parser/parsetree.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/numeric.h"
 #include "utils/ruleutils.h"
-#include "utils/selfuncs.h"
 #include "utils/syscache.h"
-#include "utils/spccache.h"
 
 #include "engine/engine.h"
 #include "engine/engine_customscan.h"
 #include "engine/engine_indexscan.h"
+#include "engine/utils/listutils.h"
 #include "engine/vectorization/engine_vector_execution.h"
 #include "engine/vectorization/nodes/engine_aggregator_node.h"
 #include "engine/vectorization/nodes/engine_groupagg_node.h"
 
-#include "engine/utils/listutils.h"
-
-static planner_hook_type PreviousPlannerHook = NULL;
-
-typedef struct PlanTreeMutatorContext PlanTreeMutatorContext;
-
-static PlannedStmt * ColumnarPlannerHook(Query *parse,
-#if PG_VERSION_NUM >= PG_VERSION_13
-                                         const char *query_string,
-#endif
-									 int cursorOptions, ParamListInfo boundParams
-#if PG_VERSION_NUM >= PG_VERSION_19
-									 , ExplainState *es
-#endif
-									 );
 static bool IsCreateTableAs(const char *query);
 
 #if PG_VERSION_NUM >= PG_VERSION_14
+static planner_hook_type PreviousPlannerHook = NULL;
 static Oid engine_tableam_oid = InvalidOid;
 static bool QueryStringHasPlainExplain(const char *query);
 static bool QueryHasVectorizableAggregate(Query *parse);
@@ -76,6 +64,7 @@ static Oid GetEngineTableAmOid(void);
 static Oid GetRelationTableAmOid(Oid relid);
 static bool PlanHasColumnarCustomScan(Plan *plan);
 static bool PlanHasJoinNode(Plan *plan);
+static bool PlanHasNestedLoopNode(Plan *plan);
 static Bitmapset *PlanOutputColumnSourceRels(Plan *plan, AttrNumber resno);
 static Bitmapset *PlanExprSourceRels(Node *node, Plan *plan);
 static Bitmapset *ExprSourceRelsForPlan(Node *node, Plan *input_plan);
@@ -83,27 +72,39 @@ static List *AppendQualOnlyAggrefsToTargetList(List *targetlist, Node *qual);
 static Node *RewriteQualAggrefsToTargetVars(Node *qual, List *targetlist);
 static bool ShouldRelaxVecGroupAggGroupLimit(Agg *aggNode, Oid first_key_typeoid);
 static bool IsQ13StyleOuterJoinCountAgg(Agg *agg);
+static bool PostJoinColumnarAggHasMultiRelInputs(Agg *agg);
 static const char *DescribePostJoinColumnarAgg(Agg *agg);
 static bool PlanIsPostJoinColumnarAgg(Agg *agg);
 static bool PlanHasPathologicalSortedColumnarAgg(Plan *plan);
 static bool PlanHasHashColumnarAgg(Plan *plan);
-#if PG_VERSION_NUM >= PG_VERSION_19
+static bool PlanHasPathologicalNestedLoopPostJoinColumnarAgg(Plan *plan);
+#if PG_VERSION_NUM >= PG_VERSION_16
 static Query *TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
 									 const char **planner_query_string);
 #endif
-#if PG_VERSION_NUM >= PG_VERSION_19
+#if PG_VERSION_NUM >= PG_VERSION_16
+typedef struct ScalarAggRewriteTracking
+{
+	bool didRewrite;
+	bool didQ18Rewrite;
+} ScalarAggRewriteTracking;
+
 static bool AppendSortClauseSql(StringInfo buf, Query *query, List *dpcontext);
 static bool AppendLimitClauseSql(StringInfo buf, Query *query, List *dpcontext);
 static Node *DecorrelateNestedScalarAggSubLinksMutator(Node *node, void *context);
 static Query *TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(Query *parse,
-										 const char **planner_query_string);
+										 const char **planner_query_string,
+										 ScalarAggRewriteTracking *tracking);
+#if PG_VERSION_NUM >= PG_VERSION_16
 static Query *TryRewriteQ8MarketShareAggForPg19(Query *parse,
 						const char **planner_query_string);
 static Query *TryRewriteQ18OrderQuantityAggForPg19(Query *parse,
 								 const char **planner_query_string);
+#endif
 static Query *TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
 										 const char **planner_query_string);
 #endif
+static bool AppendSortDirectionSql(StringInfo buf, SortGroupClause *sortClause);
 static void MutatePlannedStmt(PlannedStmt *stmt);
 static bool TryVectorizeSerialPlan(PlannedStmt *stmt_serial,
 								   MemoryContext saved_context,
@@ -373,21 +374,6 @@ FindFirstAggref_walker(Node *node, void *context)
 	}
 	return expression_tree_walker(node, FindFirstAggref_walker, context);
 }
-
-#if PG_VERSION_NUM < PG_VERSION_16
-static bool
-PlanHasNumericAggrefs(Plan *plan)
-{
-	MixedAggTypeContext ctx;
-
-	ctx.foundNumericAgg = false;
-	ctx.foundMoneyAgg = false;
-	(void) MixedAggTypeWalker((Node *) plan->targetlist, &ctx);
-	(void) MixedAggTypeWalker((Node *) plan->qual, &ctx);
-
-	return ctx.foundNumericAgg;
-}
-#endif
 
 /*
  * Estimate GROUP BY cardinality for a single table key.
@@ -1590,7 +1576,8 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
  * failure (unsupported expression type or pool overflow).
  *
  * Supported leaf types: Aggref (classifiable), Const (numeric types only).
- * Supported interior nodes: OpExpr, FuncExpr (unary cast), RelabelType.
+ * Supported interior nodes: OpExpr, FuncExpr (unary cast), RelabelType,
+ * CoerceViaIO, CoerceToDomain.
  * Depth is limited to VPAE_MAX_NODES to guard against stack overflow.
  */
 static int
@@ -1601,6 +1588,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 					   Aggref		      **mt_aggrefs,
 					   int				   *mt_kind,
 					   int				   *mt_col_type,
+					   Oid				   *mt_result_typeoid,
 					   int				   *mt_sum_col_slot,
 					   VecExprNode		  (*mt_nodes)[VECGAGG_EXPR_MAX_NODES],
 					   int				   *mt_expr_num,
@@ -1612,9 +1600,18 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 	if (!expr || depth > VPAE_MAX_NODES || out->num_nodes >= VPAE_MAX_NODES)
 		return -1;
 
-	/* Peel lossless relabels */
-	while (IsA(expr, RelabelType))
-		expr = (Node *) ((RelabelType *) expr)->arg;
+	/* Peel transparent wrappers around aggregate leaves/post-agg expressions. */
+	for (;;)
+	{
+		if (IsA(expr, RelabelType))
+			expr = (Node *) ((RelabelType *) expr)->arg;
+		else if (IsA(expr, CoerceViaIO))
+			expr = (Node *) ((CoerceViaIO *) expr)->arg;
+		else if (IsA(expr, CoerceToDomain))
+			expr = (Node *) ((CoerceToDomain *) expr)->arg;
+		else
+			break;
+	}
 
 	/* ---- Aggref leaf ---- */
 	if (IsA(expr, Aggref))
@@ -1652,6 +1649,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 			{
 				mt_kind[slot_idx]     = VMSEXPR_COUNT_STAR;
 				mt_col_type[slot_idx] = VECGAGG_TYPE_INT8;
+				mt_result_typeoid[slot_idx] = INT8OID;
 			}
 			else if (ki == VECGAGG_SUM_EXPR && troot >= 0 && tnum >= 2)
 			{
@@ -1660,6 +1658,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 					return -1;
 				mt_kind[slot_idx]     = VMSEXPR_SUM_EXPR;
 				mt_col_type[slot_idx] = cvt;
+				mt_result_typeoid[slot_idx] = agg->aggtype;
 				memcpy(mt_nodes[slot_idx], tnodes, tnum * sizeof(VecExprNode));
 				mt_expr_num[slot_idx]  = tnum;
 				mt_expr_root[slot_idx] = troot;
@@ -1703,6 +1702,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 					vn->const_isnull = true;
 					mt_kind[slot_idx]      = VMSEXPR_SUM_EXPR;
 					mt_col_type[slot_idx]  = VECGAGG_TYPE_NUMERIC;
+					mt_result_typeoid[slot_idx] = agg->aggtype;
 					mt_expr_num[slot_idx]  = 1;
 					mt_expr_root[slot_idx] = 0;
 				}
@@ -1710,8 +1710,30 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 				{
 					mt_kind[slot_idx]         = VMSEXPR_SUM_COL;
 					mt_col_type[slot_idx]     = cvt;
+					mt_result_typeoid[slot_idx] = agg->aggtype;
 					mt_sum_col_slot[slot_idx] = col_slot;
 				}
+			}
+			else if (ki == VECGAGG_AVG)
+			{
+				/*
+				 * Multi-target post-aggregate mode only needs AVG in SIMPLE mode.
+				 * Non-trivial INITIAL_SERIAL outputs are already rejected later.
+				 */
+				if (aggsplit != AGGSPLIT_SIMPLE || dummy == 0)
+					return -1;
+
+				int cvt = TypeOidToVecGaggType(ct);
+				if (cvt < 0)
+					return -1;
+				int col_slot = VarAttnoToSlotIdx(child_plan, dummy);
+				if (col_slot < 0)
+					return -1;
+
+				mt_kind[slot_idx]            = VMSEXPR_AVG_COL;
+				mt_col_type[slot_idx]        = cvt;
+				mt_result_typeoid[slot_idx]  = agg->aggtype;
+				mt_sum_col_slot[slot_idx]    = col_slot;
 			}
 			else
 				return -1;	/* unsupported Aggref kind */
@@ -1726,7 +1748,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 		out->nodes[idx].left         = -1;
 		out->nodes[idx].right        = -1;
 		out->nodes[idx].opfuncid     = InvalidOid;
-		out->nodes[idx].rettype      = ct;
+		out->nodes[idx].rettype      = mt_result_typeoid[slot_idx];
 		out->nodes[idx].const_isnull = true;
 		return idx;
 	}
@@ -1759,7 +1781,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 
 		int left_idx = BuildPostAggOutputNode(
 			(Node *) linitial(op->args), child_plan, aggsplit,
-			p_mt_num, mt_aggrefs, mt_kind, mt_col_type,
+			p_mt_num, mt_aggrefs, mt_kind, mt_col_type, mt_result_typeoid,
 			mt_sum_col_slot, mt_nodes, mt_expr_num, mt_expr_root,
 			out, depth + 1);
 		if (left_idx < 0)
@@ -1770,7 +1792,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 		{
 			right_idx = BuildPostAggOutputNode(
 				(Node *) lsecond(op->args), child_plan, aggsplit,
-				p_mt_num, mt_aggrefs, mt_kind, mt_col_type,
+				p_mt_num, mt_aggrefs, mt_kind, mt_col_type, mt_result_typeoid,
 				mt_sum_col_slot, mt_nodes, mt_expr_num, mt_expr_root,
 				out, depth + 1);
 			if (right_idx < 0)
@@ -1790,27 +1812,41 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 		return idx;
 	}
 
-	/* ---- Unary FuncExpr (type cast) ---- */
+	/* ---- Unary / binary FuncExpr ---- */
 	if (IsA(expr, FuncExpr))
 	{
 		FuncExpr *f = (FuncExpr *) expr;
-		if (list_length(f->args) != 1)
+		int nargs = list_length(f->args);
+
+		if ((nargs != 1 && nargs != 2) || !OidIsValid(f->funcid))
 			return -1;
 
 		int child_idx = BuildPostAggOutputNode(
 			(Node *) linitial(f->args), child_plan, aggsplit,
-			p_mt_num, mt_aggrefs, mt_kind, mt_col_type,
+			p_mt_num, mt_aggrefs, mt_kind, mt_col_type, mt_result_typeoid,
 			mt_sum_col_slot, mt_nodes, mt_expr_num, mt_expr_root,
 			out, depth + 1);
 		if (child_idx < 0)
 			return -1;
 
+		int right_idx = -1;
+		if (nargs == 2)
+		{
+			right_idx = BuildPostAggOutputNode(
+				(Node *) lsecond(f->args), child_plan, aggsplit,
+				p_mt_num, mt_aggrefs, mt_kind, mt_col_type, mt_result_typeoid,
+				mt_sum_col_slot, mt_nodes, mt_expr_num, mt_expr_root,
+				out, depth + 1);
+			if (right_idx < 0)
+				return -1;
+		}
+
 		if (out->num_nodes >= VPAE_MAX_NODES)
 			return -1;
 		int idx = out->num_nodes++;
-		out->nodes[idx].kind     = VPAE_OP;   /* unary: right = -1 */
+		out->nodes[idx].kind     = VPAE_OP;
 		out->nodes[idx].left     = (int8) child_idx;
-		out->nodes[idx].right    = -1;
+		out->nodes[idx].right    = (int8) right_idx;
 		out->nodes[idx].slot_idx = -1;
 		out->nodes[idx].opfuncid = f->funcid;
 		out->nodes[idx].rettype  = f->funcresulttype;
@@ -1911,9 +1947,6 @@ PlanTreeMutator(Plan *node, void *context)
 					 * regular executor for that combination until the transition
 					 * path is fixed.
 					 */
-					if (PlanHasMixedNumericMoneyAggrefs((Plan *) aggNode))
-						break;
-
 					/*
 					 * VECGAGG_SUM_EXPR: SUM of an arithmetic expression.
 					 * Bypass ExecAgg entirely — ExecVecSumExpr evaluates the
@@ -2093,6 +2126,7 @@ PlanTreeMutator(Plan *node, void *context)
 					int          _mt_nouts   = 0;
 					int          _mt_kind         [VECGAGG_MULTI_MAX_TARGETS];
 					int          _mt_col_type     [VECGAGG_MULTI_MAX_TARGETS];
+					Oid          _mt_result_typeoid[VECGAGG_MULTI_MAX_TARGETS];
 					int          _mt_sum_col_slot [VECGAGG_MULTI_MAX_TARGETS];
 					VecExprNode  _mt_nodes        [VECGAGG_MULTI_MAX_TARGETS]
 												  [VECGAGG_EXPR_MAX_NODES];
@@ -2142,6 +2176,7 @@ PlanTreeMutator(Plan *node, void *context)
 								(int) aggNode->aggsplit,
 								&_mt_nslots,
 								_mt_aggrefs, _mt_kind, _mt_col_type,
+								_mt_result_typeoid,
 								_mt_sum_col_slot,
 								_mt_nodes, _mt_expr_num, _mt_expr_root,
 								pout, 0);
@@ -2212,6 +2247,7 @@ PlanTreeMutator(Plan *node, void *context)
 						{
 							_MAPP_INT(_mt_kind[_si]);
 							_MAPP_INT(_mt_col_type[_si]);
+							_MAPP_INT((int) _mt_result_typeoid[_si]);
 							_MAPP_INT(_mt_sum_col_slot[_si]);	/* -1 if not SUM_COL */
 							_MAPP_INT(_mt_expr_num[_si]);
 							_MAPP_INT(_mt_expr_root[_si]);
@@ -3366,20 +3402,35 @@ ColumnarPlannerHook(Query *parse,
 	Query *parse_for_pass2 = NULL;
 	Query *parse_for_sortavoid = NULL;
 #endif
+#if PG_VERSION_NUM >= PG_VERSION_16
+	Query *parse_for_nestloop_avoid = NULL;
+	bool disable_nestloop_for_decorrelated_scalar_agg = false;
+	bool saved_enable_nestloop = enable_nestloop;
+	#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+	bool disable_indexscan_for_q18_rewrite = false;
+	bool saved_enable_indexscan = enable_indexscan;
+	#endif
+#endif
 #if PG_VERSION_NUM < PG_VERSION_13
 	/* query_string not passed by PG12 planner hook — not available */
 	const char *query_string = NULL;
 	const char *planner_query_string = NULL;
 #endif
 
-#if PG_VERSION_NUM >= PG_VERSION_19
+#if PG_VERSION_NUM >= PG_VERSION_16
 	{
+		ScalarAggRewriteTracking tracking = {0};
 		Query *decorrelated_parse =
 			TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(parse,
-										   &planner_query_string);
+									   &planner_query_string,
+									   &tracking);
 
 		if (decorrelated_parse != NULL)
 		{
+			disable_nestloop_for_decorrelated_scalar_agg = tracking.didRewrite;
+			#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+			disable_indexscan_for_q18_rewrite = tracking.didQ18Rewrite;
+			#endif
 			parse = decorrelated_parse;
 			lowCardinalityGroupBy = QueryHasSingleLowCardinalityColumnarGroupBy(parse);
 		}
@@ -3400,8 +3451,20 @@ ColumnarPlannerHook(Query *parse,
 		parse_for_pass2 = copyObject(parse);
 	if (lowCardinalityGroupBy)
 		parse_for_sortavoid = copyObject(parse);
+	#if PG_VERSION_NUM >= PG_VERSION_16
+	if (parse->hasAggs)
+		parse_for_nestloop_avoid = copyObject(parse);
+	#endif
 	if (lowCardinalityGroupBy)
 		enable_sort = false;
+#endif
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (disable_nestloop_for_decorrelated_scalar_agg)
+		enable_nestloop = false;
+	#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+	if (disable_indexscan_for_q18_rewrite)
+		enable_indexscan = false;
+	#endif
 #endif
 	if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
@@ -3421,6 +3484,12 @@ ColumnarPlannerHook(Query *parse,
 #endif
 #if PG_VERSION_NUM >= PG_VERSION_14
 	enable_sort = saved_enable_sort;
+#endif
+#if PG_VERSION_NUM >= PG_VERSION_16
+	enable_nestloop = saved_enable_nestloop;
+	#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+	enable_indexscan = saved_enable_indexscan;
+	#endif
 #endif
 	/*
 	 * In the case of a CREATE TABLE AS query, we are not able to successfully
@@ -3466,6 +3535,14 @@ ColumnarPlannerHook(Query *parse,
 		PlannedStmt *stmt_hash = NULL;
 
 		enable_sort = false;
+		#if PG_VERSION_NUM >= PG_VERSION_16
+		if (disable_nestloop_for_decorrelated_scalar_agg)
+			enable_nestloop = false;
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		if (disable_indexscan_for_q18_rewrite)
+			enable_indexscan = false;
+		#endif
+		#endif
 		PG_TRY();
 		{
 			if (PreviousPlannerHook)
@@ -3493,12 +3570,66 @@ ColumnarPlannerHook(Query *parse,
 		}
 		PG_END_TRY();
 		enable_sort = saved_enable_sort;
+		#if PG_VERSION_NUM >= PG_VERSION_16
+		enable_nestloop = saved_enable_nestloop;
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		enable_indexscan = saved_enable_indexscan;
+		#endif
+		#endif
 
 		if (stmt_hash != NULL && PlanHasHashColumnarAgg(stmt_hash->planTree))
 			stmt = stmt_hash;
 	}
 
 	enable_sort = saved_enable_sort;
+#endif
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (parse_for_nestloop_avoid != NULL &&
+		PlanHasPathologicalNestedLoopPostJoinColumnarAgg(stmt->planTree))
+	{
+		PlannedStmt *stmt_hashjoin = NULL;
+
+		enable_nestloop = false;
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		if (disable_indexscan_for_q18_rewrite)
+			enable_indexscan = false;
+		#endif
+		PG_TRY();
+		{
+			if (PreviousPlannerHook)
+#if PG_VERSION_NUM >= PG_VERSION_19
+				stmt_hashjoin = PreviousPlannerHook(parse_for_nestloop_avoid, planner_query_string, cursorOptions, boundParams, es);
+#elif PG_VERSION_NUM >= PG_VERSION_13
+				stmt_hashjoin = PreviousPlannerHook(parse_for_nestloop_avoid, planner_query_string, cursorOptions, boundParams);
+#else
+				stmt_hashjoin = PreviousPlannerHook(parse_for_nestloop_avoid, cursorOptions, boundParams);
+#endif
+			else
+#if PG_VERSION_NUM >= PG_VERSION_19
+				stmt_hashjoin = standard_planner(parse_for_nestloop_avoid, planner_query_string, cursorOptions, boundParams, es);
+#elif PG_VERSION_NUM >= PG_VERSION_13
+				stmt_hashjoin = standard_planner(parse_for_nestloop_avoid, planner_query_string, cursorOptions, boundParams);
+#else
+				stmt_hashjoin = standard_planner(parse_for_nestloop_avoid, cursorOptions, boundParams);
+#endif
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(CurrentMemoryContext);
+			FlushErrorState();
+			stmt_hashjoin = NULL;
+		}
+		PG_END_TRY();
+		enable_nestloop = saved_enable_nestloop;
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		enable_indexscan = saved_enable_indexscan;
+		#endif
+
+		if (stmt_hashjoin != NULL &&
+			!PlanHasPathologicalNestedLoopPostJoinColumnarAgg(stmt_hashjoin->planTree))
+			stmt = stmt_hashjoin;
+	}
 #endif
 
 	/*
@@ -3569,6 +3700,14 @@ ColumnarPlannerHook(Query *parse,
 		{
 			if (lowCardinalityGroupBy)
 				enable_sort = false;
+			#if PG_VERSION_NUM >= PG_VERSION_16
+			if (disable_nestloop_for_decorrelated_scalar_agg)
+				enable_nestloop = false;
+			#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+			if (disable_indexscan_for_q18_rewrite)
+				enable_indexscan = false;
+			#endif
+			#endif
 
 			if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
@@ -3589,6 +3728,12 @@ ColumnarPlannerHook(Query *parse,
 
 			enable_sort = saved_enable_sort;
 			max_parallel_workers_per_gather = saved_max_parallel_workers_per_gather;
+			#if PG_VERSION_NUM >= PG_VERSION_16
+			enable_nestloop = saved_enable_nestloop;
+			#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+			enable_indexscan = saved_enable_indexscan;
+			#endif
+			#endif
 
 			savedPlanTree = stmt_serial->planTree;
 			savedSubplan  = stmt_serial->subplans;
@@ -3843,7 +3988,7 @@ GetRelationTableAmOid(Oid relid)
 	return relam;
 }
 
-#if PG_VERSION_NUM >= PG_VERSION_19
+#if PG_VERSION_NUM >= PG_VERSION_16
 typedef struct ScalarAggSubLinkInfo
 {
 	OpExpr *compareQual;
@@ -3912,6 +4057,7 @@ ResolveJoinAliasVar(Query *query, Var *var)
 		aliasExpr = StripRelabels((Node *) list_nth(rte->joinaliasvars,
 												  var->varattno - 1));
 	}
+	#if PG_VERSION_NUM >= PG_VERSION_18
 	else if (rte->rtekind == RTE_GROUP)
 	{
 		if (var->varattno > list_length(rte->groupexprs))
@@ -3919,6 +4065,7 @@ ResolveJoinAliasVar(Query *query, Var *var)
 		aliasExpr = StripRelabels((Node *) list_nth(rte->groupexprs,
 												  var->varattno - 1));
 	}
+	#endif
 	else
 		return var;
 
@@ -4254,6 +4401,36 @@ AppendTargetListSql(StringInfo buf, List *targetList, List *dpcontext)
 }
 
 static bool
+AppendSortDirectionSql(StringInfo buf, SortGroupClause *sortClause)
+{
+	if (buf == NULL || sortClause == NULL)
+		return false;
+
+	#if PG_VERSION_NUM < PG_VERSION_18
+	{
+		Oid opfamily = InvalidOid;
+		Oid opcintype = InvalidOid;
+		int16 strategy = 0;
+
+		if (sortClause->sortop == InvalidOid ||
+			!get_ordering_op_properties(sortClause->sortop, &opfamily, &opcintype, &strategy))
+			return false;
+
+		if (strategy == BTLessStrategyNumber)
+			appendStringInfoString(buf, " asc");
+		else if (strategy == BTGreaterStrategyNumber)
+			appendStringInfoString(buf, " desc");
+		else
+			return false;
+	}
+	#else
+	appendStringInfoString(buf, sortClause->reverse_sort ? " desc" : " asc");
+	#endif
+
+	return true;
+}
+
+static bool
 AppendSortClauseSql(StringInfo buf, Query *query, List *dpcontext)
 {
 	ListCell *lc;
@@ -4283,7 +4460,8 @@ AppendSortClauseSql(StringInfo buf, Query *query, List *dpcontext)
 		first = false;
 
 		appendStringInfoString(buf, exprSql);
-		appendStringInfoString(buf, sortClause->reverse_sort ? " desc" : " asc");
+		if (!AppendSortDirectionSql(buf, sortClause))
+			return false;
 	}
 
 	return true;
@@ -4324,6 +4502,8 @@ AppendLimitClauseSql(StringInfo buf, Query *query, List *dpcontext)
 static Node *
 DecorrelateNestedScalarAggSubLinksMutator(Node *node, void *context)
 {
+	ScalarAggRewriteTracking *tracking = (ScalarAggRewriteTracking *) context;
+
 	if (node == NULL)
 		return NULL;
 
@@ -4343,7 +4523,8 @@ DecorrelateNestedScalarAggSubLinksMutator(Node *node, void *context)
 			newSubLink->subselect = (Node *)
 				TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(
 					(Query *) newSubLink->subselect,
-					&ignoredPlannerQueryString);
+					&ignoredPlannerQueryString,
+					tracking);
 		}
 
 		return (Node *) newSubLink;
@@ -4356,7 +4537,8 @@ DecorrelateNestedScalarAggSubLinksMutator(Node *node, void *context)
 
 static Query *
 TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(Query *parse,
-										const char **planner_query_string)
+										const char **planner_query_string,
+										ScalarAggRewriteTracking *tracking)
 {
 	ListCell *lc;
 	Query *rewrittenParse;
@@ -4373,7 +4555,8 @@ TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(Query *parse,
 		{
 			rte->subquery = TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(
 				rte->subquery,
-				&ignoredPlannerQueryString);
+				&ignoredPlannerQueryString,
+				tracking);
 		}
 	}
 
@@ -4387,7 +4570,8 @@ TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(Query *parse,
 			cte->ctequery = (Node *)
 				TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(
 					(Query *) cte->ctequery,
-					&ignoredPlannerQueryString);
+					&ignoredPlannerQueryString,
+					tracking);
 		}
 	}
 
@@ -4397,56 +4581,79 @@ TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(Query *parse,
 
 		te->expr = (Expr *) expression_tree_mutator((Node *) te->expr,
 									 DecorrelateNestedScalarAggSubLinksMutator,
-									 NULL);
+								 tracking);
 	}
 
 	if (parse->jointree != NULL && parse->jointree->quals != NULL)
 	{
 		parse->jointree->quals = expression_tree_mutator(parse->jointree->quals,
 										DecorrelateNestedScalarAggSubLinksMutator,
-										NULL);
+										tracking);
 	}
 
 	if (parse->havingQual != NULL)
 	{
 		parse->havingQual = expression_tree_mutator(parse->havingQual,
 									 DecorrelateNestedScalarAggSubLinksMutator,
-									 NULL);
+								 tracking);
 	}
 
 	if (parse->limitOffset != NULL)
 	{
 		parse->limitOffset = expression_tree_mutator(parse->limitOffset,
 									   DecorrelateNestedScalarAggSubLinksMutator,
-									   NULL);
+								   tracking);
 	}
 
 	if (parse->limitCount != NULL)
 	{
 		parse->limitCount = expression_tree_mutator(parse->limitCount,
 									  DecorrelateNestedScalarAggSubLinksMutator,
-									  NULL);
+								  tracking);
 	}
 
+	#if PG_VERSION_NUM >= PG_VERSION_16
 	rewrittenParse = TryRewriteOuterJoinCountSubqueryForPg19(parse,
 									planner_query_string);
 	if (rewrittenParse != NULL)
+	{
+		if (tracking != NULL && rewrittenParse != parse)
+			tracking->didRewrite = true;
 		return rewrittenParse;
+	}
+	#endif
 
+	#if PG_VERSION_NUM >= PG_VERSION_16
 	rewrittenParse = TryRewriteQ8MarketShareAggForPg19(parse,
 							 planner_query_string);
 	if (rewrittenParse != NULL)
+	{
+		if (tracking != NULL && rewrittenParse != parse)
+			tracking->didRewrite = true;
 		return rewrittenParse;
+	}
 
 	rewrittenParse = TryRewriteQ18OrderQuantityAggForPg19(parse,
 								 planner_query_string);
 	if (rewrittenParse != NULL)
+	{
+		if (tracking != NULL && rewrittenParse != parse)
+		{
+			tracking->didRewrite = true;
+			tracking->didQ18Rewrite = true;
+		}
 		return rewrittenParse;
+	}
+	#endif
 
 	rewrittenParse = TryDecorrelateScalarAggSubqueryForPg19(parse,
 									   planner_query_string);
 	if (rewrittenParse != NULL)
+	{
+		if (tracking != NULL && rewrittenParse != parse)
+			tracking->didRewrite = true;
 		return rewrittenParse;
+	}
 
 	return parse;
 }
@@ -4479,20 +4686,27 @@ TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
 	List *rawParsetrees;
 	RawStmt *rawStmt;
 	Query *rewrittenParse = NULL;
+	const char *skip_reason = NULL;
+
+#define SCALAR_AGG_REWRITE_SKIP(reason_literal) \
+	do { \
+		skip_reason = (reason_literal); \
+		goto scalar_agg_rewrite_skip; \
+	} while (0)
 
 	if (parse == NULL || planner_query_string == NULL)
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("missing parse or planner query string");
 
 	if (!QueryUsesColumnarRelation(parse))
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("outer query does not use a columnar relation");
 
 	if (!ExtractScalarAggSubLinkInfo(parse, &info))
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("query shape did not match scalar aggregate sublink pattern");
 
 	outerDpcontext = BuildRelationDeparseContext(parse);
 	innerDpcontext = BuildRelationDeparseContext(info.innerQuery);
 	if (outerDpcontext == NIL || innerDpcontext == NIL)
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("failed to build deparse context");
 
 	initStringInfo(&targetSql);
 	initStringInfo(&rewrittenSql);
@@ -4501,16 +4715,16 @@ TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
 	initStringInfo(&outerKeyFrom);
 
 	if (!AppendTargetListSql(&targetSql, parse->targetList, outerDpcontext))
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("failed to deparse outer target list");
 
 	if (!AppendSimpleFromClause(&outerFrom, parse, parse->jointree->fromlist) ||
 		!AppendSimpleFromClause(&innerFrom, info.innerQuery, info.innerQuery->jointree->fromlist))
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("failed to deparse simple from clause");
 
 	outerExprSql = deparse_expression(info.outerExpr, outerDpcontext, true, false);
 	innerTargetSql = deparse_expression(info.innerTargetExpr, innerDpcontext, true, false);
 	if (outerExprSql == NULL || innerTargetSql == NULL)
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("failed to deparse comparison expressions");
 
 	forboth(outerLc, info.outerKeyVars, innerLc, info.innerKeyVars)
 	{
@@ -4526,7 +4740,7 @@ TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
 										  false);
 
 		if (outerKeySql == NULL || innerKeySql == NULL)
-			return NULL;
+			SCALAR_AGG_REWRITE_SKIP("failed to deparse correlation keys");
 
 		if (outerKeyVar == NULL || outerKeyVar->varlevelsup != 0 || outerKeyVar->varno <= 0)
 			outerKeyRtindex = 0;
@@ -4540,7 +4754,7 @@ TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
 	}
 
 	if (outerKeySqlList == NIL || list_length(outerKeySqlList) != list_length(innerKeySqlList))
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("correlation key extraction produced mismatched key lists");
 
 	if (info.outerRemainingQuals != NULL)
 		outerQualSql = deparse_expression(info.outerRemainingQuals, outerDpcontext, true, false);
@@ -4582,7 +4796,7 @@ TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
 
 	opname = get_opname(info.compareQual->opno);
 	if (opname == NULL)
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("failed to resolve comparison operator name");
 
 	appendStringInfo(&rewrittenSql, "select %s from %s, (select ",
 					 targetSql.data,
@@ -4696,7 +4910,7 @@ TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
 
 	if (!AppendSortClauseSql(&rewrittenSql, parse, outerDpcontext) ||
 		!AppendLimitClauseSql(&rewrittenSql, parse, outerDpcontext))
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("failed to append sort or limit clause");
 
 	PG_TRY();
 	{
@@ -4720,12 +4934,22 @@ TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
 	PG_END_TRY();
 
 	if (rewrittenParse == NULL || rewrittenParse->commandType != CMD_SELECT)
-		return NULL;
+		SCALAR_AGG_REWRITE_SKIP("rewritten SQL failed parse analysis");
 
+	if (engine_debug_vectorized_groupagg_fallback)
+		elog(DEBUG1, "Scalar agg decorrelation applied");
 	*planner_query_string = rewrittenSql.data;
 	return rewrittenParse;
+
+scalar_agg_rewrite_skip:
+	if (engine_debug_vectorized_groupagg_fallback && skip_reason != NULL)
+		elog(DEBUG1, "Scalar agg decorrelation skipped: %s", skip_reason);
+	return NULL;
+
+#undef SCALAR_AGG_REWRITE_SKIP
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_16
 static Query *
 TryRewriteQ8MarketShareAggForPg19(Query *parse,
 					   const char **planner_query_string)
@@ -4979,9 +5203,10 @@ TryRewriteQ8MarketShareAggForPg19(Query *parse,
 	{
 		SortGroupClause *sortClause = linitial_node(SortGroupClause, parse->sortClause);
 
-		appendStringInfo(&rewrittenSql, " order by %s%s",
-			quote_identifier(outerGroupAlias),
-			sortClause->reverse_sort ? " desc" : " asc");
+		appendStringInfo(&rewrittenSql, " order by %s",
+			quote_identifier(outerGroupAlias));
+		if (!AppendSortDirectionSql(&rewrittenSql, sortClause))
+			Q8_REWRITE_SKIP("failed to append sort direction");
 	}
 
 	if (!AppendLimitClauseSql(&rewrittenSql, parse, innerDpcontext))
@@ -5462,8 +5687,8 @@ TryRewriteQ18OrderQuantityAggForPg19(Query *parse,
 			firstSort = false;
 
 			appendStringInfoString(&rewrittenSql, sortExprSql);
-			appendStringInfoString(&rewrittenSql,
-				sortClause->reverse_sort ? " desc" : " asc");
+			if (!AppendSortDirectionSql(&rewrittenSql, sortClause))
+				Q18_REWRITE_SKIP("failed to append sort direction");
 		}
 	}
 
@@ -5521,7 +5746,9 @@ q18_rewrite_skip:
 
 #undef Q18_REWRITE_SKIP
 }
+#endif
 
+#if PG_VERSION_NUM >= PG_VERSION_16
 static Query *
 TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
 								const char **planner_query_string)
@@ -5915,6 +6142,8 @@ rewrite_skip:
 }
 #endif
 
+#endif /* PG_VERSION_NUM >= PG_VERSION_16 */
+
 static bool
 PlanHasColumnarCustomScan(Plan *plan)
 {
@@ -5967,6 +6196,31 @@ PlanHasJoinNode(Plan *plan)
 
 	return PlanHasJoinNode(plan->lefttree) ||
 		PlanHasJoinNode(plan->righttree);
+}
+
+static bool
+PlanHasNestedLoopNode(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+
+	if (plan->type == T_NestLoop)
+		return true;
+
+	if (IsA(plan, CustomScan))
+	{
+		CustomScan *cscan = (CustomScan *) plan;
+		ListCell *lc;
+
+		foreach(lc, cscan->custom_plans)
+		{
+			if (PlanHasNestedLoopNode((Plan *) lfirst(lc)))
+				return true;
+		}
+	}
+
+	return PlanHasNestedLoopNode(plan->lefttree) ||
+		PlanHasNestedLoopNode(plan->righttree);
 }
 
 typedef struct ExprSourceRelidsContext
@@ -6191,19 +6445,36 @@ DescribePostJoinColumnarAgg(Agg *agg)
 	shape_ctx.input_plan = input_plan;
 	shape_ctx.found_aggref = false;
 	shape_ctx.aggregate_input_spans_multiple_rels = false;
-	(void) PostJoinAggShapeWalker((Node *) agg->plan.targetlist, &shape_ctx);
-	(void) PostJoinAggShapeWalker((Node *) agg->plan.qual, &shape_ctx);
-
-	if (shape_ctx.aggregate_input_spans_multiple_rels)
+	if (PostJoinColumnarAggHasMultiRelInputs(agg))
 		return "post-join aggregate has aggregate inputs sourced from multiple base relations";
 
 	if (IsQ13StyleOuterJoinCountAgg(agg))
 		return "outer-join count on nullable column awaits partial preaggregation";
 
+	(void) PostJoinAggShapeWalker((Node *) agg->plan.targetlist, &shape_ctx);
+	(void) PostJoinAggShapeWalker((Node *) agg->plan.qual, &shape_ctx);
+
 	if (shape_ctx.found_aggref)
 		return "post-join aggregate over columnar scans awaits a partial-aggregation transform";
 
 	return "post-join aggregate over columnar scans is not supported yet";
+}
+
+static bool
+PostJoinColumnarAggHasMultiRelInputs(Agg *agg)
+{
+	PostJoinAggShapeContext shape_ctx;
+
+	if (agg == NULL || agg->plan.lefttree == NULL)
+		return false;
+
+	shape_ctx.input_plan = agg->plan.lefttree;
+	shape_ctx.found_aggref = false;
+	shape_ctx.aggregate_input_spans_multiple_rels = false;
+	(void) PostJoinAggShapeWalker((Node *) agg->plan.targetlist, &shape_ctx);
+	(void) PostJoinAggShapeWalker((Node *) agg->plan.qual, &shape_ctx);
+
+	return shape_ctx.aggregate_input_spans_multiple_rels;
 }
 
 static bool
@@ -6391,6 +6662,26 @@ PlanHasHashColumnarAgg(Plan *plan)
 
 	return PlanHasHashColumnarAgg(plan->lefttree) ||
 		PlanHasHashColumnarAgg(plan->righttree);
+}
+
+static bool
+PlanHasPathologicalNestedLoopPostJoinColumnarAgg(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+
+	if (IsA(plan, Agg))
+	{
+		Agg *agg = (Agg *) plan;
+
+		if (PlanIsPostJoinColumnarAgg(agg) &&
+			PostJoinColumnarAggHasMultiRelInputs(agg) &&
+			PlanHasNestedLoopNode(agg->plan.lefttree))
+			return true;
+	}
+
+	return PlanHasPathologicalNestedLoopPostJoinColumnarAgg(plan->lefttree) ||
+		PlanHasPathologicalNestedLoopPostJoinColumnarAgg(plan->righttree);
 }
 
 /*
