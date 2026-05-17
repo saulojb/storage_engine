@@ -63,6 +63,17 @@
  */
 #define VECEXPR_CONST_SENTINEL (-2)
 
+/*
+ * op_type values for VecExprNode — used by the __int128 fast path to
+ * determine how to combine child results without calling FunctionCall2.
+ */
+#define SE_OPTYPE_NONE  0   /* leaf node / passthrough */
+#define SE_OPTYPE_ADD   1   /* + (result_scale = max(left, right)) */
+#define SE_OPTYPE_SUB   2   /* - (result_scale = max(left, right)) */
+#define SE_OPTYPE_MUL   3   /* * (result_scale = left + right)     */
+#define SE_OPTYPE_DIV   4   /* / forces NUMERIC fallback            */
+#define SE_OPTYPE_CAST  5   /* unary cast / passthrough             */
+
 typedef struct VecExprNode
 {
 	bool	is_var;		/* true = Var leaf, false = operator */
@@ -81,6 +92,14 @@ typedef struct VecExprNode
 	/* Constant leaf: value loaded at runtime from serialized Const node */
 	Datum	const_val;
 	bool	const_isnull;
+	/*
+	 * __int128 fast-path fields (plan-time + serialized).
+	 *   fixed_scale >= 0: this node's i128 output represents value * 10^fixed_scale
+	 *   fixed_scale == -1: NUMERIC fallback required (unconstrained typmod, Inf/NaN, div)
+	 *   op_type: SE_OPTYPE_* classifies the operation for i128 arithmetic
+	 */
+	int32	fixed_scale;	/* decimal scale for __int128 path; -1 = NUMERIC fallback */
+	int		op_type;		/* SE_OPTYPE_* */
 } VecExprNode;
 
 /*
@@ -120,7 +139,28 @@ typedef struct VecGroupAggTarget
 	 */
 	int			expr_num_nodes;					/* 0 = no expression */
 	int			expr_root_idx;					/* index of root in expr_nodes[] */
+	int32		expr_result_scale;				/* fixed_scale of root node; -1 = NUMERIC fallback */
 	VecExprNode	expr_nodes[VECGAGG_EXPR_MAX_NODES];
+
+	/*
+	 * Post-aggregate scalar operator: e.g. 0.5 * sum(col) or sum(col) * 2.
+	 * When has_post_mul is true, after computing the aggregate value we call
+	 *   post_mul_fmgr(arg1, arg2)
+	 * where (arg1, arg2) = (post_mul_const, agg_result) if post_mul_const_is_lhs,
+	 * or (agg_result, post_mul_const) otherwise.
+	 *
+	 * Only applied in AGGSPLIT_SIMPLE (non-partial) mode.
+	 * Plan-time: post_mul_const_plan is the serialized Const node.
+	 * Runtime: post_mul_fmgr and post_mul_const are loaded in BeginVecGroupAgg.
+	 */
+	bool		has_post_mul;				/* true: apply scalar op after aggregation */
+	Oid			post_mul_opfuncid;			/* binary operator function OID */
+	bool		post_mul_const_is_lhs;		/* true: op(const, agg), false: op(agg, const) */
+	struct Const *post_mul_const_plan;		/* plan-time only; NULL at runtime */
+	/* Runtime fields (loaded in BeginVecGroupAgg): */
+	FmgrInfo	post_mul_fmgr;				/* pre-loaded operator function */
+	Datum		post_mul_const;				/* stable copy of the constant value */
+	bool		post_mul_const_isnull;		/* true if constant is NULL */
 } VecGroupAggTarget;
 
 /* Maximum composite GROUP BY keys */
@@ -146,6 +186,12 @@ typedef struct VecGroupKey
  */
 #define VECGROUPAGG_MAX_TARGETS 16
 
+typedef struct VecGroupI128Store
+{
+	int64	hi;
+	uint64	lo;
+} VecGroupI128Store;
+
 typedef struct VecGroupEntry
 {
 	VecGroupKey k;					/* MUST BE FIRST: HTAB HASH_BLOBS compares
@@ -158,6 +204,14 @@ typedef struct VecGroupEntry
 	bool		acc_isnull[VECGROUPAGG_MAX_TARGETS]; /* NULL if no non-null input */
 	/* per-target distinct value sets (non-NULL only for COUNT_DISTINCT targets) */
 	HTAB	   *distinct_htab[VECGROUPAGG_MAX_TARGETS];
+	/*
+	 * __int128 accumulator for VECGAGG_SUM_EXPR NUMERIC fast path.
+	 * i128_acc[t] holds the running sum * 10^expr_result_scale.
+	 * i128_overflow[t] is set when the value overflowed or an unhandled case
+	 * was encountered; subsequent rows fall back to numeric_state_acc[t].
+	 */
+	VecGroupI128Store i128_acc[VECGROUPAGG_MAX_TARGETS];
+	bool		i128_overflow[VECGROUPAGG_MAX_TARGETS];
 } VecGroupEntry;
 
 /*
@@ -185,6 +239,7 @@ typedef struct VecGroupAggState
 	/* Per-group hash table */
 	HTAB			   *group_htab;
 	int					num_groups;
+	int				max_groups;
 
 	/* 0-based position of each GROUP BY key in the output result tuple */
 	int					key_result_attnum[VECGROUPAGG_MAX_KEYS];
@@ -233,6 +288,7 @@ extern CustomScan *engine_create_groupagg_node(int num_keys,
 											   bool key_is_consts[],
 											   Const *key_consts[],
 											   int key_result_atts[],
+									   int max_groups,
 											   bool sort_output,
 											   int aggsplit_mode,
 											   int num_targets,

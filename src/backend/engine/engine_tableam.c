@@ -109,6 +109,7 @@ typedef struct ColumnarScanDescData
 	MemoryContext scanContext;
 	Bitmapset *attr_needed;
 	List *scanQual;
+	uint64 cacheScanGeneration;
 
 	/* Parallel Scan Data */
 	ParallelColumnarScan parallelColumnarScan;
@@ -240,8 +241,15 @@ static ItemPointerData TupleSortSkipSmallerItemPointers(Tuplesortstate *tupleSor
 /* Custom tuple slot ops used for columnar. Initialized in engine_tableam_init(). */
 static TupleTableSlotOps TTSOpsColumnar;
 
-/* Previous cache enabled state. */
+/* Previous cache enabled state (used only by write operations). */
 static bool previousCacheEnabledState = false;
+
+/*
+ * Reference count for active sequential/custom scans using the column cache.
+ * We keep the cache alive across scans in the same backend, but still track
+ * active users so we never let the count drift negative on mixed scan paths.
+ */
+static int se_cache_refcount = 0;
 
 static const TupleTableSlotOps *
 engine_slot_callbacks(Relation relation)
@@ -256,7 +264,6 @@ engine_beginscan(Relation relation, Snapshot snapshot,
 				   ParallelTableScanDesc parallel_scan,
 				   uint32 flags)
 {
-	previousCacheEnabledState = engine_enable_page_cache;
 
 	int natts = relation->rd_att->natts;
 
@@ -287,7 +294,8 @@ engine_beginscan_extended(Relation relation, Snapshot snapshot,
 							ParallelColumnarScan parallelColumnarScan,
 							bool returnVectorizedTuple)
 {
-	previousCacheEnabledState = engine_enable_page_cache;
+	if (engine_enable_page_cache)
+		se_cache_refcount++;
 #if PG_VERSION_NUM >= PG_VERSION_16
 	Oid relfilelocator = relation->rd_locator.relNumber;
 #else
@@ -320,6 +328,7 @@ engine_beginscan_extended(Relation relation, Snapshot snapshot,
 	scan->attr_needed = bms_copy(attr_needed);
 	scan->scanQual = copyObject(scanQual);
 	scan->scanContext = scanContext;
+	scan->cacheScanGeneration = ColumnarCacheRegisterScan();
 
 	/* Parallel execution scan data */;
 	scan->parallelColumnarScan = parallelColumnarScan;
@@ -357,6 +366,7 @@ CreateColumnarScanMemoryContext(void)
 static ColumnarReadState *
 init_engine_read_state(Relation relation, TupleDesc tupdesc, Bitmapset *attr_needed,
 						 List *scanQual, MemoryContext scanContext, Snapshot snapshot,
+						 uint64 cacheScanGeneration,
 						 bool randomAccess,
 						 ParallelColumnarScan parallelColumnarScan)
 {
@@ -364,7 +374,8 @@ init_engine_read_state(Relation relation, TupleDesc tupdesc, Bitmapset *attr_nee
 
 	List *neededColumnList = NeededColumnsList(tupdesc, attr_needed);
 	ColumnarReadState *readState = ColumnarBeginRead(relation, tupdesc, neededColumnList,
-													 scanQual, scanContext, snapshot,
+									 scanQual, scanContext, snapshot,
+									 cacheScanGeneration,
 													 randomAccess,
 													 parallelColumnarScan);
 
@@ -392,12 +403,11 @@ engine_endscan(TableScanDesc sscan)
 	/* clean up any caches. */
 	if (engine_enable_page_cache == true)
 	{
-		ColumnarResetCache();
+		if (--se_cache_refcount < 0)
+			se_cache_refcount = 0;
 	}
 
 	MemoryContextDelete(scan->scanContext);
-
-	engine_enable_page_cache = previousCacheEnabledState;
 }
 
 
@@ -436,6 +446,7 @@ engine_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot 
 			init_engine_read_state(scan->cs_base.rs_rd, readTupleDesc,
 									 scan->attr_needed, scan->scanQual,
 									 scan->scanContext, scan->cs_base.rs_snapshot,
+									 scan->cacheScanGeneration,
 									 randomAccess,
 									 scan->parallelColumnarScan);
 		/* Propagate ANALYZE sampling stride (0 = normal scan) */
@@ -667,6 +678,9 @@ engine_index_fetch_begin(Relation rel
 
 	MemoryContextSwitchTo(oldContext);
 
+	if (engine_enable_page_cache)
+		se_cache_refcount++;
+
 	return &scan->cs_base;
 }
 
@@ -699,6 +713,9 @@ engine_index_fetch_begin_extended(Relation rel, Bitmapset *attr_needed)
 
 	MemoryContextSwitchTo(oldContext);
 
+	if (engine_enable_page_cache)
+		se_cache_refcount++;
+
 	return &scan->cs_base;
 }
 
@@ -706,7 +723,21 @@ engine_index_fetch_begin_extended(Relation rel, Bitmapset *attr_needed)
 static void
 engine_index_fetch_reset(IndexFetchTableData *sscan)
 {
-	/* no-op */
+	IndexFetchColumnarData *scan = (IndexFetchColumnarData *) sscan;
+
+	if (scan->cs_readState == NULL)
+		return;
+
+	/*
+	 * Pure no-op: the current chunk group's in-use cache entry (registered
+	 * by BeginChunkGroupRead) remains active, preventing EvictCache from
+	 * freeing the decompressed buffer between SubPlan re-evaluations.
+	 * The cache entry is removed by EndChunkGroupRead when the chunk group
+	 * actually changes (or when the scan ends via ColumnarResetRead).
+	 *
+	 * This avoids the 8-minute re-decompression regression that occurred
+	 * when ColumnarResetChunkGroupRead was called here unconditionally.
+	 */
 }
 
 
@@ -727,7 +758,8 @@ engine_index_fetch_end(IndexFetchTableData *sscan)
 	/* clean up any caches. */
 	if (engine_enable_page_cache == true)
 	{
-		ColumnarResetCache();
+		if (--se_cache_refcount < 0)
+			se_cache_refcount = 0;
 	}
 
 	MemoryContextDelete(scan->scanContext);
@@ -798,6 +830,16 @@ engine_index_fetch_tuple(struct IndexFetchTableData *sscan,
 	/* initialize read state for the first row */
 	if (scan->cs_readState == NULL)
 	{
+		/*
+		 * Switch to scanContext before any allocation.  Without this, when
+		 * engine_index_fetch_tuple is reached from inside SubPlan expression
+		 * evaluation, CurrentMemoryContext is ecxt_per_tuple_memory, which
+		 * is reset by ResetExprContext after every outer tuple.  That would
+		 * free readState and stripeReadContext while scan->cs_readState still
+		 * holds a dangling pointer, causing a SIGSEGV on the next call.
+		 */
+		MemoryContext oldCtx = MemoryContextSwitchTo(scan->scanContext);
+
 		/* no quals for index scan */
 		List *scanQual = NIL;
 
@@ -814,28 +856,56 @@ engine_index_fetch_tuple(struct IndexFetchTableData *sscan,
 													  slot->tts_tupleDescriptor,
 													  scan->attr_needed, scanQual,
 													  scan->scanContext,
-													  snapshot, randomAccess,
+									  snapshot, ColumnarCacheRegisterScan(),
+									  randomAccess,
 													  NULL);
-		if (scan->is_select_query)
+
+		/*
+		 * Pre-load the full stripe list for both select and non-select paths.
+		 * This allows FindStripeMetadataFromListBinarySearch (O(log n), no
+		 * catalog I/O) to be used on every row instead of calling
+		 * FindStripeWithMatchingFirstRowNumber (catalog scan) per row.
+		 *
+		 * For non-select paths (constraint checks), rows from uncommitted
+		 * in-progress stripes won't appear in this list; they fall back to
+		 * the catalog scan below.
+		 */
 #if PG_VERSION_NUM >= PG_VERSION_16
-			scan->stripeMetadataList =
-				StripesForRelfilenode(columnarRelation->rd_locator, ForwardScanDirection);
+		scan->stripeMetadataList =
+			StripesForRelfilenode(columnarRelation->rd_locator, ForwardScanDirection);
 #else
-			scan->stripeMetadataList =
-				StripesForRelfilenode(columnarRelation->rd_node, ForwardScanDirection);
+		scan->stripeMetadataList =
+			StripesForRelfilenode(columnarRelation->rd_node, ForwardScanDirection);
 #endif
 
+		MemoryContextSwitchTo(oldCtx);
 	}
 
 	uint64 rowNumber = tid_to_row_number(*tid);
 
-	StripeMetadata *stripeMetadata = NULL;
-	
-	if (scan->is_select_query)
-		stripeMetadata = FindStripeMetadataFromListBinarySearch(scan, rowNumber);
-	else
-		stripeMetadata = FindStripeWithMatchingFirstRowNumber(columnarRelation, rowNumber, snapshot);
-	
+	/*
+	 * need_pfree_stripe: true only when stripeMetadata was palloc'd by
+	 * FindStripeWithMatchingFirstRowNumber (non-select fallback path).
+	 * List-based lookups return a pointer into scan->stripeMetadataList —
+	 * those must NOT be pfree'd.
+	 */
+	bool need_pfree_stripe = false;
+	StripeMetadata *stripeMetadata =
+		FindStripeMetadataFromListBinarySearch(scan, rowNumber);
+
+	if (!stripeMetadata)
+	{
+		/*
+		 * Row not found in the pre-loaded committed-stripe list.
+		 * This can happen for rows in uncommitted (in-progress) stripes
+		 * during constraint checks.  Fall back to the catalog scan, which
+		 * can see dirty/in-progress data via a dirty snapshot.
+		 */
+		stripeMetadata = FindStripeWithMatchingFirstRowNumber(columnarRelation,
+															  rowNumber, snapshot);
+		need_pfree_stripe = true;
+	}
+
 	if (!stripeMetadata)
 	{
 		/* it is certain that tuple with rowNumber doesn't exist */
@@ -890,7 +960,7 @@ engine_index_fetch_tuple(struct IndexFetchTableData *sscan,
 				 * Row was deleted in the current transaction.
 				 * Not a constraint conflict — the old index entry is dead.
 				 */
-				if (!scan->is_select_query)
+				if (need_pfree_stripe)
 					pfree(stripeMetadata);
 				return false;
 			}
@@ -900,11 +970,11 @@ engine_index_fetch_tuple(struct IndexFetchTableData *sscan,
 										slot->tts_values, slot->tts_isnull))
 		{
 			/*
-			 * FindStripeWithMatchingFirstRowNumber doesn't verify upper row
+			 * FindStripeMetadataFromListBinarySearch doesn't verify upper row
 			 * number boundary of found stripe. For this reason, we didn't
 			 * certainly know if given row number belongs to one of the stripes.
 			 */
-			if (!scan->is_select_query)
+			if (need_pfree_stripe)
 				pfree(stripeMetadata);
 			return false;
 		}
@@ -916,7 +986,8 @@ engine_index_fetch_tuple(struct IndexFetchTableData *sscan,
 		 * constraint violation. In that case, indexAM provides dirty
 		 * snapshot to index_fetch_tuple callback.
 		 */
-		pfree(stripeMetadata);
+		if (need_pfree_stripe)
+			pfree(stripeMetadata);
 		Assert(snapshot->snapshot_type == SNAPSHOT_DIRTY);
 		return false;
 	}
@@ -987,7 +1058,7 @@ engine_index_fetch_tuple(struct IndexFetchTableData *sscan,
 		Assert(stripeWriteState == STRIPE_WRITE_FLUSHED);
 	}
 
-	if (!scan->is_select_query)
+	if (need_pfree_stripe)
 		pfree(stripeMetadata);
 	slot->tts_tableOid = RelationGetRelid(columnarRelation);
 	slot->tts_tid = *tid;
@@ -1022,7 +1093,8 @@ engine_fetch_row_version(Relation relation,
 											  slot->tts_tupleDescriptor,
 											  attr_needed, scanQual,
 											  GetColumnarReadStateCache(),
-											  snapshot, randomAccess,
+									  snapshot, ColumnarCacheRegisterScan(),
+									  randomAccess,
 											  NULL);
 	}
 
@@ -1428,7 +1500,8 @@ engine_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 										slot->tts_tupleDescriptor,
 										attr_needed, scanQual,
 										CurrentMemoryContext, // to be checked
-										GetTransactionSnapshot(), randomAccess,
+									GetTransactionSnapshot(), ColumnarCacheRegisterScan(),
+									randomAccess,
 										NULL);
 
 	ColumnarReadRowByRowNumber(readState, rowNumber,
@@ -1482,6 +1555,7 @@ engine_relation_set_new_filenode(Relation rel,
 #if PG_VERSION_NUM >= PG_VERSION_16
 	if (rel->rd_locator.relNumber != newrnode->relNumber)
 	{
+		ColumnarInvalidateRelationCache(rel->rd_id);
 		MarkRelfilenodeDropped(rel->rd_locator.relNumber, GetCurrentSubTransactionId());
 
 		DeleteMetadataRows(rel->rd_locator);
@@ -1489,6 +1563,7 @@ engine_relation_set_new_filenode(Relation rel,
 #else
 	if (rel->rd_node.relNode != newrnode->relNode)
 	{
+		ColumnarInvalidateRelationCache(rel->rd_id);
 		MarkRelfilenodeDropped(rel->rd_node.relNode, GetCurrentSubTransactionId());
 
 		DeleteMetadataRows(rel->rd_node);
@@ -1524,6 +1599,7 @@ engine_relation_nontransactional_truncate(Relation rel)
 	NonTransactionDropWriteState(relfilelocator.relNode);
 #endif
 	/* Delete old relfilelocator metadata */
+	ColumnarInvalidateRelationCache(rel->rd_id);
 	DeleteMetadataRows(relfilelocator);
 
 	/*
@@ -1617,6 +1693,7 @@ engine_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	ColumnarReadState *readState = init_engine_read_state(OldHeap, sourceDesc,
 															attr_needed, scanQual,
 															scanContext, snapshot,
+									ColumnarCacheRegisterScan(),
 															randomAccess,
 															NULL);
 
@@ -1798,6 +1875,7 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 
 	/* We need to re-assing RecentXmin here */
 	PushActiveSnapshot(GetTransactionSnapshot());
+	ColumnarInvalidateRelationCache(rel->rd_id);
 #if PG_VERSION_NUM >= PG_VERSION_16
 	ColumnarWriteState *writeState = ColumnarBeginWrite(rel->rd_locator,
 														columnarOptions,
@@ -1820,6 +1898,7 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 	ColumnarReadState *readState = init_engine_read_state(rel, tupleDesc,
 															attr_needed, scanQual,
 															scanContext, SnapshotAny,
+									ColumnarCacheRegisterScan(),
 															randomAccess,
 															NULL);
 
@@ -2261,16 +2340,7 @@ TruncateColumnar(Relation rel, int elevel)
 										ColumnarFirstLogicalOffset);
 #endif
 		if (unlikely(rel->rd_smgr == NULL))
-		{
-#if PG_VERSION_NUM >= PG_VERSION_17
-			rel->rd_smgr = smgropen(rel->rd_locator, rel->rd_backend);
-			smgrpin(rel->rd_smgr);
-#elif PG_VERSION_NUM >= PG_VERSION_16
-			smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-			smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-		}
+			EnsureRelationSmgrOpen(rel);
 
 		BlockNumber old_rel_pages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
 
@@ -2978,7 +3048,8 @@ engine_scan_bitmap_next_tuple(TableScanDesc sscan,
 		scan->cs_readState = init_engine_read_state(
 			scan->cs_base.rs_rd, slot->tts_tupleDescriptor,
 			scan->attr_needed, scan->scanQual, scan->scanContext,
-			scan->cs_base.rs_snapshot, true /* randomAccess */, NULL);
+			scan->cs_base.rs_snapshot, scan->cacheScanGeneration,
+			true /* randomAccess */, NULL);
 	}
 
 	while (true)
@@ -3038,7 +3109,8 @@ engine_scan_bitmap_next_tuple(TableScanDesc sscan,
 		scan->cs_readState = init_engine_read_state(
 			scan->cs_base.rs_rd, slot->tts_tupleDescriptor,
 			scan->attr_needed, scan->scanQual, scan->scanContext,
-			scan->cs_base.rs_snapshot, true /* randomAccess */, NULL);
+			scan->cs_base.rs_snapshot, scan->cacheScanGeneration,
+			true /* randomAccess */, NULL);
 	}
 
 	/* Allocate the exact-offset buffer once inside the scan memory context */
@@ -3315,6 +3387,7 @@ ColumnarTableDropHook(Oid relid)
 #else
 		RelFileLocator relfilelocator = rel->rd_node;
 #endif
+		ColumnarInvalidateRelationCache(relid);
 		DeleteMetadataRows(relfilelocator);
 		DeleteColumnarTableOptions(rel->rd_id, true);
 #if PG_VERSION_NUM >= PG_VERSION_16
@@ -4406,6 +4479,7 @@ se_vacuum_engine_table(PG_FUNCTION_ARGS)
 		ColumnarReadState *readState = init_engine_read_state(rel, tupleDesc,
 															attr_needed, scanQual,
 															scanContext, snapshot,
+									ColumnarCacheRegisterScan(),
 															randomAccess,
 															NULL);
 
@@ -4423,6 +4497,8 @@ se_vacuum_engine_table(PG_FUNCTION_ARGS)
 			ColumnarWriteRow(writeState, values, nulls);
 			rowCount++;
 		}
+
+		ColumnarInvalidateRelationCache(rel->rd_id);
 
 #if PG_VERSION_NUM >= PG_VERSION_16
 		DeleteMetadataRowsForStripeId(rel->rd_locator, vacuumCandidate->stripeMetadata->id);

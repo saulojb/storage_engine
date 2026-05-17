@@ -50,11 +50,13 @@ bool engine_enable_parallel_execution = true;
 int engine_min_parallel_processes = 8;
 bool engine_enable_vectorization = true;
 bool engine_enable_vectorized_groupagg = true;
+int  engine_vecgroupagg_max_groups = 16384;
 bool engine_enable_automatic_plan = true;
 bool engine_debug_vectorized_groupagg_fallback = false;
+bool engine_debug_vectorized_groupagg_exec = false;
 bool engine_enable_dml = true;
 bool engine_enable_page_cache = false;
-int engine_page_cache_size = 200U;
+int engine_page_cache_size = 2000U;
 bool engine_index_scan = false;
 
 static const struct config_enum_entry engine_compression_options[] =
@@ -208,10 +210,37 @@ engine_guc_init()
 							 NULL,
 							 NULL);
 
+	DefineCustomIntVariable("storage_engine.vecgroupagg_max_groups",
+							"Maximum number of distinct groups for VectorGroupAgg. "
+							"Queries whose estimated group count exceeds 75%% of this value "
+							"fall back to HashAggregate. Lower values save memory; higher "
+							"values allow vectorization for higher-cardinality GROUP BY.",
+							NULL,
+							&engine_vecgroupagg_max_groups,
+							16384,
+							256,
+							4194304,	/* 4 M groups upper bound */
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
 	DefineCustomBoolVariable("storage_engine.debug_vectorized_groupagg_fallback",
 							 "Logs DEBUG1 reasons when planner falls back from VectorGroupAgg",
 							 NULL,
 							 &engine_debug_vectorized_groupagg_fallback,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("storage_engine.debug_vectorized_groupagg_exec",
+							 "Logs executor milestones for VectorGroupAgg crash diagnosis",
+							 NULL,
+							 &engine_debug_vectorized_groupagg_exec,
 							 false,
 							 PGC_USERSET,
 							 0,

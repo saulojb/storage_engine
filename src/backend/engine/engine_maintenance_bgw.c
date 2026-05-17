@@ -42,6 +42,10 @@
 
 #include "engine/engine_maintenance_bgw.h"
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+extern void pqsignal_be(int signo, pqsigfunc func);
+#endif
+
 /* ================================================================
  * GUC variables
  * ================================================================ */
@@ -75,7 +79,11 @@ void
 se_maintenance_bgworker_main(Datum arg)
 {
 	/* Set up signal handlers */
+	#if PG_VERSION_NUM >= PG_VERSION_19
+	pqsignal_be(SIGTERM, se_bgw_sigterm);
+	#else
 	pqsignal(SIGTERM, se_bgw_sigterm);
+	#endif
 	BackgroundWorkerUnblockSignals();
 
 	/* If no database configured, nothing to do — sleep until SIGTERM */

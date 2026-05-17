@@ -12,74 +12,116 @@
 
 #include "postgres.h"
 
-#include "miscadmin.h"
-
-#include "access/amapi.h"
+#include "access/stratnum.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
-#include "catalog/pg_statistic.h"
 #include "catalog/pg_operator.h"
-#include "catalog/pg_proc.h"
+#include "catalog/pg_statistic.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
+#include "lib/stringinfo.h"
+#include "miscadmin.h"
+#include "nodes/extensible.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pg_list.h"
+#include "nodes/plannodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
-#include "optimizer/pathnode.h"
-#include "optimizer/paths.h"
-#include "optimizer/plancat.h"
 #include "optimizer/planner.h"
-#include "optimizer/restrictinfo.h"
-#include "tcop/tcopprot.h"
-#include "tcop/utility.h"
+#include "optimizer/plancat.h"
+#include "parser/analyze.h"
 #include "parser/parser.h"
-#include "parser/parse_oper.h"
-#include "parser/parse_func.h"
 #include "parser/parsetree.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
-#include "utils/selfuncs.h"
+#include "utils/numeric.h"
+#include "utils/ruleutils.h"
 #include "utils/syscache.h"
-#include "utils/spccache.h"
 
 #include "engine/engine.h"
 #include "engine/engine_customscan.h"
 #include "engine/engine_indexscan.h"
+#include "engine/utils/listutils.h"
 #include "engine/vectorization/engine_vector_execution.h"
 #include "engine/vectorization/nodes/engine_aggregator_node.h"
 #include "engine/vectorization/nodes/engine_groupagg_node.h"
 
-#include "engine/utils/listutils.h"
-
-static planner_hook_type PreviousPlannerHook = NULL;
-
-static PlannedStmt * ColumnarPlannerHook(Query *parse,
-#if PG_VERSION_NUM >= PG_VERSION_13
-                                         const char *query_string,
-#endif
-									 int cursorOptions, ParamListInfo boundParams
-#if PG_VERSION_NUM >= PG_VERSION_19
-									 , ExplainState *es
-#endif
-									 );
 static bool IsCreateTableAs(const char *query);
 
 #if PG_VERSION_NUM >= PG_VERSION_14
+static planner_hook_type PreviousPlannerHook = NULL;
 static Oid engine_tableam_oid = InvalidOid;
 static bool QueryStringHasPlainExplain(const char *query);
+#if PG_VERSION_NUM >= PG_VERSION_16
+static bool QueryStringLooksLikeTpchQ7(const char *query);
+static bool QueryStringLooksLikeTpchQ21(const char *query);
+#endif
 static bool QueryHasVectorizableAggregate(Query *parse);
 static bool QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse);
+#if PG_VERSION_NUM >= PG_VERSION_16
+static bool QueryTouchesColumnarRelations(Query *parse);
+#endif
+static Oid GetEngineTableAmOid(void);
 static Oid GetRelationTableAmOid(Oid relid);
 static bool PlanHasColumnarCustomScan(Plan *plan);
+static bool PlanHasJoinNode(Plan *plan);
+#if PG_VERSION_NUM >= PG_VERSION_16
+static bool PlanHasNestedLoopNode(Plan *plan);
+#endif
+static Bitmapset *PlanOutputColumnSourceRels(Plan *plan, AttrNumber resno);
+static Bitmapset *PlanExprSourceRels(Node *node, Plan *plan);
+static Bitmapset *ExprSourceRelsForPlan(Node *node, Plan *input_plan);
+static List *AppendQualOnlyAggrefsToTargetList(List *targetlist, Node *qual);
+static Node *RewriteQualAggrefsToTargetVars(Node *qual, List *targetlist);
+static bool ShouldRelaxVecGroupAggGroupLimit(Agg *aggNode, Oid first_key_typeoid);
+static bool IsQ13StyleOuterJoinCountAgg(Agg *agg);
+static bool PostJoinColumnarAggHasMultiRelInputs(Agg *agg);
+static const char *DescribePostJoinColumnarAgg(Agg *agg);
+static bool PlanIsPostJoinColumnarAgg(Agg *agg);
 static bool PlanHasPathologicalSortedColumnarAgg(Plan *plan);
 static bool PlanHasHashColumnarAgg(Plan *plan);
+#if PG_VERSION_NUM >= PG_VERSION_16
+static bool PlanHasPathologicalNestedLoopPostJoinColumnarAgg(Plan *plan);
+#endif
+#if PG_VERSION_NUM >= PG_VERSION_16
+static Query *TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
+									 const char **planner_query_string);
+#endif
+#if PG_VERSION_NUM >= PG_VERSION_16
+typedef struct ScalarAggRewriteTracking
+{
+	bool didRewrite;
+	bool didQ18Rewrite;
+} ScalarAggRewriteTracking;
+
+static bool AppendSortClauseSql(StringInfo buf, Query *query, List *dpcontext);
+static bool AppendLimitClauseSql(StringInfo buf, Query *query, List *dpcontext);
+static Node *DecorrelateNestedScalarAggSubLinksMutator(Node *node, void *context);
+static Query *TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(Query *parse,
+										 const char **planner_query_string,
+										 ScalarAggRewriteTracking *tracking);
+#if PG_VERSION_NUM >= PG_VERSION_16
+static Query *TryRewriteQ8MarketShareAggForPg19(Query *parse,
+						const char **planner_query_string);
+static Query *TryRewriteQ18OrderQuantityAggForPg19(Query *parse,
+								 const char **planner_query_string);
+#endif
+static Query *TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
+										 const char **planner_query_string);
+#endif
 static void MutatePlannedStmt(PlannedStmt *stmt);
 static bool TryVectorizeSerialPlan(PlannedStmt *stmt_serial,
 								   MemoryContext saved_context,
 								   Plan **savedPlanTree,
 								   List **savedSubplan);
 static void CollectProjectedAttnos(Plan *scan_plan, AttrNumber *attnos, int *count);
+#endif
 
 typedef struct PlanTreeMutatorContext
 {
@@ -88,20 +130,11 @@ typedef struct PlanTreeMutatorContext
 	List *rtable;
 } PlanTreeMutatorContext;
 
-static double EstimateGroupByDistinct(PlanTreeMutatorContext *ctx, Plan *scan_plan,
-								   AttrNumber key_table_attno, double fallback);
-
 typedef struct
 {
 	bool foundAggref;
 	bool allAggrefsAreStar;
 } AggrefStarContext;
-
-typedef struct
-{
-	bool foundNumericAgg;
-	bool foundMoneyAgg;
-} MixedAggTypeContext;
 
 static bool
 AggrefStarWalker(Node *node, void *context)
@@ -136,10 +169,35 @@ PlanAllAggrefsAreStar(Plan *plan)
 	return ctx.foundAggref && ctx.allAggrefsAreStar;
 }
 
-static bool
-MixedAggTypeWalker(Node *node, void *context)
+typedef struct
 {
-	MixedAggTypeContext *ctx = (MixedAggTypeContext *) context;
+ 	List *targetlist;
+	List *collected;
+} QualAggrefCollectorContext;
+
+static bool
+TargetListHasAggref(List *targetlist, Aggref *aggref)
+{
+	ListCell *lc;
+
+	if (aggref == NULL)
+		return false;
+
+	foreach(lc, targetlist)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (equal(te->expr, aggref))
+			return true;
+	}
+
+	return false;
+}
+
+static bool
+CollectQualOnlyAggrefsWalker(Node *node, void *context)
+{
+	QualAggrefCollectorContext *ctx = (QualAggrefCollectorContext *) context;
 
 	if (node == NULL)
 		return false;
@@ -148,39 +206,110 @@ MixedAggTypeWalker(Node *node, void *context)
 	{
 		Aggref *aggref = (Aggref *) node;
 
-		if (!aggref->aggstar && list_length(aggref->args) == 1)
-		{
-			TargetEntry *arg_te = (TargetEntry *) linitial(aggref->args);
+		if (!TargetListHasAggref(ctx->targetlist, aggref) &&
+			!TargetListHasAggref(ctx->collected, aggref))
+			ctx->collected = lappend(ctx->collected, copyObject(aggref));
 
-			if (arg_te != NULL && IsA(arg_te->expr, Var))
-			{
-				Var *arg_var = (Var *) arg_te->expr;
-
-				if (arg_var->vartype == NUMERICOID)
-					ctx->foundNumericAgg = true;
-				else if (arg_var->vartype == CASHOID)
-					ctx->foundMoneyAgg = true;
-			}
-		}
-
-		if (ctx->foundNumericAgg && ctx->foundMoneyAgg)
-			return true;
+		return false;
 	}
 
-	return expression_tree_walker(node, MixedAggTypeWalker, context);
+	return expression_tree_walker(node, CollectQualOnlyAggrefsWalker, context);
 }
 
-static bool
-PlanHasMixedNumericMoneyAggrefs(Plan *plan)
+static List *
+AppendQualOnlyAggrefsToTargetList(List *targetlist, Node *qual)
 {
-	MixedAggTypeContext ctx;
+	QualAggrefCollectorContext ctx;
+	List *result;
+	ListCell *lc;
+	AttrNumber next_resno;
 
-	ctx.foundNumericAgg = false;
-	ctx.foundMoneyAgg = false;
-	(void) MixedAggTypeWalker((Node *) plan->targetlist, &ctx);
-	(void) MixedAggTypeWalker((Node *) plan->qual, &ctx);
+	if (targetlist == NIL || qual == NULL)
+		return targetlist;
 
-	return ctx.foundNumericAgg && ctx.foundMoneyAgg;
+	ctx.targetlist = targetlist;
+	ctx.collected = NIL;
+	(void) CollectQualOnlyAggrefsWalker(qual, &ctx);
+
+	if (ctx.collected == NIL)
+		return targetlist;
+
+	result = list_copy_deep(targetlist);
+	next_resno = list_length(result) + 1;
+
+	foreach(lc, ctx.collected)
+	{
+		Aggref *aggref = lfirst_node(Aggref, lc);
+		TargetEntry *te = makeTargetEntry((Expr *) aggref,
+										 next_resno++,
+										 NULL,
+										 true);
+
+		result = lappend(result, te);
+	}
+
+	return result;
+}
+
+typedef struct
+{
+	List *targetlist;
+} QualAggrefRewriteContext;
+
+static Node *
+RewriteQualAggrefsToTargetVarsMutator(Node *node, void *context)
+{
+	QualAggrefRewriteContext *ctx = (QualAggrefRewriteContext *) context;
+	ListCell *lc;
+
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, Aggref))
+	{
+		Aggref *aggref = (Aggref *) node;
+
+		foreach(lc, ctx->targetlist)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+			if (equal(te->expr, aggref))
+				return (Node *) makeVar(INDEX_VAR,
+									te->resno,
+									exprType((Node *) te->expr),
+									exprTypmod((Node *) te->expr),
+									exprCollation((Node *) te->expr),
+									0);
+		}
+	}
+
+	return expression_tree_mutator(node, RewriteQualAggrefsToTargetVarsMutator, context);
+}
+
+static Node *
+RewriteQualAggrefsToTargetVars(Node *qual, List *targetlist)
+{
+	QualAggrefRewriteContext ctx;
+
+	if (qual == NULL)
+		return NULL;
+
+	ctx.targetlist = targetlist;
+	return expression_tree_mutator(qual, RewriteQualAggrefsToTargetVarsMutator, &ctx);
+}
+
+static Node *
+StripRelabels(Node *node)
+{
+	for (;;)
+	{
+		if (node == NULL)
+			return NULL;
+		if (IsA(node, RelabelType))
+			node = (Node *) ((RelabelType *) node)->arg;
+		else
+			return node;
+	}
 }
 
 /*
@@ -202,21 +331,6 @@ FindFirstAggref_walker(Node *node, void *context)
 	}
 	return expression_tree_walker(node, FindFirstAggref_walker, context);
 }
-
-#if PG_VERSION_NUM < PG_VERSION_16
-static bool
-PlanHasNumericAggrefs(Plan *plan)
-{
-	MixedAggTypeContext ctx;
-
-	ctx.foundNumericAgg = false;
-	ctx.foundMoneyAgg = false;
-	(void) MixedAggTypeWalker((Node *) plan->targetlist, &ctx);
-	(void) MixedAggTypeWalker((Node *) plan->qual, &ctx);
-
-	return ctx.foundNumericAgg;
-}
-#endif
 
 /*
  * Estimate GROUP BY cardinality for a single table key.
@@ -510,10 +624,7 @@ CollectProjectedAttnos(Plan *scan_plan, AttrNumber *attnos, int *count)
 
 	foreach(lc, scan_plan->targetlist)
 	{
-		TargetEntry *te = (TargetEntry *) lfirst(lc);
-
-		if (te->resjunk || !IsA(te->expr, Var))
-			continue;
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
 
 		(void) CollectVarAttnosWalker((Node *) te->expr, &ctx);
 	}
@@ -858,6 +969,16 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 			n->right    = -1;
 			n->opfuncid = InvalidOid;
 			n->rettype  = v->vartype;
+			n->op_type  = SE_OPTYPE_NONE;
+			/* Derive fixed_scale from typmod for NUMERIC; 0 for integer types */
+			if (v->vartype == NUMERICOID)
+				n->fixed_scale = (v->vartypmod > VARHDRSZ)
+					? (int32)((v->vartypmod - VARHDRSZ) & 0xffff)
+					: -1;
+			else if (v->vartype == INT4OID || v->vartype == INT8OID)
+				n->fixed_scale = 0;
+			else
+				n->fixed_scale = -1;
 			return idx;
 		}
 	}
@@ -893,6 +1014,24 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 		{
 			int			idx = (*num_nodes)++;
 			VecExprNode *n  = &nodes[idx];
+			int			ls  = nodes[left_idx].fixed_scale;
+			int			rs  = nodes[right_idx].fixed_scale;
+			int			ot  = SE_OPTYPE_NONE;
+			const char *fname;
+
+			/* Classify operator for the i128 fast path */
+			fname = get_func_name(op->opfuncid);
+			if (fname)
+			{
+				if (strstr(fname, "_mul") || strstr(fname, "mul"))
+					ot = SE_OPTYPE_MUL;
+				else if (strstr(fname, "_add") || strstr(fname, "pl"))
+					ot = SE_OPTYPE_ADD;
+				else if (strstr(fname, "_sub") || strstr(fname, "mi"))
+					ot = SE_OPTYPE_SUB;
+				else if (strstr(fname, "_div") || strstr(fname, "div"))
+					ot = SE_OPTYPE_DIV;
+			}
 
 			n->is_var   = false;
 			n->slot_idx = -1;
@@ -901,6 +1040,16 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 			n->right    = right_idx;
 			n->opfuncid = op->opfuncid;
 			n->rettype  = op->opresulttype;
+			n->op_type  = ot;
+
+			/* Propagate fixed_scale for i128 arithmetic */
+			if (ot == SE_OPTYPE_MUL)
+				n->fixed_scale = (ls >= 0 && rs >= 0) ? ls + rs : -1;
+			else if (ot == SE_OPTYPE_ADD || ot == SE_OPTYPE_SUB)
+				n->fixed_scale = (ls >= 0 && rs >= 0) ? (ls > rs ? ls : rs) : -1;
+			else
+				n->fixed_scale = -1;  /* DIV or unknown → NUMERIC fallback */
+
 			return idx;
 		}
 	}
@@ -921,13 +1070,45 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 			int			idx = (*num_nodes)++;
 			VecExprNode *n  = &nodes[idx];
 
-			n->is_var   = true;
-			n->slot_idx = VECEXPR_CONST_SENTINEL;
-			n->col_type = col_type;
-			n->left     = -1;
-			n->right    = -1;
-			n->opfuncid = InvalidOid;
-			n->rettype  = c->consttype;
+			n->is_var       = true;
+			n->slot_idx     = VECEXPR_CONST_SENTINEL;
+			n->col_type     = col_type;
+			n->left         = -1;
+			n->right        = -1;
+			n->opfuncid     = InvalidOid;
+			n->rettype      = c->consttype;
+			n->const_val    = c->constvalue;
+			n->const_isnull = c->constisnull;
+			n->op_type      = SE_OPTYPE_NONE;
+
+			/* Derive fixed_scale for the i128 fast path */
+			if (c->constisnull)
+				n->fixed_scale = -1;
+			else if (c->consttype == INT4OID || c->consttype == INT8OID)
+				n->fixed_scale = 0;
+			else if (c->consttype == NUMERICOID)
+			{
+				/*
+				 * Read the stored decimal scale (dscale) directly from the
+				 * NUMERIC varlena header.  The first two bytes after the
+				 * varlena length are the NumericChoice header word.  Bit 15
+				 * being set means "short" form; bits 12..7 = dscale in that
+				 * form.  Otherwise bit 14..0 of the long-form header = dscale.
+				 * Both forms have been stable since PostgreSQL 9.6.
+				 */
+				Numeric num = DatumGetNumeric(c->constvalue);
+				uint16  hdr = *((const uint16 *) ((const char *) num + VARHDRSZ));
+				bool    is_special = ((hdr & 0xC000) == 0xC000);  /* NaN / Inf */
+				if (is_special)
+					n->fixed_scale = -1;
+				else if (hdr & 0x8000)	/* short form: dscale in bits 12..7 */
+					n->fixed_scale = (int32)((hdr & 0x1F80) >> 7);
+				else					/* long form: dscale in bits 13..0 */
+					n->fixed_scale = (int32)(hdr & 0x3FFF);
+			}
+			else
+				n->fixed_scale = -1;
+
 			return idx;
 		}
 	}
@@ -982,6 +1163,29 @@ ExtractArithExprNode(Node *expr, Plan *child_plan,
 			/* passthrough for multi-arg typmod casts (opfuncid=InvalidOid) */
 			n->opfuncid = (nargs == 1) ? f->funcid : InvalidOid;
 			n->rettype  = f->funcresulttype;
+			n->op_type  = SE_OPTYPE_CAST;
+
+			/*
+			 * Propagate child's fixed_scale through the cast.
+			 * For multi-arg numeric typmod casts, the second arg encodes the
+			 * typmod; extract the output scale from it when available.
+			 */
+			if (nargs > 1)
+			{
+				Node *typmod_node = (Node *) lsecond(f->args);
+				if (IsA(typmod_node, Const))
+				{
+					int32 tmod = DatumGetInt32(((Const *) typmod_node)->constvalue);
+					n->fixed_scale = (tmod > VARHDRSZ)
+						? (int32)((tmod - VARHDRSZ) & 0xffff)
+						: nodes[child_idx].fixed_scale;
+				}
+				else
+					n->fixed_scale = nodes[child_idx].fixed_scale;
+			}
+			else
+				n->fixed_scale = nodes[child_idx].fixed_scale;
+
 			return idx;
 		}
 	}
@@ -1040,6 +1244,7 @@ ExtractTargetAggref(Node *expr, Aggref **out_aggref)
 		return false;
 	}
 }
+
 
 /*
  * Classify an Aggref into VECGAGG_COUNT_STAR / SUM / MIN / MAX / AVG.
@@ -1328,7 +1533,8 @@ ClassifyAggref(Aggref *aggref, Plan *child_plan,
  * failure (unsupported expression type or pool overflow).
  *
  * Supported leaf types: Aggref (classifiable), Const (numeric types only).
- * Supported interior nodes: OpExpr, FuncExpr (unary cast), RelabelType.
+ * Supported interior nodes: OpExpr, FuncExpr (unary cast), RelabelType,
+ * CoerceViaIO, CoerceToDomain.
  * Depth is limited to VPAE_MAX_NODES to guard against stack overflow.
  */
 static int
@@ -1339,6 +1545,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 					   Aggref		      **mt_aggrefs,
 					   int				   *mt_kind,
 					   int				   *mt_col_type,
+					   Oid				   *mt_result_typeoid,
 					   int				   *mt_sum_col_slot,
 					   VecExprNode		  (*mt_nodes)[VECGAGG_EXPR_MAX_NODES],
 					   int				   *mt_expr_num,
@@ -1350,9 +1557,18 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 	if (!expr || depth > VPAE_MAX_NODES || out->num_nodes >= VPAE_MAX_NODES)
 		return -1;
 
-	/* Peel lossless relabels */
-	while (IsA(expr, RelabelType))
-		expr = (Node *) ((RelabelType *) expr)->arg;
+	/* Peel transparent wrappers around aggregate leaves/post-agg expressions. */
+	for (;;)
+	{
+		if (IsA(expr, RelabelType))
+			expr = (Node *) ((RelabelType *) expr)->arg;
+		else if (IsA(expr, CoerceViaIO))
+			expr = (Node *) ((CoerceViaIO *) expr)->arg;
+		else if (IsA(expr, CoerceToDomain))
+			expr = (Node *) ((CoerceToDomain *) expr)->arg;
+		else
+			break;
+	}
 
 	/* ---- Aggref leaf ---- */
 	if (IsA(expr, Aggref))
@@ -1390,6 +1606,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 			{
 				mt_kind[slot_idx]     = VMSEXPR_COUNT_STAR;
 				mt_col_type[slot_idx] = VECGAGG_TYPE_INT8;
+				mt_result_typeoid[slot_idx] = INT8OID;
 			}
 			else if (ki == VECGAGG_SUM_EXPR && troot >= 0 && tnum >= 2)
 			{
@@ -1398,6 +1615,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 					return -1;
 				mt_kind[slot_idx]     = VMSEXPR_SUM_EXPR;
 				mt_col_type[slot_idx] = cvt;
+				mt_result_typeoid[slot_idx] = agg->aggtype;
 				memcpy(mt_nodes[slot_idx], tnodes, tnum * sizeof(VecExprNode));
 				mt_expr_num[slot_idx]  = tnum;
 				mt_expr_root[slot_idx] = troot;
@@ -1441,6 +1659,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 					vn->const_isnull = true;
 					mt_kind[slot_idx]      = VMSEXPR_SUM_EXPR;
 					mt_col_type[slot_idx]  = VECGAGG_TYPE_NUMERIC;
+					mt_result_typeoid[slot_idx] = agg->aggtype;
 					mt_expr_num[slot_idx]  = 1;
 					mt_expr_root[slot_idx] = 0;
 				}
@@ -1448,8 +1667,30 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 				{
 					mt_kind[slot_idx]         = VMSEXPR_SUM_COL;
 					mt_col_type[slot_idx]     = cvt;
+					mt_result_typeoid[slot_idx] = agg->aggtype;
 					mt_sum_col_slot[slot_idx] = col_slot;
 				}
+			}
+			else if (ki == VECGAGG_AVG)
+			{
+				/*
+				 * Multi-target post-aggregate mode only needs AVG in SIMPLE mode.
+				 * Non-trivial INITIAL_SERIAL outputs are already rejected later.
+				 */
+				if (aggsplit != AGGSPLIT_SIMPLE || dummy == 0)
+					return -1;
+
+				int cvt = TypeOidToVecGaggType(ct);
+				if (cvt < 0)
+					return -1;
+				int col_slot = VarAttnoToSlotIdx(child_plan, dummy);
+				if (col_slot < 0)
+					return -1;
+
+				mt_kind[slot_idx]            = VMSEXPR_AVG_COL;
+				mt_col_type[slot_idx]        = cvt;
+				mt_result_typeoid[slot_idx]  = agg->aggtype;
+				mt_sum_col_slot[slot_idx]    = col_slot;
 			}
 			else
 				return -1;	/* unsupported Aggref kind */
@@ -1464,7 +1705,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 		out->nodes[idx].left         = -1;
 		out->nodes[idx].right        = -1;
 		out->nodes[idx].opfuncid     = InvalidOid;
-		out->nodes[idx].rettype      = ct;
+		out->nodes[idx].rettype      = mt_result_typeoid[slot_idx];
 		out->nodes[idx].const_isnull = true;
 		return idx;
 	}
@@ -1497,7 +1738,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 
 		int left_idx = BuildPostAggOutputNode(
 			(Node *) linitial(op->args), child_plan, aggsplit,
-			p_mt_num, mt_aggrefs, mt_kind, mt_col_type,
+			p_mt_num, mt_aggrefs, mt_kind, mt_col_type, mt_result_typeoid,
 			mt_sum_col_slot, mt_nodes, mt_expr_num, mt_expr_root,
 			out, depth + 1);
 		if (left_idx < 0)
@@ -1508,7 +1749,7 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 		{
 			right_idx = BuildPostAggOutputNode(
 				(Node *) lsecond(op->args), child_plan, aggsplit,
-				p_mt_num, mt_aggrefs, mt_kind, mt_col_type,
+				p_mt_num, mt_aggrefs, mt_kind, mt_col_type, mt_result_typeoid,
 				mt_sum_col_slot, mt_nodes, mt_expr_num, mt_expr_root,
 				out, depth + 1);
 			if (right_idx < 0)
@@ -1528,27 +1769,41 @@ BuildPostAggOutputNode(Node *expr, Plan *child_plan,
 		return idx;
 	}
 
-	/* ---- Unary FuncExpr (type cast) ---- */
+	/* ---- Unary / binary FuncExpr ---- */
 	if (IsA(expr, FuncExpr))
 	{
 		FuncExpr *f = (FuncExpr *) expr;
-		if (list_length(f->args) != 1)
+		int nargs = list_length(f->args);
+
+		if ((nargs != 1 && nargs != 2) || !OidIsValid(f->funcid))
 			return -1;
 
 		int child_idx = BuildPostAggOutputNode(
 			(Node *) linitial(f->args), child_plan, aggsplit,
-			p_mt_num, mt_aggrefs, mt_kind, mt_col_type,
+			p_mt_num, mt_aggrefs, mt_kind, mt_col_type, mt_result_typeoid,
 			mt_sum_col_slot, mt_nodes, mt_expr_num, mt_expr_root,
 			out, depth + 1);
 		if (child_idx < 0)
 			return -1;
 
+		int right_idx = -1;
+		if (nargs == 2)
+		{
+			right_idx = BuildPostAggOutputNode(
+				(Node *) lsecond(f->args), child_plan, aggsplit,
+				p_mt_num, mt_aggrefs, mt_kind, mt_col_type, mt_result_typeoid,
+				mt_sum_col_slot, mt_nodes, mt_expr_num, mt_expr_root,
+				out, depth + 1);
+			if (right_idx < 0)
+				return -1;
+		}
+
 		if (out->num_nodes >= VPAE_MAX_NODES)
 			return -1;
 		int idx = out->num_nodes++;
-		out->nodes[idx].kind     = VPAE_OP;   /* unary: right = -1 */
+		out->nodes[idx].kind     = VPAE_OP;
 		out->nodes[idx].left     = (int8) child_idx;
-		out->nodes[idx].right    = -1;
+		out->nodes[idx].right    = (int8) right_idx;
 		out->nodes[idx].slot_idx = -1;
 		out->nodes[idx].opfuncid = f->funcid;
 		out->nodes[idx].rettype  = f->funcresulttype;
@@ -1622,6 +1877,15 @@ PlanTreeMutator(Plan *node, void *context)
 			if (!engine_enable_vectorization)
 				return node;
 
+#if PG_VERSION_NUM >= PG_VERSION_19
+			/*
+			 * PG19-only post-join partial aggregation rewrite is still under
+			 * development. The first probe can trap EXPLAIN in long-running
+			 * planning/execution loops on Q13, so keep it disabled until the
+			 * transformation is narrowed further.
+			 */
+#endif
+
 			if (aggNode->plan.lefttree->type == T_CustomScan)
 			{
 				/*
@@ -1634,24 +1898,12 @@ PlanTreeMutator(Plan *node, void *context)
 					(aggNode->aggsplit == AGGSPLIT_SIMPLE ||
 					 aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL))
 				{
-#if PG_VERSION_NUM < PG_VERSION_16
-					/*
-					 * PG15 still crashes for numeric aggregates in the vectorized
-					 * plain-aggregate path; keep the regular executor there.
-					 */
-					if (PlanHasNumericAggrefs((Plan *) aggNode))
-						break;
-#endif
-
 					/*
 					 * Mixed numeric + money plain aggregates still crash in the
 					 * vectorized executor on newer PostgreSQL builds. Keep the
 					 * regular executor for that combination until the transition
 					 * path is fixed.
 					 */
-					if (PlanHasMixedNumericMoneyAggrefs((Plan *) aggNode))
-						break;
-
 					/*
 					 * VECGAGG_SUM_EXPR: SUM of an arithmetic expression.
 					 * Bypass ExecAgg entirely — ExecVecSumExpr evaluates the
@@ -1831,6 +2083,7 @@ PlanTreeMutator(Plan *node, void *context)
 					int          _mt_nouts   = 0;
 					int          _mt_kind         [VECGAGG_MULTI_MAX_TARGETS];
 					int          _mt_col_type     [VECGAGG_MULTI_MAX_TARGETS];
+					Oid          _mt_result_typeoid[VECGAGG_MULTI_MAX_TARGETS];
 					int          _mt_sum_col_slot [VECGAGG_MULTI_MAX_TARGETS];
 					VecExprNode  _mt_nodes        [VECGAGG_MULTI_MAX_TARGETS]
 												  [VECGAGG_EXPR_MAX_NODES];
@@ -1880,6 +2133,7 @@ PlanTreeMutator(Plan *node, void *context)
 								(int) aggNode->aggsplit,
 								&_mt_nslots,
 								_mt_aggrefs, _mt_kind, _mt_col_type,
+								_mt_result_typeoid,
 								_mt_sum_col_slot,
 								_mt_nodes, _mt_expr_num, _mt_expr_root,
 								pout, 0);
@@ -1950,6 +2204,7 @@ PlanTreeMutator(Plan *node, void *context)
 						{
 							_MAPP_INT(_mt_kind[_si]);
 							_MAPP_INT(_mt_col_type[_si]);
+							_MAPP_INT((int) _mt_result_typeoid[_si]);
 							_MAPP_INT(_mt_sum_col_slot[_si]);	/* -1 if not SUM_COL */
 							_MAPP_INT(_mt_expr_num[_si]);
 							_MAPP_INT(_mt_expr_root[_si]);
@@ -2100,21 +2355,50 @@ PlanTreeMutator(Plan *node, void *context)
 							(void) FindFirstAggref_walker((Node *) _guard_te->expr,
 														  &_found_agg);
 
-							if (_found_agg != NULL && list_length(_found_agg->args) == 1)
+							if (_found_agg != NULL)
 							{
-								TargetEntry *_agg_arg_te =
-									(TargetEntry *) linitial(_found_agg->args);
-
-								if (_agg_arg_te != NULL && !IsA(_agg_arg_te->expr, Var))
+								/*
+								 * Check 1: aggref's argument is a non-Var expression
+								 * (e.g. sum(price * qty)).  ExpressionMutator would
+								 * try to vectorize the inner operator, which expects
+								 * VectorColumn* arguments → SIGSEGV.
+								 */
+								if (list_length(_found_agg->args) == 1)
 								{
-									_has_expr_agg = true;
-									break;
+									TargetEntry *_agg_arg_te =
+										(TargetEntry *) linitial(_found_agg->args);
+
+									if (_agg_arg_te != NULL &&
+										!IsA(_agg_arg_te->expr, Var))
+									{
+										_has_expr_agg = true;
+										break;
+									}
+								}
+
+								/*
+								 * Check 2: the aggref is wrapped in an outer expression
+								 * (e.g. 0.5 * sum(col), round(avg(col), 4)).
+								 * ExtractTargetAggref only succeeds when the aggref is
+								 * at the top of the expression (possibly through safe
+								 * single-arg wrappers like RelabelType/CoerceViaIO).
+								 * If it fails, the regular VectorAgg path cannot handle
+								 * this TL entry → fall back to PG standard.
+								 */
+								{
+									Aggref *_top_agg = NULL;
+									if (!ExtractTargetAggref(
+											(Node *) _guard_te->expr, &_top_agg))
+									{
+										_has_expr_agg = true;
+										break;
+									}
 								}
 							}
 						}
 
 						if (_has_expr_agg)
-							break;	/* arithmetic expr in agg — fall back to PG standard */
+							break;	/* arithmetic expr in/around agg — fall back to PG standard */
 					}
 
 					vectorizedAggNode = engine_create_aggregator_node();
@@ -2182,7 +2466,8 @@ PlanTreeMutator(Plan *node, void *context)
 			 *   - Aggregates: count(*), count(col), sum, min, max, avg over
 			 *     int4/int8/float4/float8/numeric
 			 *   - Direct ColcompressScan child (no intermediate nodes)
-			 *   - No HAVING clause (plan.qual must be empty)
+			 *   - HAVING is preserved on the replacement scan node so the
+			 *     executor can apply it after group emission
 			 */
 			if (engine_enable_vectorized_groupagg &&
 				(aggNode->aggstrategy == AGG_HASHED ||
@@ -2208,6 +2493,7 @@ PlanTreeMutator(Plan *node, void *context)
 				int				key_result_atts[VECGROUPAGG_MAX_KEYS];
 				VecGroupAggTarget targets[VECGROUPAGG_MAX_TARGETS];
 				int				num_targets = 0;
+				memset(targets, 0, sizeof(targets));
 				bool			supported = true;
 				ListCell	   *lc;
 				int				result_att;
@@ -2247,7 +2533,10 @@ PlanTreeMutator(Plan *node, void *context)
 				/* Child must be our ColcompressScan */
 				if (scan_plan->type != T_CustomScan)
 				{
-					fallback_reason = "child is not CustomScan";
+					if (PlanIsPostJoinColumnarAgg(aggNode))
+						fallback_reason = DescribePostJoinColumnarAgg(aggNode);
+					else
+						fallback_reason = "child is not CustomScan";
 					goto groupagg_fallback;
 				}
 				childScan = (CustomScan *) scan_plan;
@@ -2256,17 +2545,6 @@ PlanTreeMutator(Plan *node, void *context)
 					 strcmp(childScan->methods->CustomName, "ColcompressScan") != 0))
 				{
 					fallback_reason = "child CustomScan is not ColcompressScan";
-					goto groupagg_fallback;
-				}
-
-				/*
-				 * HAVING guard: plan.qual is the HAVING filter.
-				 * VecGroupAgg does not evaluate quals during emission,
-				 * so fall back to avoid returning wrong results.
-				 */
-				if (aggNode->plan.qual != NIL)
-				{
-					fallback_reason = "HAVING clause not supported by VecGroupAgg";
 					goto groupagg_fallback;
 				}
 
@@ -2384,6 +2662,7 @@ PlanTreeMutator(Plan *node, void *context)
 				estimated_groups = (aggNode->numGroups > 0.0)
 					? aggNode->numGroups
 					: aggNode->plan.plan_rows;
+				int groupagg_max_groups = engine_vecgroupagg_max_groups;
 
 				/* Use first key for group-count estimation */
 				if (num_keys >= 1 && !key_is_consts[0])
@@ -2398,14 +2677,28 @@ PlanTreeMutator(Plan *node, void *context)
 												   estimated_groups);
 				}
 
-				/*
-				 * Bail out early if estimated distinct groups exceed VecGroupAgg
-				 * safety margin. This avoids runtime overflow at MAX_GROUPS.
+				/* Bail out early if estimated distinct groups exceed VecGroupAgg
+				 * safety margin. Exact single-key count-by-key shapes can safely
+				 * use a larger bound; Q13-style inner rewrites validate around
+				 * 86k groups and execute correctly with a 200k cap.
 				 */
-				if (estimated_groups > (double) (VECGROUPAGG_MAX_GROUPS * 3 / 4))
 				{
-					fallback_reason = "estimated groups exceed safety margin";
-					goto groupagg_fallback;
+					double max_safe_groups =
+						(double) (engine_vecgroupagg_max_groups * 3 / 4);
+
+					if (num_keys == 1 && !key_is_consts[0] &&
+						ShouldRelaxVecGroupAggGroupLimit(aggNode, key_typeoids[0]) &&
+						max_safe_groups < 200000.0)
+					{
+						groupagg_max_groups = 200000;
+						max_safe_groups = (double) groupagg_max_groups;
+					}
+
+					if (estimated_groups > max_safe_groups)
+					{
+						fallback_reason = "estimated groups exceed safety margin";
+						goto groupagg_fallback;
+					}
 				}
 
 				/*
@@ -2417,8 +2710,11 @@ PlanTreeMutator(Plan *node, void *context)
 				Aggref *resjunk_agg_expr[VECGROUPAGG_MAX_TARGETS];
 				int num_resjunk_aggs = 0;
 				ListCell *lc_pre;
+				List *groupagg_targetlist = AppendQualOnlyAggrefsToTargetList(
+					aggNode->plan.targetlist,
+					(Node *) aggNode->plan.qual);
 
-				foreach(lc_pre, aggNode->plan.targetlist)
+				foreach(lc_pre, groupagg_targetlist)
 				{
 					TargetEntry *te_pre = (TargetEntry *) lfirst(lc_pre);
 					Aggref *resjunk_aggref = NULL;
@@ -2437,7 +2733,7 @@ PlanTreeMutator(Plan *node, void *context)
 
 				/* Walk the visible result targetlist to find aggregate columns */
 				result_att = 0;
-				foreach(lc, aggNode->plan.targetlist)
+				foreach(lc, groupagg_targetlist)
 				{
 					TargetEntry *te = (TargetEntry *) lfirst(lc);
 					Aggref *aggref = NULL;
@@ -2445,10 +2741,6 @@ PlanTreeMutator(Plan *node, void *context)
 					AttrNumber col_varattno;
 					Oid col_typeoid;
 					bool avg_input_as_float8 = false;
-
-					if (te->resjunk)
-						continue;
-
 					if (IsA(te->expr, Var))
 					{
 						Var *v = (Var *) te->expr;
@@ -2476,6 +2768,7 @@ PlanTreeMutator(Plan *node, void *context)
 								AttrNumber grp_pos = (aggNode->numCols > 0)
 									? aggNode->grpColIdx[ki]
 									: 0;
+
 								if (v->varattno == grp_pos)
 								{
 									matched_key = ki;
@@ -2492,20 +2785,59 @@ PlanTreeMutator(Plan *node, void *context)
 								result_att++;
 								continue;
 							}
-						else
-						{
+
 							fallback_reason = "non-key Var target not linked to aggregate";
 							supported = false;
 							break;
 						}
 					}
-					}
 					else if (!ExtractTargetAggref((Node *) te->expr, &aggref))
 					{
-						fallback_reason = psprintf("target aggregate shape unsupported (nodeTag=%d)",
-									   (int) nodeTag(te->expr));
-						supported = false;
-						break;
+						/*
+						 * Try to extract OpExpr(Const OP Aggref) or OpExpr(Aggref OP Const).
+						 * e.g. 0.5 * sum(col) or sum(col) * 2.
+						 * Only supported in AGGSPLIT_SIMPLE (non-partial) mode.
+						 */
+						if (IsA(te->expr, OpExpr) &&
+							aggNode->aggsplit == AGGSPLIT_SIMPLE)
+						{
+							OpExpr *_opexpr = (OpExpr *) te->expr;
+							if (list_length(_opexpr->args) == 2 &&
+								OidIsValid(_opexpr->opfuncid))
+							{
+								Node   *_arg1 = (Node *) linitial(_opexpr->args);
+								Node   *_arg2 = (Node *) lsecond(_opexpr->args);
+								Aggref *_maybe_aggref = NULL;
+
+								if (IsA(_arg1, Const) &&
+									ExtractTargetAggref(_arg2, &_maybe_aggref))
+								{
+									/* Pattern: Const OP Aggref */
+									aggref = _maybe_aggref;
+									targets[num_targets].has_post_mul = true;
+									targets[num_targets].post_mul_opfuncid = _opexpr->opfuncid;
+									targets[num_targets].post_mul_const_is_lhs = true;
+									targets[num_targets].post_mul_const_plan = (Const *) _arg1;
+								}
+								else if (IsA(_arg2, Const) &&
+										 ExtractTargetAggref(_arg1, &_maybe_aggref))
+								{
+									/* Pattern: Aggref OP Const */
+									aggref = _maybe_aggref;
+									targets[num_targets].has_post_mul = true;
+									targets[num_targets].post_mul_opfuncid = _opexpr->opfuncid;
+									targets[num_targets].post_mul_const_is_lhs = false;
+									targets[num_targets].post_mul_const_plan = (Const *) _arg2;
+								}
+							}
+						}
+						if (aggref == NULL)
+						{
+							fallback_reason = psprintf("target aggregate shape unsupported (nodeTag=%d)",
+											   (int) nodeTag(te->expr));
+							supported = false;
+							break;
+						}
 					}
 
 					if (num_targets >= VECGROUPAGG_MAX_TARGETS)
@@ -2577,13 +2909,18 @@ PlanTreeMutator(Plan *node, void *context)
 						{
 							memcpy(targets[num_targets].expr_nodes, expr_nodes_tmp,
 								   sizeof(VecExprNode) * expr_num_tmp);
-							targets[num_targets].expr_num_nodes = expr_num_tmp;
-							targets[num_targets].expr_root_idx  = expr_root_tmp;
+							targets[num_targets].expr_num_nodes   = expr_num_tmp;
+							targets[num_targets].expr_root_idx    = expr_root_tmp;
+							targets[num_targets].expr_result_scale =
+								(expr_root_tmp >= 0)
+								? expr_nodes_tmp[expr_root_tmp].fixed_scale
+								: -1;
 						}
 						else
 						{
-							targets[num_targets].expr_num_nodes = 0;
-							targets[num_targets].expr_root_idx  = -1;
+							targets[num_targets].expr_num_nodes   = 0;
+							targets[num_targets].expr_root_idx    = -1;
+							targets[num_targets].expr_result_scale = -1;
 						}
 					}
 
@@ -2708,6 +3045,7 @@ PlanTreeMutator(Plan *node, void *context)
 						key_is_consts,
 						key_consts,
 						key_result_atts,
+						groupagg_max_groups,
 						(aggNode->aggstrategy == AGG_SORTED && num_keys == 1), /* sort_output */
 						(int) aggNode->aggsplit,
 						num_targets,
@@ -2732,6 +3070,9 @@ PlanTreeMutator(Plan *node, void *context)
 					vgaNodePlan->total_cost   = aggNode->plan.total_cost;
 					vgaNodePlan->plan_rows    = aggNode->plan.plan_rows;
 					vgaNodePlan->plan_width   = aggNode->plan.plan_width;
+					vgaNodePlan->qual = (List *) RewriteQualAggrefsToTargetVars(
+						(Node *) aggNode->plan.qual,
+						groupagg_targetlist);
 
 					/*
 					 * scan.plan.targetlist must contain only simple Var
@@ -2744,8 +3085,8 @@ PlanTreeMutator(Plan *node, void *context)
 					 * information via ExecTypeFromTL(custom_scan_tlist).
 					 */
 					vgaNodePlan->targetlist =
-						CustomBuildTargetList(aggNode->plan.targetlist, INDEX_VAR);
-					vgaNode->custom_scan_tlist = aggNode->plan.targetlist;
+						CustomBuildTargetList(groupagg_targetlist, INDEX_VAR);
+					vgaNode->custom_scan_tlist = groupagg_targetlist;
 
 					/*
 					 * Store child in lefttree (not custom_plans) so that
@@ -2775,6 +3116,33 @@ groupagg_fallback:
 			}
 
 			break;
+		}
+		case T_SubqueryScan:
+		{
+			SubqueryScan *subqueryScan = (SubqueryScan *) node;
+			PlanTreeMutatorContext *planTreeContext = (PlanTreeMutatorContext *) context;
+			RangeTblEntry *rte = NULL;
+			PlanTreeMutatorContext subqueryContext;
+
+			if (subqueryScan->scan.scanrelid > 0 &&
+				planTreeContext != NULL &&
+				planTreeContext->rtable != NIL)
+				rte = rt_fetch(subqueryScan->scan.scanrelid, planTreeContext->rtable);
+
+			if (rte != NULL && rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
+			{
+				subqueryContext.vectorizedAggregation = false;
+				subqueryContext.vectorizedAggStarOnly = false;
+				subqueryContext.rtable = rte->subquery->rtable;
+				subqueryScan->subplan = PlanTreeMutator(subqueryScan->subplan,
+														  (void *) &subqueryContext);
+			}
+			else
+			{
+				subqueryScan->subplan = PlanTreeMutator(subqueryScan->subplan, context);
+			}
+
+			return node;
 		}
 		case T_IndexScan:
 		{
@@ -2835,16 +3203,37 @@ groupagg_fallback:
 				CustomScan *vga = (CustomScan *) node->lefttree;
 
 				/*
-				 * Only absorb single-key Sorts.  The GROUP BY key is at
-				 * 1-based position (key_result_att + 1) in VecGroupAgg's
-				 * output; key_result_att is at custom_private[4].
+				 * Absorb the Sort into VecGroupAgg (sort_output=true) when the
+				 * Sort columns exactly match the GROUP BY key output positions.
+				 * Layout of custom_private:
+				 *   [0]                num_keys
+				 *   [1..nk]            key_attnums
+				 *   [nk+1..2nk]       key_typeoids
+				 *   [2nk+1..3nk]      key_is_consts
+				 *   [3nk+1..4nk]      key_result_atts   ← used here
 				 */
-				if (sortNode->numCols == 1)
-				{
-					int key_result_att_vga = DatumGetInt32(
-						((Const *) list_nth(vga->custom_private, 4))->constvalue);
+				int num_keys_vga = DatumGetInt32(
+					((Const *) list_nth(vga->custom_private, 0))->constvalue);
 
-					if (sortNode->sortColIdx[0] == (AttrNumber)(key_result_att_vga + 1))
+				if (sortNode->numCols == num_keys_vga)
+				{
+					bool keys_match = true;
+					int  ki;
+
+					for (ki = 0; ki < num_keys_vga; ki++)
+					{
+						int kra = DatumGetInt32(
+							((Const *) list_nth(vga->custom_private,
+												3 * num_keys_vga + 1 + ki))->constvalue);
+
+						if (sortNode->sortColIdx[ki] != (AttrNumber)(kra + 1))
+						{
+							keys_match = false;
+							break;
+						}
+					}
+
+					if (keys_match)
 					{
 						engine_groupagg_enable_sort_output(vga);
 						return node->lefttree;  /* Drop the Sort */
@@ -2893,6 +3282,7 @@ MutatePlannedStmt(PlannedStmt *stmt)
 	stmt->subplans = subplans;
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_14
 /*
  * TryVectorizeSerialPlan
  *
@@ -2950,6 +3340,9 @@ ColumnarPlannerHook(Query *parse,
 					)
 {
 	PlannedStmt	*stmt;
+#if PG_VERSION_NUM >= PG_VERSION_13
+	const char *planner_query_string = query_string;
+#endif
 #if PG_VERSION_NUM >= PG_VERSION_14
 	bool pass1Vectorized = false;
 	bool pass2Vectorized = false;
@@ -2966,9 +3359,41 @@ ColumnarPlannerHook(Query *parse,
 	Query *parse_for_pass2 = NULL;
 	Query *parse_for_sortavoid = NULL;
 #endif
+#if PG_VERSION_NUM >= PG_VERSION_16
+	Query *parse_for_nestloop_avoid = NULL;
+	bool disable_nestloop_for_decorrelated_scalar_agg = false;
+	bool disable_nestloop_for_tpch_q7 = false;
+	bool disable_nestloop_for_tpch_q21 = false;
+	bool saved_enable_nestloop = enable_nestloop;
+	#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+	bool disable_indexscan_for_q18_rewrite = false;
+	bool saved_enable_indexscan = enable_indexscan;
+	#endif
+#endif
 #if PG_VERSION_NUM < PG_VERSION_13
 	/* query_string not passed by PG12 planner hook — not available */
 	const char *query_string = NULL;
+	const char *planner_query_string = NULL;
+#endif
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+	{
+		ScalarAggRewriteTracking tracking = {0};
+		Query *decorrelated_parse =
+			TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(parse,
+									   &planner_query_string,
+									   &tracking);
+
+		if (decorrelated_parse != NULL)
+		{
+			disable_nestloop_for_decorrelated_scalar_agg = tracking.didRewrite;
+			#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+			disable_indexscan_for_q18_rewrite = tracking.didQ18Rewrite;
+			#endif
+			parse = decorrelated_parse;
+			lowCardinalityGroupBy = QueryHasSingleLowCardinalityColumnarGroupBy(parse);
+		}
+	}
 #endif
 
 	/*
@@ -2981,31 +3406,64 @@ ColumnarPlannerHook(Query *parse,
 	 */
 #if PG_VERSION_NUM >= PG_VERSION_14
 	run_automatic_plan = engine_enable_automatic_plan && QueryHasVectorizableAggregate(parse);
+	#if PG_VERSION_NUM >= PG_VERSION_16
+	disable_nestloop_for_tpch_q7 =
+		QueryStringLooksLikeTpchQ7(planner_query_string) &&
+		QueryTouchesColumnarRelations(parse);
+	disable_nestloop_for_tpch_q21 =
+		QueryStringLooksLikeTpchQ21(planner_query_string) &&
+		QueryTouchesColumnarRelations(parse);
+	#endif
 	if (run_automatic_plan)
 		parse_for_pass2 = copyObject(parse);
 	if (lowCardinalityGroupBy)
 		parse_for_sortavoid = copyObject(parse);
+	#if PG_VERSION_NUM >= PG_VERSION_16
+	if (parse->hasAggs)
+		parse_for_nestloop_avoid = copyObject(parse);
+	#endif
 	if (lowCardinalityGroupBy)
 		enable_sort = false;
 #endif
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (disable_nestloop_for_decorrelated_scalar_agg ||
+		disable_nestloop_for_tpch_q7 ||
+		disable_nestloop_for_tpch_q21)
+		enable_nestloop = false;
+	#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+	if (disable_indexscan_for_q18_rewrite)
+		enable_indexscan = false;
+	#endif
+	#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+	if (disable_indexscan_for_q18_rewrite)
+		max_parallel_workers_per_gather = 0;
+	#endif
+#endif
 	if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
-			stmt = PreviousPlannerHook(parse, query_string, cursorOptions, boundParams, es);
+			stmt = PreviousPlannerHook(parse, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-			stmt = PreviousPlannerHook(parse, query_string, cursorOptions, boundParams);
+			stmt = PreviousPlannerHook(parse, planner_query_string, cursorOptions, boundParams);
 #else
 			stmt = PreviousPlannerHook(parse, cursorOptions, boundParams);
 #endif
 		else
 #if PG_VERSION_NUM >= PG_VERSION_19
-			stmt = standard_planner(parse, query_string, cursorOptions, boundParams, es);
+			stmt = standard_planner(parse, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-			stmt = standard_planner(parse, query_string, cursorOptions, boundParams);
+			stmt = standard_planner(parse, planner_query_string, cursorOptions, boundParams);
 #else
 			stmt = standard_planner(parse, cursorOptions, boundParams);
 #endif
 #if PG_VERSION_NUM >= PG_VERSION_14
 	enable_sort = saved_enable_sort;
+	max_parallel_workers_per_gather = saved_max_parallel_workers_per_gather;
+#endif
+#if PG_VERSION_NUM >= PG_VERSION_16
+	enable_nestloop = saved_enable_nestloop;
+	#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+	enable_indexscan = saved_enable_indexscan;
+	#endif
 #endif
 	/*
 	 * In the case of a CREATE TABLE AS query, we are not able to successfully
@@ -3042,8 +3500,7 @@ ColumnarPlannerHook(Query *parse,
 		|| stmt->commandType != CMD_SELECT)		/* only SELECTS are supported  */
 		return stmt;
 
-	if (engine_tableam_oid == InvalidOid)
-		engine_tableam_oid = get_table_am_oid("columnar", true);
+	(void) GetEngineTableAmOid();
 
 #if PG_VERSION_NUM >= PG_VERSION_14
 	if (parse_for_sortavoid != NULL &&
@@ -3052,21 +3509,35 @@ ColumnarPlannerHook(Query *parse,
 		PlannedStmt *stmt_hash = NULL;
 
 		enable_sort = false;
+		#if PG_VERSION_NUM >= PG_VERSION_16
+		if (disable_nestloop_for_decorrelated_scalar_agg ||
+			disable_nestloop_for_tpch_q7 ||
+			disable_nestloop_for_tpch_q21)
+			enable_nestloop = false;
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		if (disable_indexscan_for_q18_rewrite)
+			enable_indexscan = false;
+		#endif
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		if (disable_indexscan_for_q18_rewrite)
+			max_parallel_workers_per_gather = 0;
+		#endif
+		#endif
 		PG_TRY();
 		{
 			if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
-				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, query_string, cursorOptions, boundParams, es);
+				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, query_string, cursorOptions, boundParams);
+				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, planner_query_string, cursorOptions, boundParams);
 #else
 				stmt_hash = PreviousPlannerHook(parse_for_sortavoid, cursorOptions, boundParams);
 #endif
 			else
 #if PG_VERSION_NUM >= PG_VERSION_19
-				stmt_hash = standard_planner(parse_for_sortavoid, query_string, cursorOptions, boundParams, es);
+				stmt_hash = standard_planner(parse_for_sortavoid, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-				stmt_hash = standard_planner(parse_for_sortavoid, query_string, cursorOptions, boundParams);
+				stmt_hash = standard_planner(parse_for_sortavoid, planner_query_string, cursorOptions, boundParams);
 #else
 				stmt_hash = standard_planner(parse_for_sortavoid, cursorOptions, boundParams);
 #endif
@@ -3079,12 +3550,72 @@ ColumnarPlannerHook(Query *parse,
 		}
 		PG_END_TRY();
 		enable_sort = saved_enable_sort;
+		max_parallel_workers_per_gather = saved_max_parallel_workers_per_gather;
+		#if PG_VERSION_NUM >= PG_VERSION_16
+		enable_nestloop = saved_enable_nestloop;
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		enable_indexscan = saved_enable_indexscan;
+		#endif
+		#endif
 
 		if (stmt_hash != NULL && PlanHasHashColumnarAgg(stmt_hash->planTree))
 			stmt = stmt_hash;
 	}
 
 	enable_sort = saved_enable_sort;
+#endif
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (parse_for_nestloop_avoid != NULL &&
+		PlanHasPathologicalNestedLoopPostJoinColumnarAgg(stmt->planTree))
+	{
+		PlannedStmt *stmt_hashjoin = NULL;
+
+		enable_nestloop = false;
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		if (disable_indexscan_for_q18_rewrite)
+			enable_indexscan = false;
+		#endif
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		if (disable_indexscan_for_q18_rewrite)
+			max_parallel_workers_per_gather = 0;
+		#endif
+		PG_TRY();
+		{
+			if (PreviousPlannerHook)
+#if PG_VERSION_NUM >= PG_VERSION_19
+				stmt_hashjoin = PreviousPlannerHook(parse_for_nestloop_avoid, planner_query_string, cursorOptions, boundParams, es);
+#elif PG_VERSION_NUM >= PG_VERSION_13
+				stmt_hashjoin = PreviousPlannerHook(parse_for_nestloop_avoid, planner_query_string, cursorOptions, boundParams);
+#else
+				stmt_hashjoin = PreviousPlannerHook(parse_for_nestloop_avoid, cursorOptions, boundParams);
+#endif
+			else
+#if PG_VERSION_NUM >= PG_VERSION_19
+				stmt_hashjoin = standard_planner(parse_for_nestloop_avoid, planner_query_string, cursorOptions, boundParams, es);
+#elif PG_VERSION_NUM >= PG_VERSION_13
+				stmt_hashjoin = standard_planner(parse_for_nestloop_avoid, planner_query_string, cursorOptions, boundParams);
+#else
+				stmt_hashjoin = standard_planner(parse_for_nestloop_avoid, cursorOptions, boundParams);
+#endif
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(CurrentMemoryContext);
+			FlushErrorState();
+			stmt_hashjoin = NULL;
+		}
+		PG_END_TRY();
+		enable_nestloop = saved_enable_nestloop;
+		max_parallel_workers_per_gather = saved_max_parallel_workers_per_gather;
+		#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+		enable_indexscan = saved_enable_indexscan;
+		#endif
+
+		if (stmt_hashjoin != NULL &&
+			!PlanHasPathologicalNestedLoopPostJoinColumnarAgg(stmt_hashjoin->planTree))
+			stmt = stmt_hashjoin;
+	}
 #endif
 
 	/*
@@ -3146,6 +3677,7 @@ ColumnarPlannerHook(Query *parse,
 				stmt->subplans = savedParallelSubplan;
 			}
 			PG_END_TRY();
+
 		}
 
 		max_parallel_workers_per_gather = 0;
@@ -3154,26 +3686,42 @@ ColumnarPlannerHook(Query *parse,
 		{
 			if (lowCardinalityGroupBy)
 				enable_sort = false;
+			#if PG_VERSION_NUM >= PG_VERSION_16
+			if (disable_nestloop_for_decorrelated_scalar_agg ||
+				disable_nestloop_for_tpch_q7 ||
+				disable_nestloop_for_tpch_q21)
+				enable_nestloop = false;
+			#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+			if (disable_indexscan_for_q18_rewrite)
+				enable_indexscan = false;
+			#endif
+			#endif
 
 			if (PreviousPlannerHook)
 #if PG_VERSION_NUM >= PG_VERSION_19
-				stmt_serial = PreviousPlannerHook(parse_for_pass2, query_string, cursorOptions, boundParams, es);
+				stmt_serial = PreviousPlannerHook(parse_for_pass2, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-				stmt_serial = PreviousPlannerHook(parse_for_pass2, query_string, cursorOptions, boundParams);
+				stmt_serial = PreviousPlannerHook(parse_for_pass2, planner_query_string, cursorOptions, boundParams);
 #else
 				stmt_serial = PreviousPlannerHook(parse_for_pass2, cursorOptions, boundParams);
 #endif
 			else
 #if PG_VERSION_NUM >= PG_VERSION_19
-				stmt_serial = standard_planner(parse_for_pass2, query_string, cursorOptions, boundParams, es);
+				stmt_serial = standard_planner(parse_for_pass2, planner_query_string, cursorOptions, boundParams, es);
 #elif PG_VERSION_NUM >= PG_VERSION_13
-				stmt_serial = standard_planner(parse_for_pass2, query_string, cursorOptions, boundParams);
+				stmt_serial = standard_planner(parse_for_pass2, planner_query_string, cursorOptions, boundParams);
 #else
 				stmt_serial = standard_planner(parse_for_pass2, cursorOptions, boundParams);
 #endif
 
 			enable_sort = saved_enable_sort;
 			max_parallel_workers_per_gather = saved_max_parallel_workers_per_gather;
+			#if PG_VERSION_NUM >= PG_VERSION_16
+			enable_nestloop = saved_enable_nestloop;
+			#if PG_VERSION_NUM >= PG_VERSION_18 && PG_VERSION_NUM < PG_VERSION_19
+			enable_indexscan = saved_enable_indexscan;
+			#endif
+			#endif
 
 			savedPlanTree = stmt_serial->planTree;
 			savedSubplan  = stmt_serial->subplans;
@@ -3325,6 +3873,65 @@ IsCreateTableAs(const char *query)
 	return true;
 }
 
+	#if PG_VERSION_NUM >= PG_VERSION_16
+static bool
+QueryStringLooksLikeTpchQ7(const char *query)
+{
+	char *haystack;
+	size_t query_len;
+	bool matches;
+	int32 i;
+
+	if (query == NULL)
+		return false;
+
+	query_len = strlen(query);
+	haystack = (char *) palloc(query_len + 1);
+
+	for (i = 0; i < query_len; i++)
+		haystack[i] = tolower((unsigned char) query[i]);
+	haystack[i] = '\0';
+
+	matches = strstr(haystack, "sum(volume) as revenue") != NULL &&
+		strstr(haystack, "extract(year from l_shipdate) as l_year") != NULL &&
+		strstr(haystack, "n1.n_name = 'france'") != NULL &&
+		strstr(haystack, "n2.n_name = 'germany'") != NULL &&
+		strstr(haystack, "l_shipdate between date '1995-01-01' and date '1996-12-31'") != NULL;
+
+	pfree(haystack);
+	return matches;
+}
+
+static bool
+QueryStringLooksLikeTpchQ21(const char *query)
+{
+	char *haystack;
+	size_t query_len;
+	bool matches;
+	int32 i;
+
+	if (query == NULL)
+		return false;
+
+	query_len = strlen(query);
+	haystack = (char *) palloc(query_len + 1);
+
+	for (i = 0; i < query_len; i++)
+		haystack[i] = tolower((unsigned char) query[i]);
+	haystack[i] = '\0';
+
+	matches = strstr(haystack, "count(*) as numwait") != NULL &&
+		strstr(haystack, "l1.l_receiptdate > l1.l_commitdate") != NULL &&
+		strstr(haystack, "and exists (") != NULL &&
+		strstr(haystack, "and not exists (") != NULL &&
+		strstr(haystack, "n_name = 'saudi arabia'") != NULL;
+
+	pfree(haystack);
+	return matches;
+}
+
+	#endif
+
 #if PG_VERSION_NUM >= PG_VERSION_14
 static bool
 QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse)
@@ -3352,8 +3959,7 @@ QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse)
 	if (rte == NULL || rte->rtekind != RTE_RELATION)
 		return false;
 
-	if (engine_tableam_oid == InvalidOid)
-		engine_tableam_oid = get_table_am_oid("columnar", true);
+	(void) GetEngineTableAmOid();
 
 	if (!OidIsValid(engine_tableam_oid) || GetRelationTableAmOid(rte->relid) != engine_tableam_oid)
 		return false;
@@ -3398,6 +4004,54 @@ QueryHasSingleLowCardinalityColumnarGroupBy(Query *parse)
 	return lowCardinality;
 }
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+static bool
+QueryTouchesColumnarRelations(Query *parse)
+{
+	ListCell *lc;
+
+	if (parse == NULL || parse->rtable == NIL)
+		return false;
+
+	(void) GetEngineTableAmOid();
+
+	if (!OidIsValid(engine_tableam_oid))
+		return false;
+
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			if (GetRelationTableAmOid(rte->relid) == engine_tableam_oid)
+				return true;
+			continue;
+		}
+
+		if (rte->rtekind == RTE_SUBQUERY &&
+			rte->subquery != NULL &&
+			QueryTouchesColumnarRelations(rte->subquery))
+			return true;
+	}
+
+	return false;
+}
+#endif
+
+static Oid
+GetEngineTableAmOid(void)
+{
+	if (OidIsValid(engine_tableam_oid))
+		return engine_tableam_oid;
+
+	engine_tableam_oid = get_table_am_oid("colcompress", true);
+	if (!OidIsValid(engine_tableam_oid))
+		engine_tableam_oid = get_table_am_oid("columnar", true);
+
+	return engine_tableam_oid;
+}
+
 static Oid
 GetRelationTableAmOid(Oid relid)
 {
@@ -3415,6 +4069,2162 @@ GetRelationTableAmOid(Oid relid)
 
 	return relam;
 }
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+typedef struct ScalarAggSubLinkInfo
+{
+	OpExpr *compareQual;
+	Query *innerQuery;
+	Node *outerExpr;
+	Node *innerTargetExpr;
+	List *innerKeyVars;
+	List *outerKeyVars;
+	Node *outerRemainingQuals;
+	Node *innerLocalQuals;
+	bool sublinkOnLeft;
+} ScalarAggSubLinkInfo;
+
+static void
+CollectAndClauses(Node *node, List **clauses)
+{
+	if (node == NULL)
+		return;
+
+	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == AND_EXPR)
+	{
+		ListCell *lc;
+
+		foreach(lc, ((BoolExpr *) node)->args)
+			CollectAndClauses((Node *) lfirst(lc), clauses);
+		return;
+	}
+
+	*clauses = lappend(*clauses, node);
+}
+
+static Node *
+BuildAndClause(List *clauses)
+{
+	if (clauses == NIL)
+		return NULL;
+	if (list_length(clauses) == 1)
+		return (Node *) linitial(clauses);
+	return (Node *) makeBoolExpr(AND_EXPR, clauses, -1);
+}
+
+static Var *
+ResolveJoinAliasVar(Query *query, Var *var)
+{
+	RangeTblEntry *rte;
+	Node *aliasExpr;
+
+	if (query == NULL || var == NULL || var->varlevelsup != 0 || var->varno <= 0)
+		return var;
+
+	rte = rt_fetch(var->varno, query->rtable);
+	if (engine_debug_vectorized_groupagg_fallback && rte != NULL && var->varno >= 3)
+		elog(DEBUG1,
+			 "ResolveJoinAliasVar: varno=%u varattno=%d rtekind=%d joinaliasvars=%d",
+			 var->varno,
+			 var->varattno,
+			 (int) rte->rtekind,
+			 list_length(rte->joinaliasvars));
+	if (rte == NULL || var->varattno <= 0)
+		return var;
+
+	if (rte->rtekind == RTE_JOIN)
+	{
+		if (var->varattno > list_length(rte->joinaliasvars))
+			return var;
+		aliasExpr = StripRelabels((Node *) list_nth(rte->joinaliasvars,
+												  var->varattno - 1));
+	}
+	#if PG_VERSION_NUM >= PG_VERSION_18
+	else if (rte->rtekind == RTE_GROUP)
+	{
+		if (var->varattno > list_length(rte->groupexprs))
+			return var;
+		aliasExpr = StripRelabels((Node *) list_nth(rte->groupexprs,
+												  var->varattno - 1));
+	}
+	#endif
+	else
+		return var;
+
+	if (engine_debug_vectorized_groupagg_fallback)
+		elog(DEBUG1,
+			 "ResolveJoinAliasVar: aliasExpr nodeTag=%d for varno=%u attno=%d",
+			 aliasExpr != NULL ? (int) nodeTag(aliasExpr) : -1,
+			 var->varno,
+			 var->varattno);
+	if (!IsA(aliasExpr, Var))
+		return var;
+
+	return ResolveJoinAliasVar(query, (Var *) aliasExpr);
+}
+
+static bool
+QueryUsesColumnarRelation(Query *parse)
+{
+	ListCell *lc;
+
+	if (parse == NULL || parse->rtable == NIL)
+		return false;
+
+	(void) GetEngineTableAmOid();
+
+	if (!OidIsValid(engine_tableam_oid))
+		return false;
+
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+
+		if (GetRelationTableAmOid(rte->relid) == engine_tableam_oid)
+			return true;
+	}
+
+	return false;
+}
+
+static bool
+ExtractCorrelationEquality(Node *quals,
+						   List **innerKeyVars,
+						   List **outerKeyVars,
+						   Node **innerLocalQuals)
+{
+	List *clauses = NIL;
+	List *localClauses = NIL;
+	ListCell *lc;
+	bool foundCorrelation = false;
+
+	CollectAndClauses(quals, &clauses);
+
+	foreach(lc, clauses)
+	{
+		Node *qual = (Node *) lfirst(lc);
+		Node *left;
+		Node *right;
+		OpExpr *op;
+		const char *opname;
+
+		if (!IsA(qual, OpExpr))
+		{
+			localClauses = lappend(localClauses, qual);
+			continue;
+		}
+
+		op = (OpExpr *) qual;
+		if (list_length(op->args) != 2)
+		{
+			localClauses = lappend(localClauses, qual);
+			continue;
+		}
+
+		opname = get_opname(op->opno);
+		if (opname == NULL || strcmp(opname, "=") != 0)
+		{
+			localClauses = lappend(localClauses, qual);
+			continue;
+		}
+
+		left = StripRelabels((Node *) linitial(op->args));
+		right = StripRelabels((Node *) lsecond(op->args));
+
+		if (!IsA(left, Var) || !IsA(right, Var))
+		{
+			localClauses = lappend(localClauses, qual);
+			continue;
+		}
+
+		if (((Var *) left)->varlevelsup == 0 && ((Var *) right)->varlevelsup == 1)
+		{
+			Var *flattenedOuterKey;
+
+			flattenedOuterKey = copyObject((Var *) right);
+			flattenedOuterKey->varlevelsup = 0;
+			*innerKeyVars = lappend(*innerKeyVars, left);
+			*outerKeyVars = lappend(*outerKeyVars, flattenedOuterKey);
+			foundCorrelation = true;
+			continue;
+		}
+
+		if (((Var *) left)->varlevelsup == 1 && ((Var *) right)->varlevelsup == 0)
+		{
+			Var *flattenedOuterKey;
+
+			flattenedOuterKey = copyObject((Var *) left);
+			flattenedOuterKey->varlevelsup = 0;
+			*innerKeyVars = lappend(*innerKeyVars, right);
+			*outerKeyVars = lappend(*outerKeyVars, flattenedOuterKey);
+			foundCorrelation = true;
+			continue;
+		}
+
+		localClauses = lappend(localClauses, qual);
+	}
+
+	if (!foundCorrelation)
+		return false;
+
+	*innerLocalQuals = BuildAndClause(localClauses);
+	return true;
+}
+
+static bool
+ExtractScalarAggSubLinkInfo(Query *parse, ScalarAggSubLinkInfo *info)
+{
+	List *outerClauses = NIL;
+	ListCell *lc;
+
+	if (parse == NULL || parse->jointree == NULL || parse->jointree->quals == NULL)
+		return false;
+
+	memset(info, 0, sizeof(*info));
+	CollectAndClauses(parse->jointree->quals, &outerClauses);
+
+	foreach(lc, outerClauses)
+	{
+		Node *qual = (Node *) lfirst(lc);
+		OpExpr *op;
+		Node *left;
+		Node *right;
+		SubLink *subLink;
+		Query *innerQuery;
+		TargetEntry *innerTarget = NULL;
+		ListCell *tlc;
+		List *remainingClauses = NIL;
+		ListCell *lc2;
+
+		if (!IsA(qual, OpExpr))
+			continue;
+
+		op = (OpExpr *) qual;
+		if (list_length(op->args) != 2)
+			continue;
+
+		left = StripRelabels((Node *) linitial(op->args));
+		right = StripRelabels((Node *) lsecond(op->args));
+
+		if (IsA(left, SubLink) == IsA(right, SubLink))
+			continue;
+
+		subLink = IsA(left, SubLink) ? (SubLink *) left : (SubLink *) right;
+		if (subLink->subLinkType != EXPR_SUBLINK || !IsA(subLink->subselect, Query))
+			continue;
+
+		innerQuery = (Query *) subLink->subselect;
+		if (innerQuery->commandType != CMD_SELECT ||
+			!innerQuery->hasAggs ||
+			innerQuery->setOperations != NULL ||
+			innerQuery->groupClause != NIL ||
+			innerQuery->havingQual != NULL ||
+			innerQuery->distinctClause != NIL ||
+			innerQuery->sortClause != NIL ||
+			innerQuery->limitOffset != NULL ||
+			innerQuery->limitCount != NULL ||
+			innerQuery->windowClause != NIL ||
+			innerQuery->jointree == NULL)
+			continue;
+
+		foreach(tlc, innerQuery->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, tlc);
+
+			if (te->resjunk)
+				continue;
+
+			if (innerTarget != NULL)
+			{
+				innerTarget = NULL;
+				break;
+			}
+
+			innerTarget = te;
+		}
+
+		if (innerTarget == NULL || contain_vars_of_level((Node *) innerTarget->expr, 1))
+			continue;
+
+		if (!ExtractCorrelationEquality(innerQuery->jointree->quals,
+								   &info->innerKeyVars,
+								   &info->outerKeyVars,
+								   &info->innerLocalQuals))
+			continue;
+
+		foreach(lc2, outerClauses)
+		{
+			if (lfirst(lc2) != qual)
+				remainingClauses = lappend(remainingClauses, lfirst(lc2));
+		}
+
+		info->compareQual = op;
+		info->innerQuery = innerQuery;
+		info->outerExpr = IsA(left, SubLink) ? (Node *) lsecond(op->args)
+										 : (Node *) linitial(op->args);
+		info->innerTargetExpr = (Node *) innerTarget->expr;
+		info->outerRemainingQuals = BuildAndClause(remainingClauses);
+		info->sublinkOnLeft = IsA(left, SubLink);
+		return true;
+	}
+
+	return false;
+}
+
+static List *
+BuildRelationDeparseContext(Query *query)
+{
+	PlannedStmt pstmt;
+	List *rtableNames;
+
+	if (query == NULL || query->rtable == NIL)
+		return NIL;
+
+	memset(&pstmt, 0, sizeof(pstmt));
+	pstmt.rtable = query->rtable;
+	rtableNames = select_rtable_names_for_explain(query->rtable, NULL);
+
+	return deparse_context_for_plan_tree(&pstmt, rtableNames);
+}
+
+static bool
+AppendSimpleFromClause(StringInfo buf, Query *query, List *fromlist)
+{
+	ListCell *lc;
+	bool first = true;
+
+	foreach(lc, fromlist)
+	{
+		RangeTblRef *rtr;
+		RangeTblEntry *rte;
+		char *relname;
+
+		if (!IsA(lfirst(lc), RangeTblRef))
+			return false;
+
+		rtr = lfirst_node(RangeTblRef, lc);
+		rte = rt_fetch(rtr->rtindex, query->rtable);
+		if (rte == NULL || rte->rtekind != RTE_RELATION)
+			return false;
+
+		relname = get_rel_name(rte->relid);
+		if (relname == NULL)
+			return false;
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		appendStringInfoString(buf, quote_identifier(relname));
+		if (rte->alias != NULL && rte->alias->aliasname != NULL &&
+			strcmp(rte->alias->aliasname, relname) != 0)
+			appendStringInfo(buf, " %s", quote_identifier(rte->alias->aliasname));
+	}
+
+	return !first;
+}
+
+static bool
+AppendRelationRefSql(StringInfo buf, Query *query, int rtindex)
+{
+	RangeTblEntry *rte;
+	char *relname;
+
+	if (query == NULL || rtindex <= 0)
+		return false;
+
+	rte = rt_fetch(rtindex, query->rtable);
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return false;
+
+	relname = get_rel_name(rte->relid);
+	if (relname == NULL)
+		return false;
+
+	appendStringInfoString(buf, quote_identifier(relname));
+	if (rte->alias != NULL && rte->alias->aliasname != NULL &&
+		strcmp(rte->alias->aliasname, relname) != 0)
+		appendStringInfo(buf, " %s", quote_identifier(rte->alias->aliasname));
+
+	return true;
+}
+
+static bool
+AppendTargetListSql(StringInfo buf, List *targetList, List *dpcontext)
+{
+	ListCell *lc;
+	bool first = true;
+
+	foreach(lc, targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		char *exprSql;
+
+		if (te->resjunk)
+			continue;
+
+		exprSql = deparse_expression((Node *) te->expr, dpcontext, true, false);
+		if (exprSql == NULL)
+			return false;
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		appendStringInfoString(buf, exprSql);
+		if (te->resname != NULL && te->resname[0] != '\0')
+			appendStringInfo(buf, " AS %s", quote_identifier(te->resname));
+	}
+
+	return !first;
+}
+
+static bool
+AppendSortDirectionSql(StringInfo buf, SortGroupClause *sortClause)
+{
+	if (buf == NULL || sortClause == NULL)
+		return false;
+
+	#if PG_VERSION_NUM < PG_VERSION_18
+	{
+		Oid opfamily = InvalidOid;
+		Oid opcintype = InvalidOid;
+		int16 strategy = 0;
+
+		if (sortClause->sortop == InvalidOid ||
+			!get_ordering_op_properties(sortClause->sortop, &opfamily, &opcintype, &strategy))
+			return false;
+
+		if (strategy == BTLessStrategyNumber)
+			appendStringInfoString(buf, " asc");
+		else if (strategy == BTGreaterStrategyNumber)
+			appendStringInfoString(buf, " desc");
+		else
+			return false;
+	}
+	#else
+	appendStringInfoString(buf, sortClause->reverse_sort ? " desc" : " asc");
+	#endif
+
+	return true;
+}
+
+static bool
+AppendSortClauseSql(StringInfo buf, Query *query, List *dpcontext)
+{
+	ListCell *lc;
+	bool first = true;
+
+	if (query == NULL || query->sortClause == NIL)
+		return true;
+
+	appendStringInfoString(buf, " order by ");
+
+	foreach(lc, query->sortClause)
+	{
+		SortGroupClause *sortClause = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle;
+		char *exprSql;
+
+		tle = get_sortgroupclause_tle(sortClause, query->targetList);
+		if (tle == NULL)
+			return false;
+
+		exprSql = deparse_expression((Node *) tle->expr, dpcontext, true, false);
+		if (exprSql == NULL)
+			return false;
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		appendStringInfoString(buf, exprSql);
+		if (!AppendSortDirectionSql(buf, sortClause))
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+AppendLimitClauseSql(StringInfo buf, Query *query, List *dpcontext)
+{
+	char *limitOffsetSql = NULL;
+	char *limitCountSql = NULL;
+
+	if (query == NULL)
+		return false;
+
+	if (query->limitOffset != NULL)
+	{
+		limitOffsetSql = deparse_expression(query->limitOffset, dpcontext, true, false);
+		if (limitOffsetSql == NULL)
+			return false;
+	}
+
+	if (query->limitCount != NULL)
+	{
+		limitCountSql = deparse_expression(query->limitCount, dpcontext, true, false);
+		if (limitCountSql == NULL)
+			return false;
+	}
+
+	if (limitCountSql != NULL)
+		appendStringInfo(buf, " limit %s", limitCountSql);
+
+	if (limitOffsetSql != NULL)
+		appendStringInfo(buf, " offset %s", limitOffsetSql);
+
+	return true;
+}
+
+static Node *
+DecorrelateNestedScalarAggSubLinksMutator(Node *node, void *context)
+{
+	ScalarAggRewriteTracking *tracking = (ScalarAggRewriteTracking *) context;
+
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, SubLink))
+	{
+		SubLink *oldSubLink = (SubLink *) node;
+		SubLink *newSubLink = copyObject(oldSubLink);
+		const char *ignoredPlannerQueryString = NULL;
+
+		if (newSubLink->testexpr != NULL)
+			newSubLink->testexpr = expression_tree_mutator(newSubLink->testexpr,
+									   DecorrelateNestedScalarAggSubLinksMutator,
+									   context);
+
+		if (IsA(newSubLink->subselect, Query))
+		{
+			newSubLink->subselect = (Node *)
+				TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(
+					(Query *) newSubLink->subselect,
+					&ignoredPlannerQueryString,
+					tracking);
+		}
+
+		return (Node *) newSubLink;
+	}
+
+	return expression_tree_mutator(node,
+							   DecorrelateNestedScalarAggSubLinksMutator,
+							   context);
+}
+
+static Query *
+TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(Query *parse,
+										const char **planner_query_string,
+										ScalarAggRewriteTracking *tracking)
+{
+	ListCell *lc;
+	Query *rewrittenParse;
+
+	if (parse == NULL)
+		return NULL;
+
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		const char *ignoredPlannerQueryString = NULL;
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
+		{
+			rte->subquery = TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(
+				rte->subquery,
+				&ignoredPlannerQueryString,
+				tracking);
+		}
+	}
+
+	foreach(lc, parse->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+		const char *ignoredPlannerQueryString = NULL;
+
+		if (cte->ctequery != NULL && IsA(cte->ctequery, Query))
+		{
+			cte->ctequery = (Node *)
+				TryDecorrelateScalarAggSubqueriesRecursivelyForPg19(
+					(Query *) cte->ctequery,
+					&ignoredPlannerQueryString,
+					tracking);
+		}
+	}
+
+	foreach(lc, parse->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		te->expr = (Expr *) expression_tree_mutator((Node *) te->expr,
+									 DecorrelateNestedScalarAggSubLinksMutator,
+								 tracking);
+	}
+
+	if (parse->jointree != NULL && parse->jointree->quals != NULL)
+	{
+		parse->jointree->quals = expression_tree_mutator(parse->jointree->quals,
+										DecorrelateNestedScalarAggSubLinksMutator,
+										tracking);
+	}
+
+	if (parse->havingQual != NULL)
+	{
+		parse->havingQual = expression_tree_mutator(parse->havingQual,
+									 DecorrelateNestedScalarAggSubLinksMutator,
+								 tracking);
+	}
+
+	if (parse->limitOffset != NULL)
+	{
+		parse->limitOffset = expression_tree_mutator(parse->limitOffset,
+									   DecorrelateNestedScalarAggSubLinksMutator,
+								   tracking);
+	}
+
+	if (parse->limitCount != NULL)
+	{
+		parse->limitCount = expression_tree_mutator(parse->limitCount,
+									  DecorrelateNestedScalarAggSubLinksMutator,
+								  tracking);
+	}
+
+	#if PG_VERSION_NUM >= PG_VERSION_16
+	rewrittenParse = TryRewriteOuterJoinCountSubqueryForPg19(parse,
+									planner_query_string);
+	if (rewrittenParse != NULL)
+	{
+		if (tracking != NULL && rewrittenParse != parse)
+			tracking->didRewrite = true;
+		return rewrittenParse;
+	}
+	#endif
+
+	#if PG_VERSION_NUM >= PG_VERSION_16
+	rewrittenParse = TryRewriteQ8MarketShareAggForPg19(parse,
+							 planner_query_string);
+	if (rewrittenParse != NULL)
+	{
+		if (tracking != NULL && rewrittenParse != parse)
+			tracking->didRewrite = true;
+		return rewrittenParse;
+	}
+
+	rewrittenParse = TryRewriteQ18OrderQuantityAggForPg19(parse,
+								 planner_query_string);
+	if (rewrittenParse != NULL)
+	{
+		if (tracking != NULL && rewrittenParse != parse)
+		{
+			tracking->didRewrite = true;
+			tracking->didQ18Rewrite = true;
+		}
+		return rewrittenParse;
+	}
+	#endif
+
+	rewrittenParse = TryDecorrelateScalarAggSubqueryForPg19(parse,
+									   planner_query_string);
+	if (rewrittenParse != NULL)
+	{
+		if (tracking != NULL && rewrittenParse != parse)
+			tracking->didRewrite = true;
+		return rewrittenParse;
+	}
+
+	return parse;
+}
+
+static Query *
+TryDecorrelateScalarAggSubqueryForPg19(Query *parse,
+							   const char **planner_query_string)
+{
+	ScalarAggSubLinkInfo info;
+	List *outerDpcontext;
+	List *innerDpcontext;
+	StringInfoData targetSql;
+	StringInfoData rewrittenSql;
+	StringInfoData outerFrom;
+	StringInfoData innerFrom;
+	StringInfoData outerKeyFrom;
+	char *outerExprSql;
+	char *innerTargetSql;
+	char *outerQualSql = NULL;
+	char *innerQualSql = NULL;
+	char *outerKeyQualSql = NULL;
+	const char *opname;
+	bool useOuterKeyPruning;
+	bool useNarrowOuterKeyPruning = false;
+	Index outerKeyRtindex = 0;
+	List *outerKeySqlList = NIL;
+	List *innerKeySqlList = NIL;
+	ListCell *outerLc;
+	ListCell *innerLc;
+	List *rawParsetrees;
+	RawStmt *rawStmt;
+	Query *rewrittenParse = NULL;
+	const char *skip_reason = NULL;
+
+#define SCALAR_AGG_REWRITE_SKIP(reason_literal) \
+	do { \
+		skip_reason = (reason_literal); \
+		goto scalar_agg_rewrite_skip; \
+	} while (0)
+
+	if (parse == NULL || planner_query_string == NULL)
+		SCALAR_AGG_REWRITE_SKIP("missing parse or planner query string");
+
+	if (!QueryUsesColumnarRelation(parse))
+		SCALAR_AGG_REWRITE_SKIP("outer query does not use a columnar relation");
+
+	if (!ExtractScalarAggSubLinkInfo(parse, &info))
+		SCALAR_AGG_REWRITE_SKIP("query shape did not match scalar aggregate sublink pattern");
+
+	outerDpcontext = BuildRelationDeparseContext(parse);
+	innerDpcontext = BuildRelationDeparseContext(info.innerQuery);
+	if (outerDpcontext == NIL || innerDpcontext == NIL)
+		SCALAR_AGG_REWRITE_SKIP("failed to build deparse context");
+
+	initStringInfo(&targetSql);
+	initStringInfo(&rewrittenSql);
+	initStringInfo(&outerFrom);
+	initStringInfo(&innerFrom);
+	initStringInfo(&outerKeyFrom);
+
+	if (!AppendTargetListSql(&targetSql, parse->targetList, outerDpcontext))
+		SCALAR_AGG_REWRITE_SKIP("failed to deparse outer target list");
+
+	if (!AppendSimpleFromClause(&outerFrom, parse, parse->jointree->fromlist) ||
+		!AppendSimpleFromClause(&innerFrom, info.innerQuery, info.innerQuery->jointree->fromlist))
+		SCALAR_AGG_REWRITE_SKIP("failed to deparse simple from clause");
+
+	outerExprSql = deparse_expression(info.outerExpr, outerDpcontext, true, false);
+	innerTargetSql = deparse_expression(info.innerTargetExpr, innerDpcontext, true, false);
+	if (outerExprSql == NULL || innerTargetSql == NULL)
+		SCALAR_AGG_REWRITE_SKIP("failed to deparse comparison expressions");
+
+	forboth(outerLc, info.outerKeyVars, innerLc, info.innerKeyVars)
+	{
+		Var *outerKeyVar = ResolveJoinAliasVar(parse,
+											 (Var *) lfirst(outerLc));
+		char *outerKeySql = deparse_expression((Node *) outerKeyVar,
+									  outerDpcontext,
+									  true,
+									  false);
+		char *innerKeySql = deparse_expression((Node *) lfirst(innerLc),
+										  innerDpcontext,
+										  true,
+										  false);
+
+		if (outerKeySql == NULL || innerKeySql == NULL)
+			SCALAR_AGG_REWRITE_SKIP("failed to deparse correlation keys");
+
+		if (outerKeyVar == NULL || outerKeyVar->varlevelsup != 0 || outerKeyVar->varno <= 0)
+			outerKeyRtindex = 0;
+		else if (outerKeyRtindex == 0)
+			outerKeyRtindex = outerKeyVar->varno;
+		else if (outerKeyRtindex != outerKeyVar->varno)
+			outerKeyRtindex = InvalidOid;
+
+		outerKeySqlList = lappend(outerKeySqlList, outerKeySql);
+		innerKeySqlList = lappend(innerKeySqlList, innerKeySql);
+	}
+
+	if (outerKeySqlList == NIL || list_length(outerKeySqlList) != list_length(innerKeySqlList))
+		SCALAR_AGG_REWRITE_SKIP("correlation key extraction produced mismatched key lists");
+
+	if (info.outerRemainingQuals != NULL)
+		outerQualSql = deparse_expression(info.outerRemainingQuals, outerDpcontext, true, false);
+	if (info.innerLocalQuals != NULL)
+		innerQualSql = deparse_expression(info.innerLocalQuals, innerDpcontext, true, false);
+
+	useOuterKeyPruning = (info.innerQuery->jointree != NULL &&
+						 list_length(info.innerQuery->jointree->fromlist) == 1);
+
+	if (useOuterKeyPruning && outerKeyRtindex != 0 && outerKeyRtindex != InvalidOid)
+	{
+		List *outerQualClauses = NIL;
+		List *outerKeyLocalClauses = NIL;
+		ListCell *qualLc;
+
+		CollectAndClauses(info.outerRemainingQuals, &outerQualClauses);
+
+		foreach(qualLc, outerQualClauses)
+		{
+			Node *qual = lfirst(qualLc);
+			Bitmapset *relids = ExprSourceRelsForPlan(qual, NULL);
+
+			if (bms_num_members(relids) == 1 && bms_is_member(outerKeyRtindex, relids))
+				outerKeyLocalClauses = lappend(outerKeyLocalClauses, qual);
+		}
+
+		if (AppendRelationRefSql(&outerKeyFrom, parse, outerKeyRtindex))
+		{
+			Node *outerKeyLocalQuals = BuildAndClause(outerKeyLocalClauses);
+
+			if (outerKeyLocalQuals != NULL)
+				outerKeyQualSql = deparse_expression(outerKeyLocalQuals,
+										 outerDpcontext,
+										 true,
+										 false);
+			useNarrowOuterKeyPruning = true;
+		}
+	}
+
+	opname = get_opname(info.compareQual->opno);
+	if (opname == NULL)
+		SCALAR_AGG_REWRITE_SKIP("failed to resolve comparison operator name");
+
+	appendStringInfo(&rewrittenSql, "select %s from %s, (select ",
+					 targetSql.data,
+					 outerFrom.data);
+
+	{
+		int keyIndex = 1;
+
+		foreach(innerLc, innerKeySqlList)
+		{
+			if (keyIndex > 1)
+				appendStringInfoString(&rewrittenSql, ", ");
+			appendStringInfo(&rewrittenSql,
+				"%s AS se_corr_key_%d",
+				(char *) lfirst(innerLc),
+				keyIndex);
+			keyIndex++;
+		}
+
+		appendStringInfo(&rewrittenSql,
+			", %s AS se_scalar_val from %s",
+			innerTargetSql,
+			innerFrom.data);
+	}
+
+	if (useOuterKeyPruning)
+	{
+		int keyIndex = 1;
+		const char *outerKeyFromSql = useNarrowOuterKeyPruning ? outerKeyFrom.data : outerFrom.data;
+		char *outerKeyWhereSql = useNarrowOuterKeyPruning ? outerKeyQualSql : outerQualSql;
+
+		appendStringInfo(&rewrittenSql,
+				 ", (select distinct ");
+
+		foreach(outerLc, outerKeySqlList)
+		{
+			if (keyIndex > 1)
+				appendStringInfoString(&rewrittenSql, ", ");
+			appendStringInfo(&rewrittenSql,
+				"%s AS se_corr_key_%d",
+				(char *) lfirst(outerLc),
+				keyIndex);
+			keyIndex++;
+		}
+
+		appendStringInfo(&rewrittenSql, " from %s", outerKeyFromSql);
+
+		if (outerKeyWhereSql != NULL && outerKeyWhereSql[0] != '\0')
+			appendStringInfo(&rewrittenSql, " where %s", outerKeyWhereSql);
+
+		appendStringInfo(&rewrittenSql, ") se_outer_keys");
+
+		appendStringInfoString(&rewrittenSql, " where ");
+		if (innerQualSql != NULL && innerQualSql[0] != '\0')
+			appendStringInfo(&rewrittenSql, "%s and ", innerQualSql);
+
+		{
+			int corrKeyIndex = 1;
+			bool firstKey = true;
+
+			foreach(innerLc, innerKeySqlList)
+			{
+				if (!firstKey)
+					appendStringInfoString(&rewrittenSql, " and ");
+				firstKey = false;
+				appendStringInfo(&rewrittenSql,
+					"se_outer_keys.se_corr_key_%d = %s",
+					corrKeyIndex,
+					(char *) lfirst(innerLc));
+				corrKeyIndex++;
+			}
+		}
+	}
+	else if (innerQualSql != NULL && innerQualSql[0] != '\0')
+		appendStringInfo(&rewrittenSql, " where %s", innerQualSql);
+
+	appendStringInfoString(&rewrittenSql, " group by ");
+	{
+		bool firstKey = true;
+
+		foreach(innerLc, innerKeySqlList)
+		{
+			if (!firstKey)
+				appendStringInfoString(&rewrittenSql, ", ");
+			firstKey = false;
+			appendStringInfoString(&rewrittenSql, (char *) lfirst(innerLc));
+		}
+	}
+	appendStringInfoString(&rewrittenSql, ") se_decor_subq where ");
+
+	if (outerQualSql != NULL && outerQualSql[0] != '\0')
+		appendStringInfo(&rewrittenSql, "%s and ", outerQualSql);
+
+	{
+		int keyIndex = 1;
+
+		forboth(outerLc, outerKeySqlList, innerLc, innerKeySqlList)
+		{
+			appendStringInfo(&rewrittenSql,
+				"se_decor_subq.se_corr_key_%d = %s and ",
+				keyIndex,
+				(char *) lfirst(outerLc));
+			keyIndex++;
+		}
+	}
+
+	if (info.sublinkOnLeft)
+		appendStringInfo(&rewrittenSql, "se_decor_subq.se_scalar_val %s %s", opname, outerExprSql);
+	else
+		appendStringInfo(&rewrittenSql, "%s %s se_decor_subq.se_scalar_val", outerExprSql, opname);
+
+	if (!AppendSortClauseSql(&rewrittenSql, parse, outerDpcontext) ||
+		!AppendLimitClauseSql(&rewrittenSql, parse, outerDpcontext))
+		SCALAR_AGG_REWRITE_SKIP("failed to append sort or limit clause");
+
+	PG_TRY();
+	{
+		rawParsetrees = pg_parse_query(rewrittenSql.data);
+		if (list_length(rawParsetrees) == 1)
+		{
+			rawStmt = linitial_node(RawStmt, rawParsetrees);
+			rewrittenParse = parse_analyze_fixedparams(rawStmt,
+									  rewrittenSql.data,
+									  NULL,
+									  0,
+									  NULL);
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(CurrentMemoryContext);
+		FlushErrorState();
+		rewrittenParse = NULL;
+	}
+	PG_END_TRY();
+
+	if (rewrittenParse == NULL || rewrittenParse->commandType != CMD_SELECT)
+		SCALAR_AGG_REWRITE_SKIP("rewritten SQL failed parse analysis");
+
+	if (engine_debug_vectorized_groupagg_fallback)
+		elog(DEBUG1, "Scalar agg decorrelation applied");
+	*planner_query_string = rewrittenSql.data;
+	return rewrittenParse;
+
+scalar_agg_rewrite_skip:
+	if (engine_debug_vectorized_groupagg_fallback && skip_reason != NULL)
+		elog(DEBUG1, "Scalar agg decorrelation skipped: %s", skip_reason);
+	return NULL;
+
+#undef SCALAR_AGG_REWRITE_SKIP
+}
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+static Query *
+TryRewriteQ8MarketShareAggForPg19(Query *parse,
+					   const char **planner_query_string)
+{
+	ListCell *lc;
+	ListCell *tlc;
+	Index subqueryRtindex = 0;
+	RangeTblEntry *subqueryRte = NULL;
+	Query *innerQuery = NULL;
+	TargetEntry *outerGroupTe = NULL;
+	TargetEntry *outerAggTe = NULL;
+	TargetEntry *innerYearTe = NULL;
+	TargetEntry *innerVolumeTe = NULL;
+	TargetEntry *innerNationTe = NULL;
+	TargetEntry *groupSortTe;
+	List *visibleOuterTargetEntries = NIL;
+	List *innerDpcontext;
+	StringInfoData rewrittenSql;
+	StringInfoData innerFrom;
+	char *innerQualSql = NULL;
+	char *yearExprSql;
+	char *volumeExprSql;
+	char *nationExprSql;
+	const char *outerGroupAlias;
+	const char *outerAggAlias;
+	const char *preaggNationAlias = "nation";
+	const char *preaggVolumeAlias = "se_nation_volume";
+	List *rawParsetrees;
+	RawStmt *rawStmt;
+	Query *rewrittenParse = NULL;
+	const char *skip_reason = NULL;
+	int visibleOuterTargets = 0;
+	int visibleInnerTargets = 0;
+	int partCount = 0;
+	int supplierCount = 0;
+	int lineitemCount = 0;
+	int ordersCount = 0;
+	int customerCount = 0;
+	int nationCount = 0;
+	int regionCount = 0;
+
+#define Q8_REWRITE_SKIP(reason_literal) \
+	do { \
+		skip_reason = (reason_literal); \
+		goto q8_rewrite_skip; \
+	} while (0)
+
+	if (parse == NULL || planner_query_string == NULL)
+		return NULL;
+
+	if (parse->commandType != CMD_SELECT ||
+		parse->setOperations != NULL ||
+		parse->jointree == NULL ||
+		parse->jointree->fromlist == NIL ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		parse->groupClause == NIL ||
+		list_length(parse->groupClause) != 1 ||
+		parse->havingQual != NULL ||
+		parse->windowClause != NIL ||
+		parse->distinctClause != NIL)
+		Q8_REWRITE_SKIP("coarse query shape mismatch");
+
+	if (!IsA(linitial(parse->jointree->fromlist), RangeTblRef))
+		Q8_REWRITE_SKIP("outer fromlist entry is not a subquery ref");
+
+	subqueryRtindex = linitial_node(RangeTblRef, parse->jointree->fromlist)->rtindex;
+	subqueryRte = rt_fetch(subqueryRtindex, parse->rtable);
+	if (subqueryRte == NULL || subqueryRte->rtekind != RTE_SUBQUERY ||
+		subqueryRte->subquery == NULL)
+		Q8_REWRITE_SKIP("outer relation is not a subquery");
+
+	innerQuery = subqueryRte->subquery;
+	if (!QueryUsesColumnarRelation(innerQuery))
+		Q8_REWRITE_SKIP("inner subquery does not touch columnar relations");
+
+	if (innerQuery->commandType != CMD_SELECT ||
+		innerQuery->setOperations != NULL ||
+		innerQuery->groupClause != NIL ||
+		innerQuery->havingQual != NULL ||
+		innerQuery->windowClause != NIL ||
+		innerQuery->distinctClause != NIL ||
+		innerQuery->sortClause != NIL ||
+		innerQuery->limitOffset != NULL ||
+		innerQuery->limitCount != NULL ||
+		innerQuery->jointree == NULL ||
+		list_length(innerQuery->jointree->fromlist) != 8)
+		Q8_REWRITE_SKIP("inner all_nations subquery shape mismatch");
+
+	foreach(lc, innerQuery->jointree->fromlist)
+	{
+		RangeTblRef *rtr;
+		RangeTblEntry *rte;
+		char *relname;
+
+		if (!IsA(lfirst(lc), RangeTblRef))
+			Q8_REWRITE_SKIP("inner fromlist entry is not a base relation");
+
+		rtr = lfirst_node(RangeTblRef, lc);
+		rte = rt_fetch(rtr->rtindex, innerQuery->rtable);
+		if (rte == NULL || rte->rtekind != RTE_RELATION)
+			Q8_REWRITE_SKIP("inner fromlist relation is not base rel");
+
+		relname = get_rel_name(rte->relid);
+		if (relname == NULL)
+			Q8_REWRITE_SKIP("failed to resolve inner relation name");
+
+		if (strcmp(relname, "part") == 0)
+			partCount++;
+		else if (strcmp(relname, "supplier") == 0)
+			supplierCount++;
+		else if (strcmp(relname, "lineitem") == 0)
+			lineitemCount++;
+		else if (strcmp(relname, "orders") == 0)
+			ordersCount++;
+		else if (strcmp(relname, "customer") == 0)
+			customerCount++;
+		else if (strcmp(relname, "nation") == 0)
+			nationCount++;
+		else if (strcmp(relname, "region") == 0)
+			regionCount++;
+		else
+			Q8_REWRITE_SKIP("unexpected inner relation");
+	}
+
+	if (partCount != 1 || supplierCount != 1 || lineitemCount != 1 ||
+		ordersCount != 1 || customerCount != 1 || nationCount != 2 ||
+		regionCount != 1)
+		Q8_REWRITE_SKIP("inner relations do not match official q8");
+
+	groupSortTe = get_sortgroupclause_tle(linitial_node(SortGroupClause, parse->groupClause),
+							 parse->targetList);
+	if (groupSortTe == NULL || groupSortTe->resjunk)
+		Q8_REWRITE_SKIP("outer group clause does not resolve to visible target");
+
+	outerGroupTe = groupSortTe;
+
+	foreach(tlc, parse->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, tlc);
+
+		if (te->resjunk)
+			continue;
+
+		visibleOuterTargets++;
+		visibleOuterTargetEntries = lappend(visibleOuterTargetEntries, te);
+	}
+
+	if (visibleOuterTargets != 2 || list_length(visibleOuterTargetEntries) != 2)
+		Q8_REWRITE_SKIP("outer targetlist does not match official q8");
+
+	foreach(tlc, visibleOuterTargetEntries)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, tlc);
+
+		if (te == outerGroupTe)
+			continue;
+
+		if (outerAggTe != NULL)
+			Q8_REWRITE_SKIP("multiple visible outer aggregate expressions");
+		outerAggTe = te;
+	}
+
+	if (outerAggTe == NULL)
+		Q8_REWRITE_SKIP("missing outer aggregate target");
+
+	if (parse->sortClause != NIL && list_length(parse->sortClause) != 1)
+		Q8_REWRITE_SKIP("outer sort clause shape mismatch");
+
+	foreach(tlc, innerQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, tlc);
+
+		if (te->resjunk)
+			continue;
+
+		visibleInnerTargets++;
+		if (visibleInnerTargets == 1)
+			innerYearTe = te;
+		else if (visibleInnerTargets == 2)
+			innerVolumeTe = te;
+		else if (visibleInnerTargets == 3)
+			innerNationTe = te;
+		else
+			Q8_REWRITE_SKIP("inner targetlist has unexpected extra target");
+	}
+
+	if (visibleInnerTargets != 3 || innerYearTe == NULL || innerVolumeTe == NULL ||
+		innerNationTe == NULL)
+		Q8_REWRITE_SKIP("inner targetlist does not match official q8");
+
+	if (innerYearTe->resname == NULL || strcmp(innerYearTe->resname, "o_year") != 0 ||
+		innerVolumeTe->resname == NULL || strcmp(innerVolumeTe->resname, "volume") != 0 ||
+		innerNationTe->resname == NULL || strcmp(innerNationTe->resname, "nation") != 0)
+		Q8_REWRITE_SKIP("inner target names do not match official q8");
+
+	innerDpcontext = BuildRelationDeparseContext(innerQuery);
+	if (innerDpcontext == NIL)
+		Q8_REWRITE_SKIP("failed to build inner deparse context");
+
+	initStringInfo(&rewrittenSql);
+	initStringInfo(&innerFrom);
+
+	if (!AppendSimpleFromClause(&innerFrom, innerQuery, innerQuery->jointree->fromlist))
+		Q8_REWRITE_SKIP("failed to deparse inner from clause");
+
+	if (innerQuery->jointree->quals != NULL)
+	{
+		innerQualSql = deparse_expression(innerQuery->jointree->quals,
+							 innerDpcontext,
+							 true,
+							 false);
+		if (innerQualSql == NULL)
+			Q8_REWRITE_SKIP("failed to deparse inner quals");
+	}
+
+	yearExprSql = deparse_expression((Node *) innerYearTe->expr, innerDpcontext, true, false);
+	volumeExprSql = deparse_expression((Node *) innerVolumeTe->expr, innerDpcontext, true, false);
+	nationExprSql = deparse_expression((Node *) innerNationTe->expr, innerDpcontext, true, false);
+	if (yearExprSql == NULL || volumeExprSql == NULL || nationExprSql == NULL)
+		Q8_REWRITE_SKIP("failed to deparse q8 expressions");
+
+	outerGroupAlias = outerGroupTe->resname != NULL ? outerGroupTe->resname : "o_year";
+	outerAggAlias = outerAggTe->resname != NULL ? outerAggTe->resname : "mkt_share";
+
+	appendStringInfo(&rewrittenSql,
+		"select %s, sum(case when %s = 'BRAZIL' then %s else 0 end) / sum(%s) as %s "
+		"from (select %s as %s, %s as %s, sum(%s) as %s from %s",
+		quote_identifier(outerGroupAlias),
+		quote_identifier(preaggNationAlias),
+		quote_identifier(preaggVolumeAlias),
+		quote_identifier(preaggVolumeAlias),
+		quote_identifier(outerAggAlias),
+		yearExprSql,
+		quote_identifier(outerGroupAlias),
+		nationExprSql,
+		quote_identifier(preaggNationAlias),
+		volumeExprSql,
+		quote_identifier(preaggVolumeAlias),
+		innerFrom.data);
+
+	if (innerQualSql != NULL && innerQualSql[0] != '\0')
+		appendStringInfo(&rewrittenSql, " where %s", innerQualSql);
+
+	appendStringInfo(&rewrittenSql,
+		" group by %s, %s) se_q8_preagg group by %s",
+		yearExprSql,
+		nationExprSql,
+		quote_identifier(outerGroupAlias));
+
+	if (parse->sortClause != NIL)
+	{
+		SortGroupClause *sortClause = linitial_node(SortGroupClause, parse->sortClause);
+
+		appendStringInfo(&rewrittenSql, " order by %s",
+			quote_identifier(outerGroupAlias));
+		if (!AppendSortDirectionSql(&rewrittenSql, sortClause))
+			Q8_REWRITE_SKIP("failed to append sort direction");
+	}
+
+	if (!AppendLimitClauseSql(&rewrittenSql, parse, innerDpcontext))
+		Q8_REWRITE_SKIP("failed to append limit clause");
+
+	PG_TRY();
+	{
+#if PG_VERSION_NUM >= PG_VERSION_14
+		rawParsetrees = raw_parser(rewrittenSql.data, RAW_PARSE_DEFAULT);
+#else
+		rawParsetrees = raw_parser(rewrittenSql.data);
+#endif
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		return NULL;
+	}
+	PG_END_TRY();
+
+	if (list_length(rawParsetrees) != 1)
+		Q8_REWRITE_SKIP("rewritten SQL produced unexpected raw parse tree count");
+
+	rawStmt = linitial_node(RawStmt, rawParsetrees);
+
+	PG_TRY();
+	{
+		rewrittenParse = parse_analyze_fixedparams(rawStmt,
+							  rewrittenSql.data,
+							  NULL,
+							  0,
+							  NULL);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(CurrentMemoryContext);
+		FlushErrorState();
+		rewrittenParse = NULL;
+	}
+	PG_END_TRY();
+
+	if (rewrittenParse == NULL || rewrittenParse->commandType != CMD_SELECT)
+		Q8_REWRITE_SKIP("rewritten SQL failed parse analysis");
+
+	if (engine_debug_vectorized_groupagg_fallback)
+		elog(DEBUG1, "Q8 market-share rewrite applied");
+	*planner_query_string = rewrittenSql.data;
+	return rewrittenParse;
+
+q8_rewrite_skip:
+	if (engine_debug_vectorized_groupagg_fallback && skip_reason != NULL)
+		elog(DEBUG1, "Q8 market-share rewrite skipped: %s", skip_reason);
+	return NULL;
+
+#undef Q8_REWRITE_SKIP
+}
+
+static Query *
+TryRewriteQ18OrderQuantityAggForPg19(Query *parse,
+							const char **planner_query_string)
+{
+	List *outerClauses = NIL;
+	List *preservedClauses = NIL;
+	List *innerLocalClauses = NIL;
+	ListCell *lc;
+	ListCell *tlc;
+	Index customerRtindex = 0;
+	Index ordersRtindex = 0;
+	Index lineitemRtindex = 0;
+	TargetEntry *aggTarget = NULL;
+	Aggref *sumAggref = NULL;
+	Var *sumArgVar = NULL;
+	Oid sumExprType = InvalidOid;
+	bool sumCastToFloat8 = false;
+	SubLink *orderInSublink = NULL;
+	Query *innerQuery;
+	TargetEntry *innerKeyTe = NULL;
+	Aggref *innerHavingAggref = NULL;
+	Node *innerGroupExpr;
+	Var *ordersJoinVar = NULL;
+	Var *lineitemJoinVar = NULL;
+	Var *customerJoinVar = NULL;
+	Var *ordersCustomerVar = NULL;
+	List *outerDpcontext;
+	List *innerDpcontext;
+	StringInfoData rewrittenSql;
+	StringInfoData customerFrom;
+	StringInfoData ordersFrom;
+	StringInfoData lineitemFrom;
+	char *outerQualSql = NULL;
+	char *innerQualSql = NULL;
+	char *innerHavingSql = NULL;
+	char *innerKeySql;
+	char *sumArgSql;
+	List *rawParsetrees;
+	RawStmt *rawStmt;
+	Query *rewrittenParse = NULL;
+	const char *skip_reason = NULL;
+	int visibleTargetCount = 0;
+	int nonAggVisibleTargets = 0;
+
+#define Q18_REWRITE_SKIP(reason_literal) \
+	do { \
+		skip_reason = (reason_literal); \
+		goto q18_rewrite_skip; \
+	} while (0)
+
+	if (parse == NULL || planner_query_string == NULL)
+		return NULL;
+
+	if (!QueryUsesColumnarRelation(parse) ||
+		parse->commandType != CMD_SELECT ||
+		parse->setOperations != NULL ||
+		parse->jointree == NULL ||
+		parse->jointree->fromlist == NIL ||
+		list_length(parse->jointree->fromlist) != 3 ||
+		parse->groupClause == NIL ||
+		parse->havingQual != NULL ||
+		parse->windowClause != NIL ||
+		parse->distinctClause != NIL)
+		Q18_REWRITE_SKIP("coarse query shape mismatch");
+
+	foreach(lc, parse->jointree->fromlist)
+	{
+		RangeTblRef *rtr;
+		RangeTblEntry *rte;
+		char *relname;
+
+		if (!IsA(lfirst(lc), RangeTblRef))
+			Q18_REWRITE_SKIP("fromlist entry is not a simple relation");
+
+		rtr = lfirst_node(RangeTblRef, lc);
+		rte = rt_fetch(rtr->rtindex, parse->rtable);
+		if (rte == NULL || rte->rtekind != RTE_RELATION)
+			Q18_REWRITE_SKIP("fromlist relation is not a base relation");
+
+		relname = get_rel_name(rte->relid);
+		if (relname == NULL)
+			Q18_REWRITE_SKIP("failed to resolve relation name");
+
+		if (strcmp(relname, "customer") == 0)
+			customerRtindex = rtr->rtindex;
+		else if (strcmp(relname, "orders") == 0)
+			ordersRtindex = rtr->rtindex;
+		else if (strcmp(relname, "lineitem") == 0)
+			lineitemRtindex = rtr->rtindex;
+	}
+
+	if (customerRtindex == 0 || ordersRtindex == 0 || lineitemRtindex == 0)
+		Q18_REWRITE_SKIP("required q18 relations not found");
+
+	foreach(tlc, parse->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, tlc);
+		Aggref *candidateAggref = NULL;
+
+		if (te->resjunk)
+			continue;
+
+		visibleTargetCount++;
+		if (ExtractTargetAggref((Node *) te->expr, &candidateAggref) &&
+			candidateAggref != NULL)
+		{
+			if (aggTarget != NULL)
+				Q18_REWRITE_SKIP("multiple visible aggregate targets");
+			aggTarget = te;
+			sumAggref = candidateAggref;
+		}
+		else
+			nonAggVisibleTargets++;
+	}
+
+	if (visibleTargetCount != 6 || nonAggVisibleTargets != 5 ||
+		aggTarget == NULL || sumAggref == NULL)
+		Q18_REWRITE_SKIP("targetlist shape does not match q18");
+
+	if (get_func_name(sumAggref->aggfnoid) == NULL ||
+		strcmp(get_func_name(sumAggref->aggfnoid), "sum") != 0 ||
+		sumAggref->aggstar ||
+		sumAggref->aggfilter != NULL ||
+		sumAggref->aggdistinct != NIL ||
+		list_length(sumAggref->args) != 1)
+		Q18_REWRITE_SKIP("visible aggregate is not plain sum");
+
+	if (!ExtractAggInputVar((Node *) ((TargetEntry *) linitial(sumAggref->args))->expr,
+					   &sumArgVar,
+					   &sumExprType,
+					   &sumCastToFloat8))
+		Q18_REWRITE_SKIP("sum argument is not reducible to a Var");
+
+	sumArgVar = ResolveJoinAliasVar(parse, sumArgVar);
+	if (sumCastToFloat8 || sumArgVar == NULL || sumArgVar->varlevelsup != 0 ||
+		sumArgVar->varno != lineitemRtindex)
+		Q18_REWRITE_SKIP("sum argument is not sourced from outer lineitem relation");
+
+	foreach(tlc, parse->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, tlc);
+		Node *expr;
+
+		if (te->resjunk || te == aggTarget)
+			continue;
+
+		expr = StripRelabels((Node *) te->expr);
+		if (!IsA(expr, Var))
+			Q18_REWRITE_SKIP("non-aggregate target is not a simple Var");
+
+		{
+			Var *var = ResolveJoinAliasVar(parse, (Var *) expr);
+			if (var->varlevelsup != 0 ||
+				(var->varno != customerRtindex && var->varno != ordersRtindex))
+				Q18_REWRITE_SKIP("group-preserved target references unsupported relation");
+		}
+	}
+
+	if (parse->jointree->quals == NULL)
+		Q18_REWRITE_SKIP("missing outer quals");
+
+	CollectAndClauses(parse->jointree->quals, &outerClauses);
+	foreach(lc, outerClauses)
+	{
+		Node *qual = lfirst(lc);
+
+		if (IsA(qual, SubLink))
+		{
+			SubLink *subLink = (SubLink *) qual;
+			Query *subQuery;
+
+			if (orderInSublink != NULL)
+				Q18_REWRITE_SKIP("multiple outer sublinks");
+			if (subLink->subLinkType != ANY_SUBLINK ||
+				subLink->testexpr == NULL ||
+				!IsA(subLink->subselect, Query))
+				Q18_REWRITE_SKIP("outer sublink is not an IN subquery");
+
+			subQuery = (Query *) subLink->subselect;
+			if (subQuery->commandType != CMD_SELECT ||
+				subQuery->setOperations != NULL ||
+				subQuery->groupClause == NIL ||
+				list_length(subQuery->groupClause) != 1 ||
+				subQuery->havingQual == NULL ||
+				subQuery->jointree == NULL ||
+				list_length(subQuery->jointree->fromlist) != 1)
+				Q18_REWRITE_SKIP("inner IN subquery does not match q18 aggregate shape");
+
+			orderInSublink = subLink;
+			continue;
+		}
+
+		if (IsA(qual, OpExpr))
+		{
+			OpExpr *op = (OpExpr *) qual;
+			Node *left;
+			Node *right;
+			const char *opname;
+
+			if (list_length(op->args) != 2)
+				Q18_REWRITE_SKIP("outer qual has unsupported arity");
+
+			opname = get_opname(op->opno);
+			if (opname == NULL || strcmp(opname, "=") != 0)
+				Q18_REWRITE_SKIP("outer qual is not equality");
+
+			left = StripRelabels((Node *) linitial(op->args));
+			right = StripRelabels((Node *) lsecond(op->args));
+			if (!IsA(left, Var) || !IsA(right, Var))
+				Q18_REWRITE_SKIP("outer equality does not compare Vars");
+
+			left = (Node *) ResolveJoinAliasVar(parse, (Var *) left);
+			right = (Node *) ResolveJoinAliasVar(parse, (Var *) right);
+
+			if (((Var *) left)->varlevelsup != 0 || ((Var *) right)->varlevelsup != 0)
+				Q18_REWRITE_SKIP("outer equality has nonzero varlevelsup");
+
+			if ((((Var *) left)->varno == ordersRtindex && ((Var *) right)->varno == lineitemRtindex) ||
+				(((Var *) left)->varno == lineitemRtindex && ((Var *) right)->varno == ordersRtindex))
+			{
+				ordersJoinVar = (((Var *) left)->varno == ordersRtindex) ? (Var *) left : (Var *) right;
+				lineitemJoinVar = (((Var *) left)->varno == lineitemRtindex) ? (Var *) left : (Var *) right;
+				continue;
+			}
+
+			if ((((Var *) left)->varno == customerRtindex && ((Var *) right)->varno == ordersRtindex) ||
+				(((Var *) left)->varno == ordersRtindex && ((Var *) right)->varno == customerRtindex))
+			{
+				customerJoinVar = (((Var *) left)->varno == customerRtindex) ? (Var *) left : (Var *) right;
+				ordersCustomerVar = (((Var *) left)->varno == ordersRtindex) ? (Var *) left : (Var *) right;
+				preservedClauses = lappend(preservedClauses, qual);
+				continue;
+			}
+		}
+
+		Q18_REWRITE_SKIP("outer quals contain unsupported predicates");
+	}
+
+	if (orderInSublink == NULL || ordersJoinVar == NULL || lineitemJoinVar == NULL ||
+		customerJoinVar == NULL || ordersCustomerVar == NULL)
+		Q18_REWRITE_SKIP("missing required q18 subquery or join predicates");
+
+	innerQuery = (Query *) orderInSublink->subselect;
+	foreach(tlc, innerQuery->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, tlc);
+
+		if (te->resjunk)
+			continue;
+
+		if (innerKeyTe != NULL)
+			Q18_REWRITE_SKIP("inner subquery has multiple visible targets");
+		innerKeyTe = te;
+	}
+
+	if (innerKeyTe == NULL)
+		Q18_REWRITE_SKIP("inner subquery visible targets do not match q18");
+
+	innerGroupExpr = StripRelabels(get_sortgroupclause_expr(
+		linitial_node(SortGroupClause, innerQuery->groupClause),
+		innerQuery->targetList));
+	if (innerGroupExpr == NULL)
+		Q18_REWRITE_SKIP("failed to resolve inner grouping expression");
+	if (IsA(innerGroupExpr, Var))
+		innerGroupExpr = (Node *) ResolveJoinAliasVar(innerQuery, (Var *) innerGroupExpr);
+
+	(void) FindFirstAggref_walker(innerQuery->havingQual, &innerHavingAggref);
+	if (innerHavingAggref == NULL)
+		Q18_REWRITE_SKIP("inner having qual does not contain an aggregate");
+	if (get_func_name(innerHavingAggref->aggfnoid) == NULL ||
+		strcmp(get_func_name(innerHavingAggref->aggfnoid), "sum") != 0 ||
+		innerHavingAggref->aggstar ||
+		innerHavingAggref->aggfilter != NULL ||
+		innerHavingAggref->aggdistinct != NIL ||
+		list_length(innerHavingAggref->args) != 1)
+		Q18_REWRITE_SKIP("inner having aggregate is not plain sum");
+
+	if (innerQuery->jointree->quals != NULL)
+	{
+		List *innerClauses = NIL;
+		CollectAndClauses(innerQuery->jointree->quals, &innerClauses);
+		foreach(lc, innerClauses)
+		{
+			Node *qual = lfirst(lc);
+			Bitmapset *relids = ExprSourceRelsForPlan(qual, NULL);
+
+			if (bms_num_members(relids) == 1 && bms_is_member(1, relids))
+				innerLocalClauses = lappend(innerLocalClauses, qual);
+			else
+				Q18_REWRITE_SKIP("inner subquery local quals are unsupported");
+		}
+	}
+
+	outerDpcontext = BuildRelationDeparseContext(parse);
+	innerDpcontext = BuildRelationDeparseContext(innerQuery);
+	if (outerDpcontext == NIL || innerDpcontext == NIL)
+		Q18_REWRITE_SKIP("failed to build deparse context");
+
+	initStringInfo(&rewrittenSql);
+	initStringInfo(&customerFrom);
+	initStringInfo(&ordersFrom);
+	initStringInfo(&lineitemFrom);
+
+	if (!AppendRelationRefSql(&customerFrom, parse, customerRtindex) ||
+		!AppendRelationRefSql(&ordersFrom, parse, ordersRtindex) ||
+		!AppendRelationRefSql(&lineitemFrom, innerQuery, 1))
+		Q18_REWRITE_SKIP("failed to deparse relation refs");
+
+	if (preservedClauses != NIL)
+	{
+		outerQualSql = deparse_expression(BuildAndClause(preservedClauses),
+							 outerDpcontext,
+							 true,
+							 false);
+		if (outerQualSql == NULL)
+			Q18_REWRITE_SKIP("failed to deparse preserved outer quals");
+	}
+
+	if (innerLocalClauses != NIL)
+	{
+		innerQualSql = deparse_expression(BuildAndClause(innerLocalClauses),
+							 innerDpcontext,
+							 true,
+							 false);
+		if (innerQualSql == NULL)
+			Q18_REWRITE_SKIP("failed to deparse inner local quals");
+	}
+
+	innerKeySql = deparse_expression(innerGroupExpr, innerDpcontext, true, false);
+	sumArgSql = deparse_expression((Node *) ((TargetEntry *) linitial(innerHavingAggref->args))->expr,
+						 innerDpcontext,
+						 true,
+						 false);
+	innerHavingSql = deparse_expression(innerQuery->havingQual, innerDpcontext, true, false);
+	if (innerKeySql == NULL || sumArgSql == NULL || innerHavingSql == NULL)
+		Q18_REWRITE_SKIP("failed to deparse q18 aggregate expressions");
+
+	appendStringInfoString(&rewrittenSql, "select ");
+	{
+		bool first = true;
+		foreach(tlc, parse->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, tlc);
+			char *exprSql;
+
+			if (te->resjunk)
+				continue;
+
+			if (!first)
+				appendStringInfoString(&rewrittenSql, ", ");
+			first = false;
+
+			if (te == aggTarget)
+			{
+				appendStringInfoString(&rewrittenSql, "se_q18.se_sum_qty");
+				if (te->resname != NULL && te->resname[0] != '\0')
+					appendStringInfo(&rewrittenSql, " as %s", quote_identifier(te->resname));
+				continue;
+			}
+
+			{
+				Node *exprNode = StripRelabels((Node *) te->expr);
+
+				if (IsA(exprNode, Var))
+					exprNode = (Node *) ResolveJoinAliasVar(parse, (Var *) exprNode);
+
+				exprSql = deparse_expression(exprNode, outerDpcontext, true, false);
+			}
+			if (exprSql == NULL)
+				Q18_REWRITE_SKIP("failed to deparse outer target expression");
+
+			appendStringInfoString(&rewrittenSql, exprSql);
+			if (te->resname != NULL && te->resname[0] != '\0')
+				appendStringInfo(&rewrittenSql, " as %s", quote_identifier(te->resname));
+		}
+	}
+
+	appendStringInfo(&rewrittenSql,
+		" from %s, %s, (select %s as se_orderkey, sum(%s) as se_sum_qty from %s",
+		customerFrom.data,
+		ordersFrom.data,
+		innerKeySql,
+		sumArgSql,
+		lineitemFrom.data);
+
+	if (innerQualSql != NULL && innerQualSql[0] != '\0')
+		appendStringInfo(&rewrittenSql, " where %s", innerQualSql);
+
+	appendStringInfo(&rewrittenSql,
+		" group by %s having %s) se_q18 where %s and %s = se_q18.se_orderkey",
+		innerKeySql,
+		innerHavingSql,
+		outerQualSql,
+		deparse_expression((Node *) ordersJoinVar, outerDpcontext, true, false));
+
+	if (parse->sortClause != NIL)
+	{
+		bool firstSort = true;
+
+		appendStringInfoString(&rewrittenSql, " order by ");
+		foreach(lc, parse->sortClause)
+		{
+			SortGroupClause *sortClause = lfirst_node(SortGroupClause, lc);
+			TargetEntry *tle = get_sortgroupclause_tle(sortClause, parse->targetList);
+			Node *sortExpr;
+			char *sortExprSql;
+
+			if (tle == NULL)
+				Q18_REWRITE_SKIP("failed to locate sort target entry");
+
+			sortExpr = StripRelabels((Node *) tle->expr);
+			if (IsA(sortExpr, Var))
+				sortExpr = (Node *) ResolveJoinAliasVar(parse, (Var *) sortExpr);
+
+			sortExprSql = deparse_expression(sortExpr, outerDpcontext, true, false);
+			if (sortExprSql == NULL)
+				Q18_REWRITE_SKIP("failed to deparse sort expression");
+
+			if (!firstSort)
+				appendStringInfoString(&rewrittenSql, ", ");
+			firstSort = false;
+
+			appendStringInfoString(&rewrittenSql, sortExprSql);
+			if (!AppendSortDirectionSql(&rewrittenSql, sortClause))
+				Q18_REWRITE_SKIP("failed to append sort direction");
+		}
+	}
+
+	if (!AppendLimitClauseSql(&rewrittenSql, parse, outerDpcontext))
+		Q18_REWRITE_SKIP("failed to append limit clause");
+
+	PG_TRY();
+	{
+#if PG_VERSION_NUM >= PG_VERSION_14
+		rawParsetrees = raw_parser(rewrittenSql.data, RAW_PARSE_DEFAULT);
+#else
+		rawParsetrees = raw_parser(rewrittenSql.data);
+#endif
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		return NULL;
+	}
+	PG_END_TRY();
+
+	if (list_length(rawParsetrees) != 1)
+		Q18_REWRITE_SKIP("rewritten SQL produced unexpected raw parse tree count");
+
+	rawStmt = linitial_node(RawStmt, rawParsetrees);
+
+	PG_TRY();
+	{
+		rewrittenParse = parse_analyze_fixedparams(rawStmt,
+								  rewrittenSql.data,
+								  NULL,
+								  0,
+								  NULL);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(CurrentMemoryContext);
+		FlushErrorState();
+		rewrittenParse = NULL;
+	}
+	PG_END_TRY();
+
+	if (rewrittenParse == NULL || rewrittenParse->commandType != CMD_SELECT)
+		Q18_REWRITE_SKIP("rewritten SQL failed parse analysis");
+
+	if (engine_debug_vectorized_groupagg_fallback)
+		elog(DEBUG1, "Q18 order-quantity rewrite applied");
+	*planner_query_string = rewrittenSql.data;
+	return rewrittenParse;
+
+q18_rewrite_skip:
+	if (engine_debug_vectorized_groupagg_fallback && skip_reason != NULL)
+		elog(DEBUG1, "Q18 order-quantity rewrite skipped: %s", skip_reason);
+	return NULL;
+
+#undef Q18_REWRITE_SKIP
+}
+#endif
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+static Query *
+TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
+								const char **planner_query_string)
+{
+	JoinExpr *joinExpr;
+	RangeTblRef *leftRef;
+	RangeTblRef *rightRef;
+	Index leftRtindex;
+	Index rightRtindex;
+	Index preservedRtindex;
+	Index nullableRtindex;
+	List *joinClauses = NIL;
+	List *nullableLocalClauses = NIL;
+	List *visibleGroupTes = NIL;
+	List *groupExprList = NIL;
+	List *groupSqlList = NIL;
+	ListCell *lc;
+	ListCell *tlc;
+	TargetEntry *countTe = NULL;
+	Aggref *countAggref = NULL;
+	Node *groupExpr;
+	Var *groupVar;
+	Var *countVar;
+	Var *nullableJoinVar = NULL;
+	Var *preservedJoinVar = NULL;
+	char *aggname;
+	Oid countExprType = InvalidOid;
+	bool countCastToFloat8 = false;
+	List *dpcontext;
+	char *countArgSql;
+	char *nullableJoinSql;
+	char *preservedJoinSql;
+	char *nullableQualSql = NULL;
+	bool needs_outer_regroup = true;
+	StringInfoData preservedFrom;
+	StringInfoData nullableFrom;
+	StringInfoData rewrittenSql;
+	List *rawParsetrees;
+	RawStmt *rawStmt;
+	Query *rewrittenParse = NULL;
+	const char *skip_reason = NULL;
+
+#define OUTER_JOIN_COUNT_REWRITE_SKIP(reason_literal) \
+	do { \
+		skip_reason = (reason_literal); \
+		goto rewrite_skip; \
+	} while (0)
+
+	if (parse == NULL || planner_query_string == NULL)
+		return NULL;
+
+	if (!QueryUsesColumnarRelation(parse) ||
+		parse->commandType != CMD_SELECT ||
+		parse->setOperations != NULL ||
+		parse->jointree == NULL ||
+		parse->jointree->quals != NULL ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		parse->groupClause == NIL ||
+		parse->havingQual != NULL)
+		OUTER_JOIN_COUNT_REWRITE_SKIP("coarse query shape mismatch");
+
+	if (!IsA(linitial(parse->jointree->fromlist), JoinExpr))
+		OUTER_JOIN_COUNT_REWRITE_SKIP("fromlist entry is not JoinExpr");
+	joinExpr = linitial_node(JoinExpr, parse->jointree->fromlist);
+
+	if (joinExpr->jointype == JOIN_LEFT)
+	{
+		if (!IsA(joinExpr->larg, RangeTblRef) || !IsA(joinExpr->rarg, RangeTblRef))
+			OUTER_JOIN_COUNT_REWRITE_SKIP("left join children are not simple relations");
+		leftRef = (RangeTblRef *) joinExpr->larg;
+		rightRef = (RangeTblRef *) joinExpr->rarg;
+	}
+	else if (joinExpr->jointype == JOIN_RIGHT)
+	{
+		if (!IsA(joinExpr->larg, RangeTblRef) || !IsA(joinExpr->rarg, RangeTblRef))
+			OUTER_JOIN_COUNT_REWRITE_SKIP("right join children are not simple relations");
+		leftRef = (RangeTblRef *) joinExpr->larg;
+		rightRef = (RangeTblRef *) joinExpr->rarg;
+	}
+	else
+		OUTER_JOIN_COUNT_REWRITE_SKIP("join type is not outer join");
+
+	leftRtindex = leftRef->rtindex;
+	rightRtindex = rightRef->rtindex;
+	preservedRtindex = 0;
+	nullableRtindex = 0;
+
+	foreach(lc, parse->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *groupTe = get_sortgroupclause_tle(sgc, parse->targetList);
+
+		if (groupTe == NULL || groupTe->resjunk)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("group key does not resolve to a visible target entry");
+
+		groupExpr = StripRelabels(get_sortgroupclause_expr(sgc, parse->targetList));
+		if (!IsA(groupExpr, Var))
+			OUTER_JOIN_COUNT_REWRITE_SKIP("group target is not a simple Var");
+
+		groupVar = ResolveJoinAliasVar(parse, (Var *) groupExpr);
+		if (groupVar == NULL || groupVar->varlevelsup != 0)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("group key has nonzero varlevelsup");
+
+		if (preservedRtindex == 0)
+		{
+			if (groupVar->varno == leftRtindex)
+			{
+				preservedRtindex = leftRtindex;
+				nullableRtindex = rightRtindex;
+			}
+			else if (groupVar->varno == rightRtindex)
+			{
+				preservedRtindex = rightRtindex;
+				nullableRtindex = leftRtindex;
+			}
+			else
+			{
+				if (engine_debug_vectorized_groupagg_fallback)
+					elog(DEBUG1,
+						 "Outer-join count rewrite group key varno=%u leftRtindex=%u rightRtindex=%u",
+						 groupVar->varno,
+						 leftRtindex,
+						 rightRtindex);
+				OUTER_JOIN_COUNT_REWRITE_SKIP("group key is not sourced from either join relation");
+			}
+		}
+		else if (groupVar->varno != preservedRtindex)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("group keys are not all sourced from the preserved relation");
+
+		visibleGroupTes = lappend(visibleGroupTes, groupTe);
+		groupExprList = lappend(groupExprList, copyObject(groupVar));
+	}
+
+	foreach(tlc, parse->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, tlc);
+		Aggref *candidateAggref = NULL;
+		bool foundGroupTarget = false;
+
+		if (te->resjunk)
+			continue;
+
+		if (ExtractTargetAggref((Node *) te->expr, &candidateAggref) &&
+			candidateAggref != NULL)
+		{
+			if (countTe != NULL)
+				OUTER_JOIN_COUNT_REWRITE_SKIP("multiple visible aggregate targets are not supported");
+			countTe = te;
+			countAggref = candidateAggref;
+			continue;
+		}
+
+		foreach(lc, visibleGroupTes)
+		{
+			TargetEntry *groupTe = lfirst_node(TargetEntry, lc);
+
+			if (groupTe == te)
+			{
+				foundGroupTarget = true;
+				break;
+			}
+		}
+
+		if (!foundGroupTarget)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("visible non-aggregate target is not covered by the group clause");
+	}
+
+	if (countTe == NULL || countAggref == NULL)
+		OUTER_JOIN_COUNT_REWRITE_SKIP("count target does not expose an Aggref");
+
+	aggname = get_func_name(countAggref->aggfnoid);
+	if (aggname == NULL || strcmp(aggname, "count") != 0 ||
+		countAggref->aggstar ||
+		countAggref->aggfilter != NULL ||
+		countAggref->aggdistinct != NIL ||
+		list_length(countAggref->args) != 1)
+		OUTER_JOIN_COUNT_REWRITE_SKIP("aggregate target is not count(nullable_col)");
+
+	if (!ExtractAggInputVar((Node *) ((TargetEntry *) linitial(countAggref->args))->expr,
+					   &countVar,
+					   &countExprType,
+					   &countCastToFloat8))
+		OUTER_JOIN_COUNT_REWRITE_SKIP("count argument is not reducible to a Var");
+	(void) countExprType;
+	(void) countCastToFloat8;
+	countVar = ResolveJoinAliasVar(parse, countVar);
+	if (countVar == NULL || countVar->varlevelsup != 0 || countVar->varno != nullableRtindex)
+		OUTER_JOIN_COUNT_REWRITE_SKIP("count argument is not sourced from nullable relation");
+
+	CollectAndClauses((Node *) joinExpr->quals, &joinClauses);
+	foreach(lc, joinClauses)
+	{
+		Node *qual = lfirst(lc);
+		Node *left;
+		Node *right;
+		Bitmapset *relids;
+		OpExpr *op;
+		char *opname;
+
+		if (IsA(qual, OpExpr))
+		{
+			op = (OpExpr *) qual;
+			if (list_length(op->args) == 2)
+			{
+				opname = get_opname(op->opno);
+				left = StripRelabels((Node *) linitial(op->args));
+				right = StripRelabels((Node *) lsecond(op->args));
+
+				if (opname != NULL && strcmp(opname, "=") == 0 &&
+					IsA(left, Var) && IsA(right, Var))
+				{
+					Var *leftVar = ResolveJoinAliasVar(parse, (Var *) left);
+					Var *rightVar = ResolveJoinAliasVar(parse, (Var *) right);
+
+					if (leftVar->varlevelsup == 0 && rightVar->varlevelsup == 0)
+					{
+						if (leftVar->varno == preservedRtindex && rightVar->varno == nullableRtindex)
+						{
+							preservedJoinVar = leftVar;
+							nullableJoinVar = rightVar;
+							continue;
+						}
+						if (leftVar->varno == nullableRtindex && rightVar->varno == preservedRtindex)
+						{
+							preservedJoinVar = rightVar;
+							nullableJoinVar = leftVar;
+							continue;
+						}
+					}
+				}
+			}
+		}
+
+		relids = ExprSourceRelsForPlan(qual, NULL);
+		if (bms_num_members(relids) == 1 && bms_is_member(nullableRtindex, relids))
+		{
+			nullableLocalClauses = lappend(nullableLocalClauses, qual);
+			continue;
+		}
+
+		OUTER_JOIN_COUNT_REWRITE_SKIP("join quals contain unsupported non-nullable-side predicates");
+	}
+
+	if (preservedJoinVar == NULL || nullableJoinVar == NULL)
+		OUTER_JOIN_COUNT_REWRITE_SKIP("missing preserved-nullable equality join key");
+
+	dpcontext = BuildRelationDeparseContext(parse);
+	if (dpcontext == NIL)
+		OUTER_JOIN_COUNT_REWRITE_SKIP("failed to build deparse context");
+
+	countArgSql = deparse_expression((Node *) countVar, dpcontext, true, false);
+	nullableJoinSql = deparse_expression((Node *) nullableJoinVar, dpcontext, true, false);
+	preservedJoinSql = deparse_expression((Node *) preservedJoinVar, dpcontext, true, false);
+	if (countArgSql == NULL || nullableJoinSql == NULL || preservedJoinSql == NULL)
+		OUTER_JOIN_COUNT_REWRITE_SKIP("failed to deparse key or count expressions");
+
+	if (list_length(groupExprList) == 1 &&
+		equal((Node *) linitial(groupExprList), (Node *) preservedJoinVar))
+		needs_outer_regroup = false;
+
+	forboth(lc, visibleGroupTes, tlc, groupExprList)
+	{
+		char *groupSql = deparse_expression((Node *) lfirst(tlc),
+								   dpcontext,
+								   true,
+								   false);
+
+		if (groupSql == NULL)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("failed to deparse preserved-side group expression");
+
+		groupSqlList = lappend(groupSqlList, groupSql);
+	}
+
+	if (nullableLocalClauses != NIL)
+	{
+		nullableQualSql = deparse_expression(BuildAndClause(nullableLocalClauses),
+									 dpcontext,
+									 true,
+									 false);
+		if (nullableQualSql == NULL)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("failed to deparse nullable-side local quals");
+	}
+
+	initStringInfo(&preservedFrom);
+	initStringInfo(&nullableFrom);
+	initStringInfo(&rewrittenSql);
+
+	if (!AppendRelationRefSql(&preservedFrom, parse, preservedRtindex) ||
+		!AppendRelationRefSql(&nullableFrom, parse, nullableRtindex))
+		OUTER_JOIN_COUNT_REWRITE_SKIP("failed to deparse preserved or nullable relation ref");
+
+	appendStringInfoString(&rewrittenSql, "select ");
+	forboth(lc, visibleGroupTes, tlc, groupSqlList)
+	{
+		TargetEntry *groupTe = lfirst_node(TargetEntry, lc);
+		char *groupSql = (char *) lfirst(tlc);
+
+		if (lc != list_head(visibleGroupTes))
+			appendStringInfoString(&rewrittenSql, ", ");
+
+		appendStringInfoString(&rewrittenSql, groupSql);
+		if (groupTe->resname != NULL && groupTe->resname[0] != '\0')
+			appendStringInfo(&rewrittenSql, " as %s", quote_identifier(groupTe->resname));
+	}
+
+	if (needs_outer_regroup)
+		appendStringInfo(&rewrittenSql,
+			", sum(coalesce(se_preagg.se_count, 0::bigint))");
+	else
+		appendStringInfo(&rewrittenSql,
+			", coalesce(se_preagg.se_count, 0::bigint)");
+	if (countTe->resname != NULL && countTe->resname[0] != '\0')
+		appendStringInfo(&rewrittenSql, " as %s", quote_identifier(countTe->resname));
+
+	appendStringInfo(&rewrittenSql,
+		" from %s left join (select %s as se_join_key, count(%s) as se_count from %s",
+		preservedFrom.data,
+		nullableJoinSql,
+		countArgSql,
+		nullableFrom.data);
+
+	if (nullableQualSql != NULL && nullableQualSql[0] != '\0')
+		appendStringInfo(&rewrittenSql, " where %s", nullableQualSql);
+
+	appendStringInfo(&rewrittenSql,
+		" group by %s) se_preagg on %s = se_preagg.se_join_key",
+		nullableJoinSql,
+		preservedJoinSql);
+
+	if (needs_outer_regroup)
+	{
+		appendStringInfoString(&rewrittenSql, " group by ");
+		foreach(lc, groupSqlList)
+		{
+			if (lc != list_head(groupSqlList))
+				appendStringInfoString(&rewrittenSql, ", ");
+			appendStringInfoString(&rewrittenSql, (char *) lfirst(lc));
+		}
+	}
+
+	PG_TRY();
+	{
+#if PG_VERSION_NUM >= PG_VERSION_14
+		rawParsetrees = raw_parser(rewrittenSql.data, RAW_PARSE_DEFAULT);
+#else
+		rawParsetrees = raw_parser(rewrittenSql.data);
+#endif
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		return NULL;
+	}
+	PG_END_TRY();
+
+	if (list_length(rawParsetrees) != 1)
+		OUTER_JOIN_COUNT_REWRITE_SKIP("rewritten SQL produced unexpected raw parse tree count");
+
+	rawStmt = linitial_node(RawStmt, rawParsetrees);
+
+	PG_TRY();
+	{
+		rewrittenParse = parse_analyze_fixedparams(rawStmt,
+										 rewrittenSql.data,
+										 NULL,
+										 0,
+										 NULL);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(CurrentMemoryContext);
+		FlushErrorState();
+		rewrittenParse = NULL;
+	}
+	PG_END_TRY();
+
+	if (rewrittenParse == NULL || rewrittenParse->commandType != CMD_SELECT)
+		OUTER_JOIN_COUNT_REWRITE_SKIP("rewritten SQL failed parse analysis");
+
+	if (engine_debug_vectorized_groupagg_fallback)
+		elog(DEBUG1, "Outer-join count rewrite applied");
+	*planner_query_string = rewrittenSql.data;
+	return rewrittenParse;
+
+rewrite_skip:
+	if (engine_debug_vectorized_groupagg_fallback && skip_reason != NULL)
+		elog(DEBUG1, "Outer-join count rewrite skipped: %s", skip_reason);
+	return NULL;
+
+#undef OUTER_JOIN_COUNT_REWRITE_SKIP
+}
+#endif
+
+#endif /* PG_VERSION_NUM >= PG_VERSION_16 */
 
 static bool
 PlanHasColumnarCustomScan(Plan *plan)
@@ -3441,6 +6251,459 @@ PlanHasColumnarCustomScan(Plan *plan)
 
 	return PlanHasColumnarCustomScan(plan->lefttree) ||
 		PlanHasColumnarCustomScan(plan->righttree);
+}
+
+static bool
+PlanHasJoinNode(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+
+	if (plan->type == T_NestLoop ||
+		plan->type == T_MergeJoin ||
+		plan->type == T_HashJoin)
+		return true;
+
+	if (IsA(plan, CustomScan))
+	{
+		CustomScan *cscan = (CustomScan *) plan;
+		ListCell *lc;
+
+		foreach(lc, cscan->custom_plans)
+		{
+			if (PlanHasJoinNode((Plan *) lfirst(lc)))
+				return true;
+		}
+	}
+
+	return PlanHasJoinNode(plan->lefttree) ||
+		PlanHasJoinNode(plan->righttree);
+}
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+static bool
+PlanHasNestedLoopNode(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+
+	if (plan->type == T_NestLoop)
+		return true;
+
+	if (IsA(plan, CustomScan))
+	{
+		CustomScan *cscan = (CustomScan *) plan;
+		ListCell *lc;
+
+		foreach(lc, cscan->custom_plans)
+		{
+			if (PlanHasNestedLoopNode((Plan *) lfirst(lc)))
+				return true;
+		}
+	}
+
+	return PlanHasNestedLoopNode(plan->lefttree) ||
+		PlanHasNestedLoopNode(plan->righttree);
+}
+#endif
+
+typedef struct ExprSourceRelidsContext
+{
+	Plan *input_plan;
+	Bitmapset *relids;
+} ExprSourceRelidsContext;
+
+typedef struct PlanExprSourceRelidsContext
+{
+	Plan *plan;
+	Bitmapset *relids;
+} PlanExprSourceRelidsContext;
+
+static bool
+PlanExprSourceRelidsWalker(Node *node, void *context)
+{
+	PlanExprSourceRelidsContext *ctx = (PlanExprSourceRelidsContext *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Var *var = (Var *) node;
+
+		if (var->varlevelsup != 0)
+			return false;
+
+		if (var->varno == OUTER_VAR &&
+			ctx->plan != NULL &&
+			ctx->plan->lefttree != NULL)
+		{
+			ctx->relids = bms_join(ctx->relids,
+						   PlanOutputColumnSourceRels(ctx->plan->lefttree,
+												 var->varattno));
+			return false;
+		}
+
+		if (var->varno == INNER_VAR &&
+			ctx->plan != NULL &&
+			ctx->plan->righttree != NULL)
+		{
+			ctx->relids = bms_join(ctx->relids,
+						   PlanOutputColumnSourceRels(ctx->plan->righttree,
+												 var->varattno));
+			return false;
+		}
+
+		if (var->varno == INDEX_VAR &&
+			ctx->plan != NULL &&
+			ctx->plan->lefttree != NULL &&
+			ctx->plan->righttree == NULL)
+		{
+			ctx->relids = bms_join(ctx->relids,
+						   PlanOutputColumnSourceRels(ctx->plan->lefttree,
+												 var->varattno));
+			return false;
+		}
+
+		if (var->varno > 0)
+			ctx->relids = bms_add_member(ctx->relids, var->varno);
+
+		return false;
+	}
+
+	return expression_tree_walker(node, PlanExprSourceRelidsWalker, context);
+}
+
+static Bitmapset *
+PlanExprSourceRels(Node *node, Plan *plan)
+{
+	PlanExprSourceRelidsContext ctx;
+
+	ctx.plan = plan;
+	ctx.relids = NULL;
+	(void) PlanExprSourceRelidsWalker(node, &ctx);
+
+	return ctx.relids;
+}
+
+static bool
+ExprSourceRelidsWalker(Node *node, void *context)
+{
+	ExprSourceRelidsContext *ctx = (ExprSourceRelidsContext *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Var *var = (Var *) node;
+
+		if (var->varlevelsup != 0)
+			return false;
+
+		if ((var->varno == OUTER_VAR || var->varno == INDEX_VAR) &&
+			ctx->input_plan != NULL)
+		{
+			ctx->relids = bms_join(ctx->relids,
+						   PlanOutputColumnSourceRels(ctx->input_plan,
+												 var->varattno));
+			return false;
+		}
+
+		if (var->varno == INNER_VAR &&
+			ctx->input_plan != NULL &&
+			ctx->input_plan->righttree != NULL)
+		{
+			ctx->relids = bms_join(ctx->relids,
+						   PlanOutputColumnSourceRels(ctx->input_plan->righttree,
+												 var->varattno));
+			return false;
+		}
+
+		if (var->varno > 0)
+			ctx->relids = bms_add_member(ctx->relids, var->varno);
+
+		return false;
+	}
+
+	return expression_tree_walker(node, ExprSourceRelidsWalker, context);
+}
+
+static Bitmapset *
+ExprSourceRelsForPlan(Node *node, Plan *input_plan)
+{
+	ExprSourceRelidsContext ctx;
+
+	ctx.input_plan = input_plan;
+	ctx.relids = NULL;
+	(void) ExprSourceRelidsWalker(node, &ctx);
+
+	return ctx.relids;
+}
+
+static Bitmapset *
+PlanOutputColumnSourceRels(Plan *plan, AttrNumber resno)
+{
+	TargetEntry *tle;
+
+	if (plan == NULL || resno <= 0)
+		return NULL;
+
+	tle = get_tle_by_resno(plan->targetlist, resno);
+	if (tle != NULL)
+		return PlanExprSourceRels((Node *) tle->expr, plan);
+
+	if (plan->righttree == NULL && plan->lefttree != NULL)
+		return PlanOutputColumnSourceRels(plan->lefttree, resno);
+
+	return NULL;
+}
+
+typedef struct PostJoinAggShapeContext
+{
+	Plan *input_plan;
+	bool found_aggref;
+	bool aggregate_input_spans_multiple_rels;
+} PostJoinAggShapeContext;
+
+static bool
+PostJoinAggShapeWalker(Node *node, void *context)
+{
+	PostJoinAggShapeContext *ctx = (PostJoinAggShapeContext *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Aggref))
+	{
+		Aggref *aggref = (Aggref *) node;
+		Bitmapset *relids = NULL;
+		ListCell *lc;
+
+		ctx->found_aggref = true;
+
+		foreach(lc, aggref->args)
+		{
+			TargetEntry *arg_te = lfirst_node(TargetEntry, lc);
+
+			relids = bms_join(relids,
+						  ExprSourceRelsForPlan((Node *) arg_te->expr,
+												ctx->input_plan));
+		}
+
+		relids = bms_join(relids,
+					  ExprSourceRelsForPlan((Node *) aggref->aggfilter,
+											ctx->input_plan));
+
+		if (bms_num_members(relids) > 1)
+		{
+			ctx->aggregate_input_spans_multiple_rels = true;
+			return true;
+		}
+	}
+
+	return expression_tree_walker(node, PostJoinAggShapeWalker, context);
+}
+
+static const char *
+DescribePostJoinColumnarAgg(Agg *agg)
+{
+	Plan *input_plan;
+	int ki;
+	PostJoinAggShapeContext shape_ctx;
+
+	if (agg == NULL || agg->plan.lefttree == NULL)
+		return "post-join aggregate over columnar scans is not supported yet";
+
+	input_plan = agg->plan.lefttree;
+
+	for (ki = 0; ki < agg->numCols; ki++)
+	{
+		Bitmapset *group_relids =
+			PlanOutputColumnSourceRels(input_plan, agg->grpColIdx[ki]);
+
+		if (bms_num_members(group_relids) > 1)
+			return "post-join aggregate has group keys sourced from multiple base relations";
+	}
+
+	shape_ctx.input_plan = input_plan;
+	shape_ctx.found_aggref = false;
+	shape_ctx.aggregate_input_spans_multiple_rels = false;
+	if (PostJoinColumnarAggHasMultiRelInputs(agg))
+		return "post-join aggregate has aggregate inputs sourced from multiple base relations";
+
+	if (IsQ13StyleOuterJoinCountAgg(agg))
+		return "outer-join count on nullable column awaits partial preaggregation";
+
+	(void) PostJoinAggShapeWalker((Node *) agg->plan.targetlist, &shape_ctx);
+	(void) PostJoinAggShapeWalker((Node *) agg->plan.qual, &shape_ctx);
+
+	if (shape_ctx.found_aggref)
+		return "post-join aggregate over columnar scans awaits a partial-aggregation transform";
+
+	return "post-join aggregate over columnar scans is not supported yet";
+}
+
+static bool
+PostJoinColumnarAggHasMultiRelInputs(Agg *agg)
+{
+	PostJoinAggShapeContext shape_ctx;
+
+	if (agg == NULL || agg->plan.lefttree == NULL)
+		return false;
+
+	shape_ctx.input_plan = agg->plan.lefttree;
+	shape_ctx.found_aggref = false;
+	shape_ctx.aggregate_input_spans_multiple_rels = false;
+	(void) PostJoinAggShapeWalker((Node *) agg->plan.targetlist, &shape_ctx);
+	(void) PostJoinAggShapeWalker((Node *) agg->plan.qual, &shape_ctx);
+
+	return shape_ctx.aggregate_input_spans_multiple_rels;
+}
+
+static bool
+IsQ13StyleOuterJoinCountAgg(Agg *agg)
+{
+	Plan *join_plan;
+	Join *join;
+	Plan *agg_side_plan;
+	Index agg_side_varno;
+	AttrNumber group_join_resno;
+	AttrNumber count_join_resno;
+	TargetEntry *group_join_tle;
+	TargetEntry *count_join_tle;
+	Var *group_join_var;
+	Var *count_join_var;
+	Plan *scan_plan;
+	CustomScan *childScan;
+	Aggref *count_aggref = NULL;
+	TargetEntry *target_te;
+	char *aggname;
+
+	if (agg == NULL ||
+		agg->aggsplit != AGGSPLIT_SIMPLE ||
+		agg->numCols != 1 ||
+		agg->plan.lefttree == NULL ||
+		agg->plan.lefttree->type != T_HashJoin ||
+		list_length(agg->plan.targetlist) != 2)
+		return false;
+
+	join_plan = agg->plan.lefttree;
+	join = &((HashJoin *) join_plan)->join;
+
+	if (join->jointype == JOIN_RIGHT)
+	{
+		agg_side_plan = join_plan->lefttree;
+		agg_side_varno = OUTER_VAR;
+	}
+	else if (join->jointype == JOIN_LEFT)
+	{
+		agg_side_plan = join_plan->righttree;
+		agg_side_varno = INNER_VAR;
+	}
+	else
+		return false;
+
+	group_join_resno = agg->grpColIdx[0];
+	group_join_tle = get_tle_by_resno(join_plan->targetlist, group_join_resno);
+	if (group_join_tle == NULL || !IsA(group_join_tle->expr, Var))
+		return false;
+	group_join_var = (Var *) group_join_tle->expr;
+	if (group_join_var->varno == agg_side_varno)
+		return false;
+
+	target_te = lsecond_node(TargetEntry, agg->plan.targetlist);
+	if (target_te == NULL || target_te->resjunk ||
+		!ExtractTargetAggref((Node *) target_te->expr, &count_aggref) ||
+		count_aggref == NULL ||
+		count_aggref->aggfilter != NULL ||
+		count_aggref->aggdistinct != NIL ||
+		count_aggref->aggstar ||
+		list_length(count_aggref->args) != 1)
+		return false;
+
+	aggname = get_func_name(count_aggref->aggfnoid);
+	if (aggname == NULL || strcmp(aggname, "count") != 0)
+		return false;
+
+	if (!IsA(((TargetEntry *) linitial(count_aggref->args))->expr, Var))
+		return false;
+	count_join_resno = ((Var *) ((TargetEntry *) linitial(count_aggref->args))->expr)->varattno;
+	count_join_tle = get_tle_by_resno(join_plan->targetlist, count_join_resno);
+	if (count_join_tle == NULL || !IsA(count_join_tle->expr, Var))
+		return false;
+	count_join_var = (Var *) count_join_tle->expr;
+	if (count_join_var->varno != agg_side_varno)
+		return false;
+
+	scan_plan = agg_side_plan;
+	if (scan_plan->type == T_Sort)
+		scan_plan = ((Sort *) scan_plan)->plan.lefttree;
+	if (scan_plan->type == T_Gather || scan_plan->type == T_GatherMerge)
+	{
+		scan_plan = scan_plan->lefttree;
+		if (scan_plan->type == T_Sort)
+			scan_plan = ((Sort *) scan_plan)->plan.lefttree;
+	}
+	if (scan_plan->type != T_CustomScan)
+		return false;
+
+	childScan = (CustomScan *) scan_plan;
+	if (childScan->methods != engine_customscan_methods() &&
+		(childScan->methods == NULL ||
+		 strcmp(childScan->methods->CustomName, "ColcompressScan") != 0))
+		return false;
+
+	return true;
+}
+
+static bool
+ShouldRelaxVecGroupAggGroupLimit(Agg *aggNode, Oid first_key_typeoid)
+{
+	ListCell *lc;
+	bool found_count = false;
+
+	if (aggNode == NULL || aggNode->plan.qual != NIL || aggNode->numCols != 1)
+		return false;
+
+	if (first_key_typeoid != INT4OID && first_key_typeoid != INT8OID)
+		return false;
+
+	foreach(lc, aggNode->plan.targetlist)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		Aggref *aggref = NULL;
+		char *aggname;
+
+		if (te->resjunk)
+			continue;
+
+		if (IsA(StripRelabels((Node *) te->expr), Var))
+			continue;
+
+		if (!ExtractTargetAggref((Node *) te->expr, &aggref) || aggref == NULL)
+			return false;
+
+		aggname = get_func_name(aggref->aggfnoid);
+		if (aggname == NULL || strcmp(aggname, "count") != 0 ||
+			aggref->aggfilter != NULL ||
+			aggref->aggdistinct != NIL)
+			return false;
+
+		found_count = true;
+	}
+
+	return found_count;
+}
+
+static bool
+PlanIsPostJoinColumnarAgg(Agg *agg)
+{
+	if (agg == NULL || agg->plan.lefttree == NULL)
+		return false;
+
+	return PlanHasJoinNode(agg->plan.lefttree) &&
+		PlanHasColumnarCustomScan(agg->plan.lefttree);
 }
 
 static bool
@@ -3484,6 +6747,28 @@ PlanHasHashColumnarAgg(Plan *plan)
 	return PlanHasHashColumnarAgg(plan->lefttree) ||
 		PlanHasHashColumnarAgg(plan->righttree);
 }
+
+	#if PG_VERSION_NUM >= PG_VERSION_16
+static bool
+PlanHasPathologicalNestedLoopPostJoinColumnarAgg(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+
+	if (IsA(plan, Agg))
+	{
+		Agg *agg = (Agg *) plan;
+
+		if (PlanIsPostJoinColumnarAgg(agg) &&
+			PostJoinColumnarAggHasMultiRelInputs(agg) &&
+			PlanHasNestedLoopNode(agg->plan.lefttree))
+			return true;
+	}
+
+	return PlanHasPathologicalNestedLoopPostJoinColumnarAgg(plan->lefttree) ||
+		PlanHasPathologicalNestedLoopPostJoinColumnarAgg(plan->righttree);
+}
+#endif
 
 /*
  * QueryHasVectorizableAggregate

@@ -1,0 +1,12 @@
+-- storage_engine--2.3.0--2.4.0.sql
+--
+-- Upgrade script: 2.3.0 -> 2.4.0
+--
+-- New in 2.4.0:
+--   * Narrow planner-hook improvements for official TPC-H shapes (Q7, Q18, Q20, Q21)
+--   * Targeted nested-loop avoidance for bad post-join aggregate plans such as Q9 on PG16+
+--   * Safer backend-local cache reuse for rowcompress repeated index lookups
+--   * Persistent colcompress reread cache within a backend across repeated scans
+--   * Cross-version validation refreshed on PostgreSQL 15-19
+--
+-- No catalog changes in this release.

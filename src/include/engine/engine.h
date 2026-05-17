@@ -264,10 +264,17 @@ typedef struct RowMaskWriteStateEntry RowMaskWriteStateEntry;
 /* Cache statistics for when caching is enabled and used. */
 typedef struct ColumnarCacheStatistics
 {
+	uint64 lookups;
 	uint64 hits;
+	uint64 sameScanHits;
+	uint64 reusedScanHits;
 	uint64 misses;
 	uint64 evictions;
+	uint64 evictedBytes;
 	uint64 writes;
+	uint64 overwrites;
+	uint64 bytesWritten;
+	uint64 bytesReused;
 	uint64 maximumCacheSize;
 	uint64 endingCacheSize;
 	uint64 entries;
@@ -282,8 +289,10 @@ extern bool engine_enable_parallel_execution;
 extern int engine_min_parallel_processes;
 extern bool engine_enable_vectorization;
 extern bool engine_enable_vectorized_groupagg;
+extern int  engine_vecgroupagg_max_groups;
 extern bool engine_enable_automatic_plan;
 extern bool engine_debug_vectorized_groupagg_fallback;
+extern bool engine_debug_vectorized_groupagg_exec;
 extern bool engine_enable_dml;
 extern bool engine_enable_page_cache;
 extern int engine_page_cache_size;
@@ -317,11 +326,14 @@ extern ColumnarReadState * ColumnarBeginRead(Relation relation,
 											 List *qualConditions,
 											 MemoryContext scanContext,
 											 Snapshot snaphot,
+									 uint64 scanGeneration,
 											 bool randomAccess,
 											 ParallelColumnarScan parallaleColumnarScan);
 extern void ColumnarReadFlushPendingWrites(ColumnarReadState *readState);
 extern void ColumnarEndRead(ColumnarReadState *state);
 extern void ColumnarResetRead(ColumnarReadState *readState);
+extern void ColumnarResetChunkGroupRead(ColumnarReadState *readState);
+extern void ColumnarUnmarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId);
 
 /* functions only applicable for sequential access */
 extern bool ColumnarReadNextRow(ColumnarReadState *state, Datum *columnValues,
@@ -479,9 +491,11 @@ extern MemoryContext GetColumnarReadStateCache(void);
 
 /* engine_cache.c */
 extern void ColumnarMarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId);
-extern void ColumnarAddCacheEntry(uint64, uint64, uint64, uint32, void *);
-extern void *ColumnarRetrieveCache(uint64, uint64, uint64, uint32);
+extern uint64 ColumnarCacheRegisterScan(void);
+extern void ColumnarAddCacheEntry(uint64, uint64, uint64, uint32, void *, uint64);
+extern void *ColumnarRetrieveCache(uint64, uint64, uint64, uint32, uint64);
 extern void ColumnarResetCache(void);
+extern void ColumnarInvalidateRelationCache(uint64 relId);
 extern ColumnarCacheStatistics *ColumnarGetCacheStatistics(void);
 extern MemoryContext ColumnarCacheMemoryContext(void);
 

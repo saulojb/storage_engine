@@ -1,4 +1,4 @@
-comment = 'Storage Engine — colcompress, rowcompress, chcompress (embedded ClickHouse) Table AMs + vectorized aggregation (v2.3)'
-default_version = '2.3.0'
+comment = 'Storage Engine — colcompress, rowcompress, chcompress (embedded ClickHouse) Table AMs + vectorized aggregation (v2.4)'
+default_version = '2.4.0'
 module_pathname = '$libdir/storage_engine'
 relocatable = false

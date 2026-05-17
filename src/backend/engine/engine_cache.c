@@ -48,6 +48,7 @@ struct ColumnarCacheEntry
 	uint64 chunkId;
 	uint64 readCount;
 	uint64 length;
+	uint64 writerScanGeneration;
 	time_t creationTime;
 	time_t lastAccessTime;
 	void *store;
@@ -71,6 +72,9 @@ static uint64 totalAllocationLength = 0;
  */
 static ColumnarCacheStatistics statistics = { 0 };
 
+static pg_atomic_uint64 columnarScanGeneration;
+static bool columnarScanGenerationInitialized = false;
+
 /*
  * Housekeeping of current chunk in use - so they are not evicted.
  */
@@ -83,6 +87,24 @@ typedef struct ColumarCacheChunkGroupInUse
 
 static List * ChunkGroupsInUse = NIL;
 
+static void
+EnsureColumnarCacheGlobalsInitialized(void)
+{
+	if (!columnarScanGenerationInitialized)
+	{
+		pg_atomic_init_u64(&columnarScanGeneration, 0);
+		columnarScanGenerationInitialized = true;
+	}
+}
+
+uint64
+ColumnarCacheRegisterScan(void)
+{
+	EnsureColumnarCacheGlobalsInitialized();
+
+	return pg_atomic_add_fetch_u64(&columnarScanGeneration, 1);
+}
+
 /*
  * ColumnarCacheMemoryContext
  *
@@ -93,6 +115,8 @@ static List * ChunkGroupsInUse = NIL;
 MemoryContext
 ColumnarCacheMemoryContext(void)
 {
+	EnsureColumnarCacheGlobalsInitialized();
+
 	if (columnarCacheContext == NULL)
 	{
 		columnarCacheContext = 
@@ -127,6 +151,33 @@ ColumnarResetCache(void)
 	head = NULL;
 }
 
+void
+ColumnarInvalidateRelationCache(uint64 relId)
+{
+	if (head == NULL)
+		return;
+
+	dlist_mutable_iter miter;
+	dlist_foreach_modify(miter, head)
+	{
+		ColumnarCacheEntry *entry = dlist_container(ColumnarCacheEntry, list_node, miter.cur);
+
+		if (entry->relId != relId)
+			continue;
+
+		dlist_delete(miter.cur);
+		totalAllocationLength -= entry->length;
+		statistics.evictions++;
+		statistics.evictedBytes += entry->length;
+
+		StringInfo str = entry->store;
+		if (str->data)
+			pfree(str->data);
+		pfree(str);
+		pfree(entry);
+	}
+}
+
 /*
  * ColumnarFindInCache
  *
@@ -151,6 +202,7 @@ ColumnarFindInCache(uint64 relId, uint64 stripeId, uint64 chunkId, uint32 column
 			entry->chunkId == chunkId && entry->columnId == columnId)
 		{
 			entry->readCount++;
+			entry->lastAccessTime = time(NULL);
 
 			return entry;
 		}
@@ -184,6 +236,7 @@ ColumnarInvalidateCacheEntry(uint64 relId, uint64 stripeId, uint64 chunkId, uint
 
 			totalAllocationLength -= entry->length;
 			statistics.evictions++;
+			statistics.evictedBytes += entry->length;
 
 			return true;
 		}
@@ -236,6 +289,7 @@ EvictCache(uint64 size)
 
 				totalAllocationLength -= entry->length;
 				statistics.evictions++;
+				statistics.evictedBytes += entry->length;
 
 				StringInfo str = entry->store;
 				if (str->data) {
@@ -264,37 +318,52 @@ EvictCache(uint64 size)
 void
 ColumnarMarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId)
 {
-	bool found = false;
-	ListCell *lc;
-
 	MemoryContext ctx = MemoryContextSwitchTo(ColumnarCacheMemoryContext());
 
-	foreach(lc, ChunkGroupsInUse)
-	{
-		ColumarCacheChunkGroupInUse *chunkGroupInUse =
-			(ColumarCacheChunkGroupInUse *) lfirst(lc);
-
-		if (chunkGroupInUse->relId == relId)
-		{
-			chunkGroupInUse->stripeId = stripeId;
-			chunkGroupInUse->chunkId = chunkId;
-			found = true;
-		}
-	}
-
-	if (!found)
-	{
-		ColumarCacheChunkGroupInUse *newChunkGroupInUse =
-			palloc0(sizeof(ColumarCacheChunkGroupInUse));
-
-		newChunkGroupInUse->relId = relId;
-		newChunkGroupInUse->stripeId = stripeId;
-		newChunkGroupInUse->chunkId = chunkId;
-
-		ChunkGroupsInUse = lappend(ChunkGroupsInUse, newChunkGroupInUse);
-	}
+	/*
+	 * Append a new entry for this (relId, stripeId, chunkId) tuple.
+	 * Multiple concurrent scans on the same relation each protect their own
+	 * chunk group independently.  ColumnarUnmarkChunkGroupInUse removes
+	 * exactly one matching entry when the chunk group is released.
+	 */
+	ColumarCacheChunkGroupInUse *newEntry =
+		palloc0(sizeof(ColumarCacheChunkGroupInUse));
+	newEntry->relId  = relId;
+	newEntry->stripeId = stripeId;
+	newEntry->chunkId  = chunkId;
+	ChunkGroupsInUse = lappend(ChunkGroupsInUse, newEntry);
 
 	MemoryContextSwitchTo(ctx);
+}
+
+/*
+ * ColumnarUnmarkChunkGroupInUse
+ *
+ * Remove exactly one in-use entry matching (relId, stripeId, chunkId).
+ * Called from EndChunkGroupRead so that EvictCache can reclaim the buffer
+ * once no scan is actively reading it.
+ */
+void
+ColumnarUnmarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId)
+{
+	if (ChunkGroupsInUse == NIL)
+		return;
+
+	ListCell *lc;
+	foreach(lc, ChunkGroupsInUse)
+	{
+		ColumarCacheChunkGroupInUse *entry =
+			(ColumarCacheChunkGroupInUse *) lfirst(lc);
+
+		if (entry->relId   == relId &&
+			entry->stripeId == stripeId &&
+			entry->chunkId  == chunkId)
+		{
+			ChunkGroupsInUse = list_delete_cell(ChunkGroupsInUse, lc);
+			pfree(entry);
+			return;		/* remove exactly one entry */
+		}
+	}
 }
 
 /*
@@ -304,7 +373,7 @@ ColumnarMarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId)
  */
 void
 ColumnarAddCacheEntry(uint64 relId, uint64 stripeId, uint64 chunkId, 
-					  uint32 columnId, void *data)
+					  uint32 columnId, void *data, uint64 scanGeneration)
 {
 	if (engine_enable_page_cache == false)
 	{
@@ -316,12 +385,15 @@ ColumnarAddCacheEntry(uint64 relId, uint64 stripeId, uint64 chunkId,
 	if (head == NULL)
 	{
 		head = palloc0(sizeof(dlist_head));
+		dlist_init(head);
 	}
 
 	ColumnarCacheEntry *entry = ColumnarFindInCache(relId, stripeId, chunkId, columnId);
 
 	if (entry != NULL)
 	{
+		statistics.overwrites++;
+
 		/* Free up any existing stored data, everything else will be overwritten. */
 		StringInfo str = entry->store;
 		if (str->data)
@@ -352,6 +424,8 @@ ColumnarAddCacheEntry(uint64 relId, uint64 stripeId, uint64 chunkId,
 
 	entry->store = data;
 	entry->length = size;
+	entry->writerScanGeneration = scanGeneration;
+	entry->lastAccessTime = time(NULL);
 
 	totalAllocationLength += size;
 
@@ -368,6 +442,7 @@ ColumnarAddCacheEntry(uint64 relId, uint64 stripeId, uint64 chunkId,
 	}
 
 	statistics.writes++;
+	statistics.bytesWritten += size;
 
 	MemoryContextSwitchTo(oldContext);
 }
@@ -379,12 +454,15 @@ ColumnarAddCacheEntry(uint64 relId, uint64 stripeId, uint64 chunkId,
  * make a copy in the current memory context and return it.
  */
 void *
-ColumnarRetrieveCache(uint64 relId, uint64 stripeId, uint64 chunkId, uint32 columnId)
+ColumnarRetrieveCache(uint64 relId, uint64 stripeId, uint64 chunkId, uint32 columnId,
+					 uint64 scanGeneration)
 {
 	if (engine_enable_page_cache == false)
 	{
 		return NULL;
 	}
+
+	statistics.lookups++;
 
 	ColumnarCacheEntry *entry = ColumnarFindInCache(relId, stripeId, chunkId, columnId);
 
@@ -396,6 +474,15 @@ ColumnarRetrieveCache(uint64 relId, uint64 stripeId, uint64 chunkId, uint32 colu
 	}
 
 	statistics.hits++;
+	if (entry->writerScanGeneration == scanGeneration)
+	{
+		statistics.sameScanHits++;
+	}
+	else
+	{
+		statistics.reusedScanHits++;
+	}
+	statistics.bytesReused += entry->length;
 
 	void *chunkCopy = entry->store;
 

@@ -14,6 +14,7 @@ Covers:
   - NULL handling (empty table, all-NULL column, mixed NULLs)
   - EXPLAIN plan verification (StorageEngineVectorAgg node)
   - EXPLAIN ANALYZE correctness (not blocked by IsExplainQuery)
+    - PG19 correlated scalar aggregate decorrelation (single-relation + multi-relation)
   - Parallel safety (AGGSPLIT_SIMPLE guard)
   - Multi-column aggregate query
   - Upgrade path chain traversability
@@ -828,10 +829,10 @@ class TestRunner:
             "SET max_parallel_workers_per_gather=0; "
             "EXPLAIN SELECT sum(i4), round(avg(num), 6), sum(m) FROM _texpl_mixed"
         )
-        self.check("mixed numeric+money: EXPLAIN falls back to regular Agg",
-                   "StorageEngineVectorAgg" not in plan_mixed, plan_mixed[:400])
+        self.check("mixed numeric+money: EXPLAIN shows StorageEngineVectorAgg",
+                   "StorageEngineVectorAgg" in plan_mixed, plan_mixed[:400])
 
-        self.agg_ok("mixed numeric+money: VEC ON falls back without changing result",
+        self.agg_ok("mixed numeric+money: VEC ON matches regular result",
                     "SELECT sum(i4), round(avg(num), 6), sum(m) FROM _texpl_mixed")
 
         out, rc, err = self._run(
@@ -841,6 +842,176 @@ class TestRunner:
         )
         self.check("mixed numeric+money: VEC ON query runs without crash",
                    rc == 0, err[:200] if err else out[:200])
+
+    def test_pg19_correlated_scalar_decorrelation(self) -> None:
+        self.section("PG19 Correlated Scalar Aggregate Decorrelation")
+
+        server_version_num = self.q1("SHOW server_version_num")
+        if not server_version_num or int(server_version_num) < 190000:
+            self.check("PG19+ only: correlated decorrelation test skipped", True)
+            return
+
+        rc, err = self.exec("""
+            DROP TABLE IF EXISTS _corr_dim;
+            DROP TABLE IF EXISTS _corr_supp;
+            DROP TABLE IF EXISTS _corr_fact_heap;
+            DROP TABLE IF EXISTS _corr_fact_col;
+            DROP TABLE IF EXISTS _corr_part_heap;
+            DROP TABLE IF EXISTS _corr_part_col;
+            DROP TABLE IF EXISTS _corr_ps_heap;
+            DROP TABLE IF EXISTS _corr_ps_col;
+
+            CREATE TABLE _corr_dim (
+                partkey integer,
+                tag text
+            ) USING heap;
+
+            CREATE TABLE _corr_supp (
+                suppkey integer,
+                region text
+            ) USING heap;
+
+            CREATE TABLE _corr_fact_heap (
+                partkey integer,
+                qty integer
+            ) USING heap;
+
+            CREATE TABLE _corr_fact_col (
+                partkey integer,
+                qty integer
+            ) USING colcompress;
+
+            CREATE TABLE _corr_part_heap (
+                partkey integer,
+                kind text
+            ) USING heap;
+
+            CREATE TABLE _corr_part_col (
+                partkey integer,
+                kind text
+            ) USING colcompress;
+
+            CREATE TABLE _corr_ps_heap (
+                partkey integer,
+                suppkey integer,
+                cost integer
+            ) USING heap;
+
+            CREATE TABLE _corr_ps_col (
+                partkey integer,
+                suppkey integer,
+                cost integer
+            ) USING colcompress;
+
+            INSERT INTO _corr_dim VALUES
+                (1, 'keep'),
+                (2, 'keep'),
+                (3, 'skip');
+
+            INSERT INTO _corr_supp VALUES
+                (1, 'EU'),
+                (2, 'EU'),
+                (3, 'US');
+
+            INSERT INTO _corr_fact_heap VALUES
+                (1, 10), (1, 20), (1, 30),
+                (2, 5), (2, 15), (2, 40),
+                (3, 100);
+
+            INSERT INTO _corr_fact_col SELECT * FROM _corr_fact_heap;
+
+            INSERT INTO _corr_part_heap VALUES
+                (1, 'keep'),
+                (2, 'keep'),
+                (3, 'skip');
+
+            INSERT INTO _corr_part_col SELECT * FROM _corr_part_heap;
+
+            INSERT INTO _corr_ps_heap VALUES
+                (1, 1, 10), (1, 2, 12), (1, 3, 1),
+                (2, 1, 7), (2, 2, 7), (2, 3, 2),
+                (3, 1, 50);
+
+            INSERT INTO _corr_ps_col SELECT * FROM _corr_ps_heap;
+        """)
+        self.check("setup correlated decorrelation fixtures", rc == 0, err[:200] if err else "")
+
+        single_heap_sql = (
+            "SELECT c.partkey, c.qty "
+            "FROM _corr_fact_heap c, _corr_dim d "
+            "WHERE d.partkey = c.partkey "
+            "AND d.tag = 'keep' "
+            "AND c.qty < ("
+            "  SELECT avg(c2.qty) "
+            "  FROM _corr_fact_heap c2 "
+            "  WHERE c2.partkey = d.partkey"
+            ") "
+            "ORDER BY 1, 2"
+        )
+        single_col_sql = single_heap_sql.replace("_corr_fact_heap", "_corr_fact_col")
+
+        single_heap = self.q(single_heap_sql)
+        single_col = self.q(single_col_sql)
+        self.check(
+            "single-relation correlated aggregate: col result matches heap",
+            single_col == single_heap,
+            f"heap={single_heap!r} col={single_col!r}",
+        )
+
+        single_plan = self.q(f"EXPLAIN (COSTS OFF) {single_col_sql}")
+        self.check(
+            "single-relation correlated aggregate: plan has no SubPlan",
+            "SubPlan" not in single_plan,
+            single_plan[:700],
+        )
+
+        multi_heap_sql = (
+            "SELECT p.partkey, ps.suppkey, ps.cost "
+            "FROM _corr_part_heap p, _corr_ps_heap ps, _corr_supp s "
+            "WHERE p.partkey = ps.partkey "
+            "AND s.suppkey = ps.suppkey "
+            "AND p.kind = 'keep' "
+            "AND s.region = 'EU' "
+            "AND ps.cost = ("
+            "  SELECT min(ps2.cost) "
+            "  FROM _corr_ps_heap ps2, _corr_supp s2 "
+            "  WHERE ps2.partkey = p.partkey "
+            "  AND s2.suppkey = ps2.suppkey "
+            "  AND s2.region = 'EU'"
+            ") "
+            "ORDER BY 1, 2, 3"
+        )
+        multi_col_sql = (
+            "SELECT p.partkey, ps.suppkey, ps.cost "
+            "FROM _corr_part_col p, _corr_ps_col ps, _corr_supp s "
+            "WHERE p.partkey = ps.partkey "
+            "AND s.suppkey = ps.suppkey "
+            "AND p.kind = 'keep' "
+            "AND s.region = 'EU' "
+            "AND ps.cost = ("
+            "  SELECT min(ps2.cost) "
+            "  FROM _corr_ps_col ps2, _corr_supp s2 "
+            "  WHERE ps2.partkey = p.partkey "
+            "  AND s2.suppkey = ps2.suppkey "
+            "  AND s2.region = 'EU'"
+            ") "
+            "ORDER BY 1, 2, 3"
+        )
+
+        multi_heap = self.q(multi_heap_sql)
+        multi_col = self.q(multi_col_sql)
+        self.check(
+            "multi-relation correlated aggregate: col result matches heap",
+            multi_col == multi_heap,
+            f"heap={multi_heap!r} col={multi_col!r}",
+        )
+
+        multi_plan = self.q(f"EXPLAIN (COSTS OFF) {multi_col_sql}")
+        self.check(
+            "multi-relation correlated aggregate: plan has no SubPlan",
+            "SubPlan" not in multi_plan,
+            multi_plan[:700],
+        )
 
     # ------------------------------------------------------------------ parallel safety
 
@@ -930,11 +1101,23 @@ class TestRunner:
         )
 
         plan_vec = self.q(f"{pfx_parallel_vec} EXPLAIN {vec_group_sql}")
-        self.check(
-            "parallel grouped count/sum/min/max: EXPLAIN shows StorageEngineVectorGroupAgg",
-            "StorageEngineVectorGroupAgg" in plan_vec,
-            plan_vec[:500],
+        server_version_num = self.q1("SHOW server_version_num")
+        vecgroupagg_supported = (
+            server_version_num and
+            (150000 <= int(server_version_num) < 200000)
         )
+        if vecgroupagg_supported:
+            self.check(
+                "parallel grouped count/sum/min/max: EXPLAIN shows StorageEngineVectorGroupAgg",
+                "StorageEngineVectorGroupAgg" in plan_vec,
+                plan_vec[:500],
+            )
+        else:
+            self.check(
+                "parallel grouped count/sum/min/max: EXPLAIN falls back (version-limited)",
+                "StorageEngineVectorGroupAgg" not in plan_vec,
+                plan_vec[:500],
+            )
         self.check(
             "parallel grouped count/sum/min/max: EXPLAIN is parallel",
             "Parallel" in plan_vec,
@@ -943,10 +1126,13 @@ class TestRunner:
 
         avg_group_sql = "SELECT grp, avg(v::float8) FROM _tpar_group GROUP BY grp"
         plan_avg = self.q(f"{pfx_parallel_vec} EXPLAIN {avg_group_sql}")
-        server_version_num = self.q1("SHOW server_version_num")
         avg_groupagg_expected = (
-            server_version_num and
+            vecgroupagg_supported and
             (int(server_version_num) < 200000)
+        )
+        avg_groupagg_serial_expected = (
+            server_version_num and
+            (150000 <= int(server_version_num) < 200000)
         )
         if avg_groupagg_expected:
             self.check(
@@ -982,7 +1168,7 @@ class TestRunner:
             "SET max_parallel_workers_per_gather=0; "
             "EXPLAIN SELECT grp, avg(v) FROM _tpar_group GROUP BY grp"
         )
-        if avg_groupagg_expected:
+        if avg_groupagg_serial_expected:
             self.check(
                 "serial grouped avg(int4): EXPLAIN shows StorageEngineVectorGroupAgg",
                 "StorageEngineVectorGroupAgg" in plan_avg_int4_serial,
@@ -995,7 +1181,7 @@ class TestRunner:
                 plan_avg_int4_serial[:500],
             )
 
-        # PG15-only safety gate: numeric plain aggregate must fallback.
+        # PG15 compatibility: numeric plain aggregate is vectorized too.
         server_version_num = self.q1("SHOW server_version_num")
         if server_version_num and int(server_version_num) < 160000:
             self.exec("""
@@ -1011,8 +1197,8 @@ class TestRunner:
                 "EXPLAIN SELECT count(val) FROM _tpar_num_plain"
             )
             self.check(
-                "PG15 numeric plain aggregate: EXPLAIN falls back (no StorageEngineVectorAgg)",
-                "StorageEngineVectorAgg" not in plan_num_pg15,
+                "PG15 numeric plain aggregate: EXPLAIN shows StorageEngineVectorAgg",
+                "StorageEngineVectorAgg" in plan_num_pg15,
                 plan_num_pg15[:500],
             )
 
@@ -1088,16 +1274,35 @@ class TestRunner:
                       "min(val), max(val), round(sum(val)::numeric, 2), "
                       "min(m), max(m), sum(m) "
                       "FROM _tgrp GROUP BY country ORDER BY country")
+        single_explain_sql = (
+            "SELECT country, count(*), count(val), min(val), max(val), sum(val) "
+            "FROM _tgrp GROUP BY country ORDER BY country"
+        )
         r_off = self.q(f"{pfx_off} {single_sql}")
         r_on  = self.q(f"{pfx_on}  {single_sql}")
         self.check("single-key GROUP BY: VEC ON == VEC OFF", r_off == r_on,
                    f"OFF={r_off[:200]!r}  ON={r_on[:200]!r}")
 
+        server_version_num = self.q1("SHOW server_version_num")
+        vecgroupagg_supported = (
+            server_version_num and int(server_version_num) >= 150000
+        )
+        vecgroupagg_serial_supported = (
+            server_version_num and int(server_version_num) >= 150000
+        )
+
         # 2. Single-key: EXPLAIN shows VecGroupAgg
         # Force HashAgg: disable sort so planner can't pick GroupAggregate
-        plan = self.q(f"{pfx_on} SET enable_sort=off; EXPLAIN {single_sql}")
-        self.check("single-key GROUP BY: EXPLAIN shows StorageEngineVectorGroupAgg",
-                   "StorageEngineVectorGroupAgg" in plan, plan[:400])
+        plan = self.q(
+            f"{pfx_on} SET max_parallel_workers_per_gather=0; "
+            f"SET enable_sort=off; EXPLAIN {single_explain_sql}"
+        )
+        if vecgroupagg_supported:
+            self.check("single-key GROUP BY: EXPLAIN shows StorageEngineVectorGroupAgg",
+                       "StorageEngineVectorGroupAgg" in plan, plan[:400])
+        else:
+            self.check("single-key GROUP BY: EXPLAIN falls back (version-limited)",
+                       "StorageEngineVectorGroupAgg" not in plan, plan[:400])
 
         # 3. COUNT(col) with NULLs — val has NULLs every 7th row
         null_sql = ("SELECT country, count(*) AS cs, count(val) AS cv "
@@ -1128,8 +1333,12 @@ class TestRunner:
         # which the hook can intercept on all PG versions
         plan2 = self.q(f"{pfx_on} SET max_parallel_workers_per_gather=0; EXPLAIN "
                        "SELECT k1, k2, count(*), sum(v) FROM _tgrp2 GROUP BY k1, k2")
-        self.check("composite GROUP BY (2 int keys): EXPLAIN shows StorageEngineVectorGroupAgg",
-                   "StorageEngineVectorGroupAgg" in plan2, plan2[:400])
+        if vecgroupagg_serial_supported:
+            self.check("composite GROUP BY (2 int keys): EXPLAIN shows StorageEngineVectorGroupAgg",
+                       "StorageEngineVectorGroupAgg" in plan2, plan2[:400])
+        else:
+            self.check("composite GROUP BY (2 int keys): EXPLAIN falls back (version-limited)",
+                       "StorageEngineVectorGroupAgg" not in plan2, plan2[:400])
 
         # 6. HAVING — must still produce correct results (applied by Finalize node)
         having_sql = ("SELECT country, count(*) FROM _tgrp "
@@ -2017,6 +2226,7 @@ class TestRunner:
         self.test_multi_column_aggregates()
         self.test_null_handling()
         self.test_explain_plan()
+        self.test_pg19_correlated_scalar_decorrelation()
         self.test_parallel_safety()
         self.test_vecgroupagg()
         self.test_maintenance_api()
