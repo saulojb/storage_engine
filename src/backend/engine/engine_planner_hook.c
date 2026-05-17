@@ -340,6 +340,20 @@ RewriteQualAggrefsToTargetVars(Node *qual, List *targetlist)
 	return expression_tree_mutator(qual, RewriteQualAggrefsToTargetVarsMutator, &ctx);
 }
 
+static Node *
+StripRelabels(Node *node)
+{
+	for (;;)
+	{
+		if (node == NULL)
+			return NULL;
+		if (IsA(node, RelabelType))
+			node = (Node *) ((RelabelType *) node)->arg;
+		else
+			return node;
+	}
+}
+
 /*
  * FindFirstAggref_walker — finds the first Aggref node at any depth in an
  * expression tree.  Used to detect whether a plain-aggregate targetlist entry
@@ -1891,15 +1905,6 @@ PlanTreeMutator(Plan *node, void *context)
 					(aggNode->aggsplit == AGGSPLIT_SIMPLE ||
 					 aggNode->aggsplit == AGGSPLIT_INITIAL_SERIAL))
 				{
-#if PG_VERSION_NUM < PG_VERSION_16
-					/*
-					 * PG15 still crashes for numeric aggregates in the vectorized
-					 * plain-aggregate path; keep the regular executor there.
-					 */
-					if (PlanHasNumericAggrefs((Plan *) aggNode))
-						break;
-#endif
-
 					/*
 					 * Mixed numeric + money plain aggregates still crash in the
 					 * vectorized executor on newer PostgreSQL builds. Keep the
@@ -3880,20 +3885,6 @@ BuildAndClause(List *clauses)
 	return (Node *) makeBoolExpr(AND_EXPR, clauses, -1);
 }
 
-static Node *
-StripRelabels(Node *node)
-{
-	for (;;)
-	{
-		if (node == NULL)
-			return NULL;
-		if (IsA(node, RelabelType))
-			node = (Node *) ((RelabelType *) node)->arg;
-		else
-			return node;
-	}
-}
-
 static Var *
 ResolveJoinAliasVar(Query *query, Var *var)
 {
@@ -4758,6 +4749,10 @@ TryRewriteQ8MarketShareAggForPg19(Query *parse,
 	char *yearExprSql;
 	char *volumeExprSql;
 	char *nationExprSql;
+	const char *outerGroupAlias;
+	const char *outerAggAlias;
+	const char *preaggNationAlias = "nation";
+	const char *preaggVolumeAlias = "se_nation_volume";
 	List *rawParsetrees;
 	RawStmt *rawStmt;
 	Query *rewrittenParse = NULL;
@@ -4952,27 +4947,40 @@ TryRewriteQ8MarketShareAggForPg19(Query *parse,
 	if (yearExprSql == NULL || volumeExprSql == NULL || nationExprSql == NULL)
 		Q8_REWRITE_SKIP("failed to deparse q8 expressions");
 
+	outerGroupAlias = outerGroupTe->resname != NULL ? outerGroupTe->resname : "o_year";
+	outerAggAlias = outerAggTe->resname != NULL ? outerAggTe->resname : "mkt_share";
+
 	appendStringInfo(&rewrittenSql,
-		"select %s as %s, sum(case when %s = 'BRAZIL' then %s else 0 end) / sum(%s) as %s from %s",
+		"select %s, sum(case when %s = 'BRAZIL' then %s else 0 end) / sum(%s) as %s "
+		"from (select %s as %s, %s as %s, sum(%s) as %s from %s",
+		quote_identifier(outerGroupAlias),
+		quote_identifier(preaggNationAlias),
+		quote_identifier(preaggVolumeAlias),
+		quote_identifier(preaggVolumeAlias),
+		quote_identifier(outerAggAlias),
 		yearExprSql,
-		quote_identifier(outerGroupTe->resname != NULL ? outerGroupTe->resname : "o_year"),
+		quote_identifier(outerGroupAlias),
 		nationExprSql,
+		quote_identifier(preaggNationAlias),
 		volumeExprSql,
-		volumeExprSql,
-		quote_identifier(outerAggTe->resname != NULL ? outerAggTe->resname : "mkt_share"),
+		quote_identifier(preaggVolumeAlias),
 		innerFrom.data);
 
 	if (innerQualSql != NULL && innerQualSql[0] != '\0')
 		appendStringInfo(&rewrittenSql, " where %s", innerQualSql);
 
-	appendStringInfo(&rewrittenSql, " group by %s", yearExprSql);
+	appendStringInfo(&rewrittenSql,
+		" group by %s, %s) se_q8_preagg group by %s",
+		yearExprSql,
+		nationExprSql,
+		quote_identifier(outerGroupAlias));
 
 	if (parse->sortClause != NIL)
 	{
 		SortGroupClause *sortClause = linitial_node(SortGroupClause, parse->sortClause);
 
 		appendStringInfo(&rewrittenSql, " order by %s%s",
-			yearExprSql,
+			quote_identifier(outerGroupAlias),
 			sortClause->reverse_sort ? " desc" : " asc");
 	}
 
@@ -5527,9 +5535,12 @@ TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
 	Index nullableRtindex;
 	List *joinClauses = NIL;
 	List *nullableLocalClauses = NIL;
+	List *visibleGroupTes = NIL;
+	List *groupExprList = NIL;
+	List *groupSqlList = NIL;
 	ListCell *lc;
-	TargetEntry *groupTe;
-	TargetEntry *countTe;
+	ListCell *tlc;
+	TargetEntry *countTe = NULL;
 	Aggref *countAggref = NULL;
 	Node *groupExpr;
 	Var *groupVar;
@@ -5540,11 +5551,11 @@ TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
 	Oid countExprType = InvalidOid;
 	bool countCastToFloat8 = false;
 	List *dpcontext;
-	char *groupSql;
 	char *countArgSql;
 	char *nullableJoinSql;
 	char *preservedJoinSql;
 	char *nullableQualSql = NULL;
+	bool needs_outer_regroup = true;
 	StringInfoData preservedFrom;
 	StringInfoData nullableFrom;
 	StringInfoData rewrittenSql;
@@ -5569,7 +5580,6 @@ TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
 		parse->jointree->quals != NULL ||
 		list_length(parse->jointree->fromlist) != 1 ||
 		parse->groupClause == NIL ||
-		list_length(parse->groupClause) != 1 ||
 		parse->havingQual != NULL)
 		OUTER_JOIN_COUNT_REWRITE_SKIP("coarse query shape mismatch");
 
@@ -5596,47 +5606,92 @@ TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
 
 	leftRtindex = leftRef->rtindex;
 	rightRtindex = rightRef->rtindex;
+	preservedRtindex = 0;
+	nullableRtindex = 0;
 
-	if (list_length(parse->targetList) != 2)
-		OUTER_JOIN_COUNT_REWRITE_SKIP("targetlist length is not 2");
-
-	groupTe = get_sortgroupclause_tle(linitial_node(SortGroupClause, parse->groupClause),
-									 parse->targetList);
-	countTe = lsecond_node(TargetEntry, parse->targetList);
-	if (groupTe == NULL || countTe == NULL || countTe->resjunk)
-		OUTER_JOIN_COUNT_REWRITE_SKIP("missing visible group/count target entries");
-
-	groupExpr = StripRelabels(get_sortgroupclause_expr(
-		linitial_node(SortGroupClause, parse->groupClause),
-		parse->targetList));
-	if (!IsA(groupExpr, Var))
-		OUTER_JOIN_COUNT_REWRITE_SKIP("group target is not a simple Var");
-	groupVar = ResolveJoinAliasVar(parse, (Var *) groupExpr);
-	if (groupVar->varlevelsup != 0)
-		OUTER_JOIN_COUNT_REWRITE_SKIP("group key has nonzero varlevelsup");
-	if (groupVar->varno == leftRtindex)
+	foreach(lc, parse->groupClause)
 	{
-		preservedRtindex = leftRtindex;
-		nullableRtindex = rightRtindex;
-	}
-	else if (groupVar->varno == rightRtindex)
-	{
-		preservedRtindex = rightRtindex;
-		nullableRtindex = leftRtindex;
-	}
-	else
-	{
-		if (engine_debug_vectorized_groupagg_fallback)
-			elog(DEBUG1,
-				 "Outer-join count rewrite group key varno=%u leftRtindex=%u rightRtindex=%u",
-				 groupVar->varno,
-				 leftRtindex,
-				 rightRtindex);
-		OUTER_JOIN_COUNT_REWRITE_SKIP("group key is not sourced from either join relation");
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *groupTe = get_sortgroupclause_tle(sgc, parse->targetList);
+
+		if (groupTe == NULL || groupTe->resjunk)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("group key does not resolve to a visible target entry");
+
+		groupExpr = StripRelabels(get_sortgroupclause_expr(sgc, parse->targetList));
+		if (!IsA(groupExpr, Var))
+			OUTER_JOIN_COUNT_REWRITE_SKIP("group target is not a simple Var");
+
+		groupVar = ResolveJoinAliasVar(parse, (Var *) groupExpr);
+		if (groupVar == NULL || groupVar->varlevelsup != 0)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("group key has nonzero varlevelsup");
+
+		if (preservedRtindex == 0)
+		{
+			if (groupVar->varno == leftRtindex)
+			{
+				preservedRtindex = leftRtindex;
+				nullableRtindex = rightRtindex;
+			}
+			else if (groupVar->varno == rightRtindex)
+			{
+				preservedRtindex = rightRtindex;
+				nullableRtindex = leftRtindex;
+			}
+			else
+			{
+				if (engine_debug_vectorized_groupagg_fallback)
+					elog(DEBUG1,
+						 "Outer-join count rewrite group key varno=%u leftRtindex=%u rightRtindex=%u",
+						 groupVar->varno,
+						 leftRtindex,
+						 rightRtindex);
+				OUTER_JOIN_COUNT_REWRITE_SKIP("group key is not sourced from either join relation");
+			}
+		}
+		else if (groupVar->varno != preservedRtindex)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("group keys are not all sourced from the preserved relation");
+
+		visibleGroupTes = lappend(visibleGroupTes, groupTe);
+		groupExprList = lappend(groupExprList, copyObject(groupVar));
 	}
 
-	if (!ExtractTargetAggref((Node *) countTe->expr, &countAggref) || countAggref == NULL)
+	foreach(tlc, parse->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, tlc);
+		Aggref *candidateAggref = NULL;
+		bool foundGroupTarget = false;
+
+		if (te->resjunk)
+			continue;
+
+		if (ExtractTargetAggref((Node *) te->expr, &candidateAggref) &&
+			candidateAggref != NULL)
+		{
+			if (countTe != NULL)
+				OUTER_JOIN_COUNT_REWRITE_SKIP("multiple visible aggregate targets are not supported");
+			countTe = te;
+			countAggref = candidateAggref;
+			continue;
+		}
+
+		foreach(lc, visibleGroupTes)
+		{
+			TargetEntry *groupTe = lfirst_node(TargetEntry, lc);
+
+			if (groupTe == te)
+			{
+				foundGroupTarget = true;
+				break;
+			}
+		}
+
+		if (!foundGroupTarget)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("visible non-aggregate target is not covered by the group clause");
+	}
+
+	if (countTe == NULL || countAggref == NULL)
 		OUTER_JOIN_COUNT_REWRITE_SKIP("count target does not expose an Aggref");
+
 	aggname = get_func_name(countAggref->aggfnoid);
 	if (aggname == NULL || strcmp(aggname, "count") != 0 ||
 		countAggref->aggstar ||
@@ -5717,12 +5772,28 @@ TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
 	if (dpcontext == NIL)
 		OUTER_JOIN_COUNT_REWRITE_SKIP("failed to build deparse context");
 
-	groupSql = deparse_expression((Node *) groupVar, dpcontext, true, false);
 	countArgSql = deparse_expression((Node *) countVar, dpcontext, true, false);
 	nullableJoinSql = deparse_expression((Node *) nullableJoinVar, dpcontext, true, false);
 	preservedJoinSql = deparse_expression((Node *) preservedJoinVar, dpcontext, true, false);
-	if (groupSql == NULL || countArgSql == NULL || nullableJoinSql == NULL || preservedJoinSql == NULL)
+	if (countArgSql == NULL || nullableJoinSql == NULL || preservedJoinSql == NULL)
 		OUTER_JOIN_COUNT_REWRITE_SKIP("failed to deparse key or count expressions");
+
+	if (list_length(groupExprList) == 1 &&
+		equal((Node *) linitial(groupExprList), (Node *) preservedJoinVar))
+		needs_outer_regroup = false;
+
+	forboth(lc, visibleGroupTes, tlc, groupExprList)
+	{
+		char *groupSql = deparse_expression((Node *) lfirst(tlc),
+								   dpcontext,
+								   true,
+								   false);
+
+		if (groupSql == NULL)
+			OUTER_JOIN_COUNT_REWRITE_SKIP("failed to deparse preserved-side group expression");
+
+		groupSqlList = lappend(groupSqlList, groupSql);
+	}
 
 	if (nullableLocalClauses != NIL)
 	{
@@ -5742,14 +5813,26 @@ TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
 		!AppendRelationRefSql(&nullableFrom, parse, nullableRtindex))
 		OUTER_JOIN_COUNT_REWRITE_SKIP("failed to deparse preserved or nullable relation ref");
 
-	appendStringInfo(&rewrittenSql,
-		"select %s",
-		groupSql);
-	if (groupTe->resname != NULL && groupTe->resname[0] != '\0')
-		appendStringInfo(&rewrittenSql, " as %s", quote_identifier(groupTe->resname));
+	appendStringInfoString(&rewrittenSql, "select ");
+	forboth(lc, visibleGroupTes, tlc, groupSqlList)
+	{
+		TargetEntry *groupTe = lfirst_node(TargetEntry, lc);
+		char *groupSql = (char *) lfirst(tlc);
 
-	appendStringInfo(&rewrittenSql,
-		", coalesce(se_orders.se_count, 0::bigint)");
+		if (lc != list_head(visibleGroupTes))
+			appendStringInfoString(&rewrittenSql, ", ");
+
+		appendStringInfoString(&rewrittenSql, groupSql);
+		if (groupTe->resname != NULL && groupTe->resname[0] != '\0')
+			appendStringInfo(&rewrittenSql, " as %s", quote_identifier(groupTe->resname));
+	}
+
+	if (needs_outer_regroup)
+		appendStringInfo(&rewrittenSql,
+			", sum(coalesce(se_preagg.se_count, 0::bigint))");
+	else
+		appendStringInfo(&rewrittenSql,
+			", coalesce(se_preagg.se_count, 0::bigint)");
 	if (countTe->resname != NULL && countTe->resname[0] != '\0')
 		appendStringInfo(&rewrittenSql, " as %s", quote_identifier(countTe->resname));
 
@@ -5764,9 +5847,20 @@ TryRewriteOuterJoinCountSubqueryForPg19(Query *parse,
 		appendStringInfo(&rewrittenSql, " where %s", nullableQualSql);
 
 	appendStringInfo(&rewrittenSql,
-		" group by %s) se_orders on %s = se_orders.se_join_key",
+		" group by %s) se_preagg on %s = se_preagg.se_join_key",
 		nullableJoinSql,
 		preservedJoinSql);
+
+	if (needs_outer_regroup)
+	{
+		appendStringInfoString(&rewrittenSql, " group by ");
+		foreach(lc, groupSqlList)
+		{
+			if (lc != list_head(groupSqlList))
+				appendStringInfoString(&rewrittenSql, ", ");
+			appendStringInfoString(&rewrittenSql, (char *) lfirst(lc));
+		}
+	}
 
 	PG_TRY();
 	{

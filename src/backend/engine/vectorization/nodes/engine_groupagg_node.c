@@ -297,6 +297,19 @@ i128_to_numeric_datum(__int128 val, int32 scale)
 							   Int32GetDatum(-1));
 }
 
+static inline __int128
+vecgroup_i128_load(const VecGroupI128Store *store)
+{
+	return (((__int128) store->hi) << 64) | store->lo;
+}
+
+static inline void
+vecgroup_i128_store(VecGroupI128Store *store, __int128 value)
+{
+	store->hi = (int64) (value >> 64);
+	store->lo = (uint64) value;
+}
+
 /*
  * Recursively evaluate a VecExprNode tree using __int128 arithmetic.
  *
@@ -632,6 +645,16 @@ vecgroupkey_hash(const void *key, Size keysize)
 	const VecGroupKey *gk = (const VecGroupKey *) key;
 	uint32	hash = 0;
 	int		ki;
+	static int hash_debug_logs = 0;
+
+	if (engine_debug_vectorized_groupagg_exec && hash_debug_logs < 8)
+	{
+		hash_debug_logs++;
+		elog(LOG,
+			 "VecGroupAgg exec: vecgroupkey_hash enter keysize=%zu num_keys=%d",
+			 keysize,
+			 gk->num_keys);
+	}
 
 	for (ki = 0; ki < gk->num_keys; ki++)
 	{
@@ -664,6 +687,17 @@ vecgroupkey_compare(const void *key1, const void *key2, Size keysize)
 	const VecGroupKey *a = (const VecGroupKey *) key1;
 	const VecGroupKey *b = (const VecGroupKey *) key2;
 	int		ki;
+	static int compare_debug_logs = 0;
+
+	if (engine_debug_vectorized_groupagg_exec && compare_debug_logs < 8)
+	{
+		compare_debug_logs++;
+		elog(LOG,
+			 "VecGroupAgg exec: vecgroupkey_compare enter keysize=%zu a_keys=%d b_keys=%d",
+			 keysize,
+			 a->num_keys,
+			 b->num_keys);
+	}
 
 	if (a->num_keys != b->num_keys)
 		return a->num_keys - b->num_keys;
@@ -724,14 +758,38 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 	VecGroupEntry  *entry;
 	bool			found;
 
+	if (engine_debug_vectorized_groupagg_exec)
+		elog(LOG,
+			 "VecGroupAgg exec: lookup_or_create_group before hash_search htab=%p num_groups=%d key_num=%d key0_type=%d key0_isnull=%d",
+			 (void *) state->group_htab,
+			 state->num_groups,
+			 hkey->num_keys,
+			 hkey->num_keys > 0 ? hkey->key_type[0] : -1,
+			 hkey->num_keys > 0 ? hkey->isnull[0] : 1);
+
 	entry = (VecGroupEntry *) hash_search(state->group_htab,
 										  hkey,
 										  HASH_ENTER,
 										  &found);
+
+	if (engine_debug_vectorized_groupagg_exec)
+		elog(LOG,
+			 "VecGroupAgg exec: lookup_or_create_group after hash_search found=%d entry=%p num_groups=%d",
+			 found,
+			 (void *) entry,
+			 state->num_groups);
+
 	if (!found)
 	{
 		int			ki, i;
 		MemoryContext	oldctx;
+
+		if (engine_debug_vectorized_groupagg_exec)
+			elog(LOG,
+				 "VecGroupAgg exec: lookup_or_create_group init-new-entry begin entry=%p targets=%d key_typbyval0=%d",
+				 (void *) entry,
+				 state->num_targets,
+				 state->num_keys > 0 ? state->key_typbyval[0] : 1);
 
 		if (state->num_groups >= state->max_groups)
 			ereport(ERROR,
@@ -746,6 +804,8 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 		 * so the hash/compare inline bytes stay valid.
 		 */
 		oldctx = MemoryContextSwitchTo(state->agg_context);
+		if (engine_debug_vectorized_groupagg_exec)
+			elog(LOG, "VecGroupAgg exec: lookup_or_create_group switched agg_context");
 		for (ki = 0; ki < state->num_keys; ki++)
 		{
 			if (!hkey->isnull[ki] && !state->key_typbyval[ki])
@@ -764,6 +824,8 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 			}
 		}
 		MemoryContextSwitchTo(oldctx);
+		if (engine_debug_vectorized_groupagg_exec)
+			elog(LOG, "VecGroupAgg exec: lookup_or_create_group restored context");
 
 		for (i = 0; i < state->num_targets; i++)
 		{
@@ -774,7 +836,7 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 			entry->numeric_state_acc[i]	= (Datum) 0;
 			entry->acc_isnull[i]		= true;
 			entry->distinct_htab[i]		= NULL;
-			entry->i128_acc[i]			= (__int128) 0;
+			vecgroup_i128_store(&entry->i128_acc[i], (__int128) 0);
 			entry->i128_overflow[i]		= false;
 
 			/* For COUNT(DISTINCT col), create a per-group hash set */
@@ -808,6 +870,11 @@ lookup_or_create_group(VecGroupAggState *state, VecGroupKey *hkey)
 		}
 
 		state->num_groups++;
+
+		if (engine_debug_vectorized_groupagg_exec)
+			elog(LOG,
+				 "VecGroupAgg exec: lookup_or_create_group init-new-entry complete num_groups=%d",
+				 state->num_groups);
 	}
 
 	return entry;
@@ -992,6 +1059,8 @@ accumulate_value(VecGroupAggState *state, VecGroupEntry *entry,
 				case VECGAGG_TYPE_FLOAT8:
 					entry->float8_acc[t_idx] += DatumGetFloat8(val);
 					entry->acc_isnull[t_idx] = false;
+					break;
+				default:
 					break;
 			}
 			break;
@@ -1325,6 +1394,9 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 	uint32	i;
 	int		ki;
 
+	if (engine_debug_vectorized_groupagg_exec)
+		elog(LOG, "VecGroupAgg exec: process_vector_batch begin dim=%u", dim);
+
 	/* Pre-fetch all key columns */
 	VectorColumn *key_cols[VECGROUPAGG_MAX_KEYS];
 	for (ki = 0; ki < state->num_keys; ki++)
@@ -1339,6 +1411,9 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 	{
 		if (!vslot->keep[i])
 			continue;
+
+		if (engine_debug_vectorized_groupagg_exec && (i < 4 || (i % 128) == 0))
+			elog(LOG, "VecGroupAgg exec: row=%u begin", i);
 
 		Datum			key_vals[VECGROUPAGG_MAX_KEYS];
 		bool			key_nulls[VECGROUPAGG_MAX_KEYS];
@@ -1369,13 +1444,30 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 		}
 
 		build_composite_key(state, key_vals, key_nulls, &hkey);
+
+		if (engine_debug_vectorized_groupagg_exec && (i < 4 || (i % 128) == 0))
+			elog(LOG, "VecGroupAgg exec: row=%u key built", i);
+
 		entry = lookup_or_create_group(state, &hkey);
+
+		if (engine_debug_vectorized_groupagg_exec && (i < 4 || (i % 128) == 0))
+			elog(LOG,
+				 "VecGroupAgg exec: row=%u group ready groups=%d",
+				 i,
+				 state->num_groups);
 
 		for (t = 0; t < state->num_targets; t++)
 		{
 			VecGroupAggTarget *tgt = &state->targets[t];
 			Datum	val = (Datum) 0;
 			bool	val_null = true;
+
+			if (engine_debug_vectorized_groupagg_exec && i < 2)
+				elog(LOG,
+					 "VecGroupAgg exec: row=%u target=%d begin kind=%d",
+					 i,
+					 t,
+					 tgt->agg_kind);
 
 			/*
 			 * __int128 fast path for VECGAGG_SUM_EXPR with a known fixed
@@ -1399,13 +1491,14 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 
 				if (i128_ok)
 				{
-					__int128 new_acc = entry->i128_acc[t] + expr_val;
-					bool ovfl = (expr_val > 0 && new_acc < entry->i128_acc[t]) ||
-								(expr_val < 0 && new_acc > entry->i128_acc[t]);
+					__int128 old_acc = vecgroup_i128_load(&entry->i128_acc[t]);
+					__int128 new_acc = old_acc + expr_val;
+					bool ovfl = (expr_val > 0 && new_acc < old_acc) ||
+								(expr_val < 0 && new_acc > old_acc);
 
 					if (!ovfl)
 					{
-						entry->i128_acc[t]   = new_acc;
+						vecgroup_i128_store(&entry->i128_acc[t], new_acc);
 						entry->acc_isnull[t] = false;
 						continue;	/* fast path: no further processing */
 					}
@@ -1417,7 +1510,7 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 						MemoryContext oldctx =
 							MemoryContextSwitchTo(state->agg_context);
 						Datum acc_numeric =
-							i128_to_numeric_datum(entry->i128_acc[t],
+							i128_to_numeric_datum(old_acc,
 												  tgt->expr_result_scale);
 						entry->numeric_state_acc[t] =
 							call_numeric_binary_fmgr(
@@ -1510,6 +1603,13 @@ process_vector_batch(VecGroupAggState *state, TupleTableSlot *slot)
 			}
 
 			accumulate_value(state, entry, t, tgt, val, val_null);
+
+			if (engine_debug_vectorized_groupagg_exec && i < 2)
+				elog(LOG,
+					 "VecGroupAgg exec: row=%u target=%d accumulated val_null=%d",
+					 i,
+					 t,
+					 val_null);
 		}
 	}
 }
@@ -1521,6 +1621,14 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 {
 	int natt = slot->tts_tupleDescriptor->natts;
 	int t;
+
+	if (engine_debug_vectorized_groupagg_exec)
+		elog(LOG,
+			 "VecGroupAgg exec: fill_and_store_slot begin groups=%d targets=%d partial=%d sort=%d",
+			 state->num_groups,
+			 state->num_targets,
+			 state->is_partial_serial,
+			 state->sort_output);
 
 	ExecClearTuple(slot);
 
@@ -1573,6 +1681,16 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 	{
 		VecGroupAggTarget *tgt = &state->targets[t];
 		int ra = tgt->result_attnum;	/* 0-based */
+
+		if (engine_debug_vectorized_groupagg_exec)
+			elog(LOG,
+				 "VecGroupAgg exec: emit target=%d kind=%d col_type=%d result_type=%u acc_isnull=%d result_att=%d",
+				 t,
+				 tgt->agg_kind,
+				 tgt->col_type,
+				 tgt->result_typeoid,
+				 entry->acc_isnull[t],
+				 ra);
 
 		if (ra >= natt)
 			continue;
@@ -1632,7 +1750,7 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 							MemoryContext oldctx =
 								MemoryContextSwitchTo(state->agg_context);
 							Datum i128_numeric =
-								i128_to_numeric_datum(entry->i128_acc[t],
+								i128_to_numeric_datum(vecgroup_i128_load(&entry->i128_acc[t]),
 													  tgt->expr_result_scale);
 							Datum state_tmp =
 								call_numeric_binary_fmgr(
@@ -1651,7 +1769,7 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 						{
 							/* Serial or non-partial: emit raw NUMERIC */
 							slot->tts_values[ra] =
-								i128_to_numeric_datum(entry->i128_acc[t],
+								i128_to_numeric_datum(vecgroup_i128_load(&entry->i128_acc[t]),
 													  tgt->expr_result_scale);
 						}
 						break;
@@ -1859,7 +1977,16 @@ fill_and_store_slot(VecGroupAggState *state, VecGroupEntry *entry,
 													  InvalidOid,
 													  _pm_arg1, _pm_arg2);
 		}
+
+		if (engine_debug_vectorized_groupagg_exec)
+			elog(LOG,
+				 "VecGroupAgg exec: emit target=%d complete isnull=%d",
+				 t,
+				 slot->tts_isnull[ra]);
 	}
+
+	if (engine_debug_vectorized_groupagg_exec)
+		elog(LOG, "VecGroupAgg exec: fill_and_store_slot complete");
 
 	return ExecStoreVirtualTuple(slot);
 }
@@ -1884,7 +2011,8 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 	VecGroupAggState *state = (VecGroupAggState *) css;
 	CustomScan		 *cscan = (CustomScan *) css->ss.ps.plan;
 
-	elog(DEBUG1, "VecGroupAgg: BeginVecGroupAgg entered, eflags=%d", eflags);
+	if (engine_debug_vectorized_groupagg_exec)
+		elog(LOG, "VecGroupAgg exec: BeginVecGroupAgg entered eflags=%d", eflags);
 
 	/*
 	 * Unpack parameters from custom_private (new multi-key format):
@@ -2099,6 +2227,15 @@ BeginVecGroupAgg(CustomScanState *css, EState *estate, int eflags)
 		}
 	}
 
+
+	if (engine_debug_vectorized_groupagg_exec)
+		elog(LOG,
+			 "VecGroupAgg exec: Begin complete keys=%d targets=%d partial=%d sort=%d max_groups=%d",
+			 state->num_keys,
+			 state->num_targets,
+			 state->is_partial_serial,
+			 state->sort_output,
+			 state->max_groups);
 	/* Initialize group hash table */
 	state->group_htab = create_group_htab(state, state->agg_context);
 	state->num_groups = 0;
@@ -2127,6 +2264,11 @@ ExecVecGroupAgg(CustomScanState *css)
 	/* Phase 1: consume all batches from ColcompressScan */
 	if (!state->scan_done)
 	{
+		uint64 batch_count = 0;
+
+		if (engine_debug_vectorized_groupagg_exec)
+			elog(LOG, "VecGroupAgg exec: phase1 begin");
+
 		for (;;)
 		{
 			TupleTableSlot *batch = ExecProcNode(child_ps);
@@ -2136,9 +2278,24 @@ ExecVecGroupAgg(CustomScanState *css)
 
 			/* batch is a VectorTupleTableSlot */
 			process_vector_batch(state, batch);
+			batch_count++;
+
+			if (engine_debug_vectorized_groupagg_exec &&
+				(batch_count <= 4 || (batch_count % 64) == 0))
+				elog(LOG,
+					 "VecGroupAgg exec: phase1 batch=%llu groups=%d",
+					 (unsigned long long) batch_count,
+					 state->num_groups);
 		}
 
 		state->scan_done = true;
+
+		if (engine_debug_vectorized_groupagg_exec)
+			elog(LOG,
+				 "VecGroupAgg exec: phase1 complete batches=%llu groups=%d sort=%d",
+				 (unsigned long long) batch_count,
+				 state->num_groups,
+				 state->sort_output);
 
 		if (state->sort_output)
 		{
@@ -2183,6 +2340,11 @@ ExecVecGroupAgg(CustomScanState *css)
 			return ExecClearTuple(css->ss.ss_ScanTupleSlot);
 
 		VecGroupEntry *entry = state->sorted_arr[state->sorted_idx++];
+		if (engine_debug_vectorized_groupagg_exec)
+			elog(LOG,
+				 "VecGroupAgg exec: emit sorted idx=%d/%d",
+				 state->sorted_idx,
+				 state->num_groups);
 		return fill_and_store_slot(state, entry, css->ss.ss_ScanTupleSlot);
 	}
 
@@ -2194,6 +2356,9 @@ ExecVecGroupAgg(CustomScanState *css)
 		state->seq_started = false;
 		return ExecClearTuple(css->ss.ss_ScanTupleSlot);
 	}
+
+	if (engine_debug_vectorized_groupagg_exec)
+		elog(LOG, "VecGroupAgg exec: emit hash entry");
 
 	/*
 	 * Fill the scan tuple slot (ss_ScanTupleSlot), which PG's projection

@@ -186,6 +186,12 @@ typedef struct VecGroupKey
  */
 #define VECGROUPAGG_MAX_TARGETS 16
 
+typedef struct VecGroupI128Store
+{
+	int64	hi;
+	uint64	lo;
+} VecGroupI128Store;
+
 typedef struct VecGroupEntry
 {
 	VecGroupKey k;					/* MUST BE FIRST: HTAB HASH_BLOBS compares
@@ -204,7 +210,7 @@ typedef struct VecGroupEntry
 	 * i128_overflow[t] is set when the value overflowed or an unhandled case
 	 * was encountered; subsequent rows fall back to numeric_state_acc[t].
 	 */
-	__int128	i128_acc[VECGROUPAGG_MAX_TARGETS];
+	VecGroupI128Store i128_acc[VECGROUPAGG_MAX_TARGETS];
 	bool		i128_overflow[VECGROUPAGG_MAX_TARGETS];
 } VecGroupEntry;
 

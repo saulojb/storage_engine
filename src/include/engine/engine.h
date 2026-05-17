@@ -285,6 +285,7 @@ extern bool engine_enable_vectorized_groupagg;
 extern int  engine_vecgroupagg_max_groups;
 extern bool engine_enable_automatic_plan;
 extern bool engine_debug_vectorized_groupagg_fallback;
+extern bool engine_debug_vectorized_groupagg_exec;
 extern bool engine_enable_dml;
 extern bool engine_enable_page_cache;
 extern int engine_page_cache_size;

@@ -53,6 +53,7 @@ bool engine_enable_vectorized_groupagg = true;
 int  engine_vecgroupagg_max_groups = 16384;
 bool engine_enable_automatic_plan = true;
 bool engine_debug_vectorized_groupagg_fallback = false;
+bool engine_debug_vectorized_groupagg_exec = false;
 bool engine_enable_dml = true;
 bool engine_enable_page_cache = false;
 int engine_page_cache_size = 2000U;
@@ -229,6 +230,17 @@ engine_guc_init()
 							 "Logs DEBUG1 reasons when planner falls back from VectorGroupAgg",
 							 NULL,
 							 &engine_debug_vectorized_groupagg_fallback,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("storage_engine.debug_vectorized_groupagg_exec",
+							 "Logs executor milestones for VectorGroupAgg crash diagnosis",
+							 NULL,
+							 &engine_debug_vectorized_groupagg_exec,
 							 false,
 							 PGC_USERSET,
 							 0,

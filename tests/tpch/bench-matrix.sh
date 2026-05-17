@@ -4,15 +4,56 @@
 # Frio  = 1ª execução  (cache frio)
 # Quente = média de 3 execuções seguintes (cache quente)
 #
-# Uso: bash bench-matrix.sh [port]
-#        port padrão: 5432
+# Uso: bash bench-matrix.sh [port] [--no-ch]
+#        port padrão: 5433
 
 export LC_ALL=C
 
-PORT=${1:-5433}
+PORT=5433
+WITH_CH=1
+DBUSER="${PGUSER:-postgres}"
+
+for arg in "$@"; do
+    case "$arg" in
+        --no-ch)
+            WITH_CH=0
+            ;;
+        ''|*[!0-9]*)
+            if [[ "$arg" != "--no-ch" ]]; then
+                echo "Uso: bash bench-matrix.sh [port] [--no-ch]" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            PORT="$arg"
+            ;;
+    esac
+done
+
 DIR="$(cd "$(dirname "$0")" && pwd)"
-PSQL="psql -p $PORT -d tpch -qAXt"
+if [[ "$DBUSER" == "postgres" && "$(id -un)" != "postgres" ]]; then
+    USE_SUDO_POSTGRES=1
+else
+    USE_SUDO_POSTGRES=0
+fi
 mkdir -p "$DIR/result"
+
+
+# ---------------------------------------------------------------------------
+# run_psql <pgoptions> <extra args...>
+# ---------------------------------------------------------------------------
+function run_psql {
+    local pgoptions="$1"
+    shift
+
+    if [[ "$USE_SUDO_POSTGRES" -eq 1 ]]; then
+        sudo -u postgres env PGOPTIONS="$pgoptions" \
+            psql -p "$PORT" -d tpch -qAXt "$@"
+    else
+        PGOPTIONS="$pgoptions" \
+            psql -U "$DBUSER" -p "$PORT" -d tpch -qAXt "$@"
+    fi
+}
 
 
 # ---------------------------------------------------------------------------
@@ -21,7 +62,7 @@ mkdir -p "$DIR/result"
 function wait_pg {
     local tries=0
     while (( tries < 30 )); do
-        psql -p "$PORT" -d tpch -qAXtc "SELECT 1" >/dev/null 2>&1 && return 0
+        run_psql "" -c "SELECT 1" >/dev/null 2>&1 && return 0
         sleep 1; (( tries++ ))
     done
     echo "[AVISO] servidor não voltou após 30 s" >&2
@@ -33,8 +74,7 @@ function wait_pg {
 # ---------------------------------------------------------------------------
 function run_pg {
     local prefix="$1" spath="$2" extra="$3" i="$4" j="$5"
-    PGOPTIONS="-c search_path=${spath},public ${extra}" \
-        $PSQL -f "$DIR/queries/${i}.sql" \
+    run_psql "-c search_path=${spath},public ${extra}" -f "$DIR/queries/${i}.sql" \
         > "$DIR/result/${prefix}${i}.${j}" 2>&1
 
     if grep -qE "conexão com o servidor foi perdida|server closed the connection|connection to server" \
@@ -87,10 +127,17 @@ function fmt_sec {
 # Cabeçalho
 # ---------------------------------------------------------------------------
 printf '\n'
-printf '| %-5s | %9s | %9s | %9s | %9s | %9s | %9s |\n' \
-    "Query" "PG Frio" "PG Quente" "Col Frio" "Col Quente" "CH Frio" "CH Quente"
-printf '|%s|%s|%s|%s|%s|%s|%s|\n' \
-    "------:" "----------:" "----------:" "----------:" "----------:" "----------:" "----------:"
+if [[ "$WITH_CH" -eq 1 ]]; then
+    printf '| %-5s | %9s | %9s | %9s | %9s | %9s | %9s |\n' \
+        "Query" "PG Frio" "PG Quente" "Col Frio" "Col Quente" "CH Frio" "CH Quente"
+    printf '|%s|%s|%s|%s|%s|%s|%s|\n' \
+        "------:" "----------:" "----------:" "----------:" "----------:" "----------:" "----------:"
+else
+    printf '| %-5s | %9s | %9s | %9s | %9s |\n' \
+        "Query" "PG Frio" "PG Quente" "Col Frio" "Col Quente"
+    printf '|%s|%s|%s|%s|%s|\n' \
+        "------:" "----------:" "----------:" "----------:" "----------:"
+fi
 
 # acumuladores (ms)
 total_pf=0 total_pw=0 total_cf=0 total_cw=0 total_hf=0 total_hw=0
@@ -129,17 +176,22 @@ for i in $(seq 1 22); do
                  "$(ms_pg "$DIR/result/col${i}.3")" \
                  "$(ms_pg "$DIR/result/col${i}.4")")
 
-    # ---- ClickHouse (via pg_clickhouse FDW, schema ch) ----
-    printf " ch" >&2
-    run_pg "ch" "ch" "" "$i" 1
-    ms_hf=$(ms_pg "$DIR/result/ch${i}.1")
-    for j in 2 3 4; do
-        run_pg "ch" "ch" "" "$i" $j
-        printf "." >&2
-    done
-    ms_hw=$(avg3 "$(ms_pg "$DIR/result/ch${i}.2")" \
-                 "$(ms_pg "$DIR/result/ch${i}.3")" \
-                 "$(ms_pg "$DIR/result/ch${i}.4")")
+    if [[ "$WITH_CH" -eq 1 ]]; then
+        # ---- ClickHouse (via pg_clickhouse FDW, schema ch) ----
+        printf " ch" >&2
+        run_pg "ch" "ch" "" "$i" 1
+        ms_hf=$(ms_pg "$DIR/result/ch${i}.1")
+        for j in 2 3 4; do
+            run_pg "ch" "ch" "" "$i" $j
+            printf "." >&2
+        done
+        ms_hw=$(avg3 "$(ms_pg "$DIR/result/ch${i}.2")" \
+                     "$(ms_pg "$DIR/result/ch${i}.3")" \
+                     "$(ms_pg "$DIR/result/ch${i}.4")")
+    else
+        ms_hf="-"
+        ms_hw="-"
+    fi
 
     printf "\r" >&2
 
@@ -148,8 +200,13 @@ for i in $(seq 1 22); do
     scf=$(fmt_sec "$ms_cf"); scw=$(fmt_sec "$ms_cw")
     shf=$(fmt_sec "$ms_hf"); shw=$(fmt_sec "$ms_hw")
 
-    printf '| Q%-4s | %9s | %9s | %9s | %9s | %9s | %9s |\n' \
-        "$i" "$spf" "$spw" "$scf" "$scw" "$shf" "$shw"
+    if [[ "$WITH_CH" -eq 1 ]]; then
+        printf '| Q%-4s | %9s | %9s | %9s | %9s | %9s | %9s |\n' \
+            "$i" "$spf" "$spw" "$scf" "$scw" "$shf" "$shw"
+    else
+        printf '| Q%-4s | %9s | %9s | %9s | %9s |\n' \
+            "$i" "$spf" "$spw" "$scf" "$scw"
+    fi
 
     # acumula totais
     for pair in \
@@ -168,13 +225,22 @@ done
 # ---------------------------------------------------------------------------
 # Linha de Totais
 # ---------------------------------------------------------------------------
-printf '|%s|%s|%s|%s|%s|%s|%s|\n' \
-    "------:" "----------:" "----------:" "----------:" "----------:" "----------:" "----------:"
-printf '| %-5s | %9s | %9s | %9s | %9s | %9s | %9s |\n' \
-    "Total" \
-    "$(fmt_sec "$total_pf")" "$(fmt_sec "$total_pw")" \
-    "$(fmt_sec "$total_cf")" "$(fmt_sec "$total_cw")" \
-    "$(fmt_sec "$total_hf")" "$(fmt_sec "$total_hw")"
+if [[ "$WITH_CH" -eq 1 ]]; then
+    printf '|%s|%s|%s|%s|%s|%s|%s|\n' \
+        "------:" "----------:" "----------:" "----------:" "----------:" "----------:" "----------:"
+    printf '| %-5s | %9s | %9s | %9s | %9s | %9s | %9s |\n' \
+        "Total" \
+        "$(fmt_sec "$total_pf")" "$(fmt_sec "$total_pw")" \
+        "$(fmt_sec "$total_cf")" "$(fmt_sec "$total_cw")" \
+        "$(fmt_sec "$total_hf")" "$(fmt_sec "$total_hw")"
+else
+    printf '|%s|%s|%s|%s|%s|\n' \
+        "------:" "----------:" "----------:" "----------:" "----------:"
+    printf '| %-5s | %9s | %9s | %9s | %9s |\n' \
+        "Total" \
+        "$(fmt_sec "$total_pf")" "$(fmt_sec "$total_pw")" \
+        "$(fmt_sec "$total_cf")" "$(fmt_sec "$total_cw")"
+fi
 
 printf '\n'
 [[ $any_timeout -eq 1 ]] && \
