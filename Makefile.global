@@ -54,10 +54,11 @@ ifneq (,$(wildcard /usr/include/libdeflate.h))
 endif
 
 # ZXC — asymmetric codec (slow compress, very fast decompress); ideal on ARM64
-# Not yet in apt — build from https://github.com/hellobertrand/zxc/releases
+# Debian/Ubuntu: sudo apt install libzxc-dev
+# Or build from source: https://github.com/hellobertrand/zxc
 #   cmake -B build -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
 #   sudo cmake --install build
-ifneq (,$(wildcard /usr/local/include/zxc.h))
+ifneq (,$(or $(wildcard /usr/include/zxc.h),$(wildcard /usr/local/include/zxc.h)))
   override CPPFLAGS += -DHAVE_LIBZXC=1
   SHLIB_LINK += -lzxc
 endif

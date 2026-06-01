@@ -317,7 +317,7 @@ Each chunk is compressed independently. Available algorithms:
 | `lz4` | Fast compression/decompression, moderate ratio (~500 MB/s decomp) | `liblz4-dev` |
 | `zstd` | Best ratio + good speed; configurable level 1–19 (default: 3). **Recommended** | `libzstd-dev` |
 | `deflate` | zlib-compatible codec; good middle ground between LZ4 and ZSTD | `libdeflate-dev` |
-| `zxc` | Asymmetric: slow compress, extremely fast decompress via SIMD (NEON on ARM64, AVX2/AVX-512 on x86_64). Ideal for read-heavy analytics on ARM Graviton/Neoverse. [github.com/hellobertrand/zxc](https://github.com/hellobertrand/zxc) | build from source |
+| `zxc` | Asymmetric: slow compress, extremely fast decompress via SIMD (NEON on ARM64, AVX2/AVX-512 on x86_64). Ideal for read-heavy analytics on ARM Graviton/Neoverse. [github.com/hellobertrand/zxc](https://github.com/hellobertrand/zxc) | `libzxc-dev` or build from source (see below) |
 
 All compression libraries are **optional** — the extension auto-detects them at build time and falls back to `pglz` if none are installed. Default precedence when multiple are present: `zstd > zxc > lz4 > deflate > pglz`.
 
@@ -595,7 +595,7 @@ sudo dnf install -y gcc make postgresql18-devel \
 > | **LZ4** | `liblz4-dev` | Very fast compression/decompression (~500 MB/s). Ideal for write-heavy workloads or when latency matters. |
 > | **ZSTD** ★ | `libzstd-dev` | Best compression ratio + good speed. **Strongly recommended** for `colcompress` — saves 40–60% disk vs LZ4 with comparable read performance. |
 > | **libdeflate** | `libdeflate-dev` | zlib-compatible codec. Good middle ground between LZ4 and ZSTD. |
-> | **ZXC** | [build from source](https://github.com/hellobertrand/zxc) | Asymmetric codec: very slow compression, extremely fast decompression via SIMD (NEON on ARM64, AVX2/AVX-512 on x86_64). Excellent on ARM Graviton/Neoverse for read-heavy analytical workloads. Not yet in apt. |
+> | **ZXC** | `libzxc-dev` (Debian/Ubuntu) or build from source: https://github.com/hellobertrand/zxc | Asymmetric codec: very slow compression, extremely fast decompression via SIMD (NEON on ARM64, AVX2/AVX-512 on x86_64). Excellent on ARM Graviton/Neoverse for read-heavy analytical workloads. |
 >
 > Default compression precedence (first available wins): `ZSTD > ZXC > LZ4 > Deflate > pglz`
 
@@ -608,6 +608,23 @@ sudo dnf install -y gcc make postgresql18-devel \
 ```bash
 sudo make -j$(nproc) install
 ```
+
+### zxc (optional dependency)
+
+If you prefer to build `zxc` from source (or need a newer version), the upstream project provides a CMake-based build. Example:
+
+```bash
+git clone https://github.com/hellobertrand/zxc.git
+cd zxc
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+# Optional: run tests
+ctest --test-dir build -C Release --output-on-failure
+# Install headers, static/shared libs and pkg-config / CMake files
+sudo cmake --install build
+```
+
+After installing the system package (`libzxc-dev`) or building and installing from source, rebuild `storage_engine` so the extension detects and links `libzxc` at build time.
 
 If multiple PostgreSQL versions are installed, pass `PG_CONFIG` **after** `sudo make`
 (placing it before `sudo` won't work — `sudo` discards environment variables by default):
